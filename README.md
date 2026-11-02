@@ -29,13 +29,29 @@ It comes in three forms:
 
 `-Validate` (or `@Validate = 1`) compares every decoded value with what SQL Server reports through `DBCC SHOW_STATISTICS`, `sys.dm_db_stats_histogram` and trace flag 2388.
 
+## Checking histograms against the data
+
+`-VerifyData` (the app's **Data check** tab, F6) compares each histogram with the rows actually in the table:
+
+- **One seek per step.** It reads through a rowstore index whose first key column is the statistics' leading column (the smallest one), so column statistics are checked too. Each step's range gives the real EQ_ROWS, RANGE_ROWS and DISTINCT_RANGE_ROWS, plus the largest row count for a single value inside the step. Two more seeks count the NULL rows and the rows above the last step (the ascending key problem).
+- **Low impact.** READ UNCOMMITTED, `LOCK_TIMEOUT 1000`, `MAXDOP 1`, a query timeout, an optional pause between steps, and a page budget (default 100,000 pages, about 780 MB). On a larger index it becomes a spot check: the NULL rows, both ends of the histogram, then steps at random while they fit.
+- **No side effects on the statistics.** The queries use `OPTION (KEEPFIXED PLAN)`, which keeps them from triggering an automatic update of a stale statistic they read.
+- **Typed comparisons.** Each step key is bound as a parameter of the column's own type, and `varchar` keys are converted in the column's collation, so case-insensitive, trailing-space and code-page rules match the histogram's.
+- **Results you can act on.** Every range is rated by q-error (how many times the estimate is off, either way): Exact, Good (up to 2), Fair (up to 10) or Poor. The findings separate sampling error from modifications since the update, flag steps that hide a frequent value, and suggest a higher sample rate or `PERSIST_SAMPLE_PERCENT` when sampling is the cause. FULLSCAN statistics with no modifications must match exactly; when they don't, the statistics were probably loaded with `STATS_STREAM`.
+
+It skips filtered, incremental and columnstore statistics, indexed views, memory-optimized tables, and statistics with no supporting index. It needs `SELECT` on the table. The results show step numbers and counts, not key values.
+
+```powershell
+.\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.Orders -Statistics IX_Orders_OrderDate -VerifyData -VerifyPageBudget 20000
+```
+
 The binary layout is documented in [STATS_STREAM-format.md](STATS_STREAM-format.md).
 
 ## Requirements
 
 - Windows PowerShell 5.1 or PowerShell 7. The app needs Windows.
 - SQL Server 2017 or later for the T-SQL procedure (`STRING_AGG`, `CREATE OR ALTER`). The PowerShell decoder has no such limit.
-- The permissions of `DBCC SHOW_STATISTICS` on the tables you decode. `-UseDac` needs sysadmin and the Dedicated Admin Connection. Running a generated `UPDATE STATISTICS ... WITH STATS_STREAM` script needs `ALTER` on the table.
+- The permissions of `DBCC SHOW_STATISTICS` on the tables you decode. `-UseDac` needs sysadmin and the Dedicated Admin Connection. `-VerifyData` needs `SELECT` on the table. Running a generated `UPDATE STATISTICS ... WITH STATS_STREAM` script needs `ALTER` on the table.
 
 Developed and validated on SQL Server 2025 and SQL Server 2022.
 
@@ -51,7 +67,8 @@ Double-click `SQLStatsXRay.cmd`, or run:
 
 - **File > Connect...** to a server, then pick a database, filter the table list and choose a statistic. Browsing stays disabled until you connect.
 - **File > Paste STATS_STREAM...** decodes a stream copied from SSMS (the whole DBCC row or just the `0x...` value), with no server needed. **File > Open STATS_STREAM file...** does the same from a file.
-- Tabs: Report, Header, Histogram (with a chart), Density vector, String index (tree view, left to right or top down), Columns, TF 2388 and Validation.
+- Tabs: Report, Header, Histogram (with a chart), Density vector, String index (tree view, left to right or top down), Columns, TF 2388, Validation and Data check.
+- **Check against the table (F6)** on the Data check tab compares the selected statistics object's histogram with the table data (see [Checking histograms against the data](#checking-histograms-against-the-data)). It runs only when you ask, one statistics object at a time.
 - **Edit statistics** turns on editing of the header, histogram steps (insert and delete with a right click) and density vector. **Generate script...** builds the edited stream with a new checksum and writes the `UPDATE STATISTICS ... WITH STATS_STREAM` script, optionally with `NORECOMPUTE` and a commented block that restores the original statistics. The app never runs the script itself.
 - **Tools > Settings...** holds the theme, connection defaults and report limits. They are saved per user in `%LOCALAPPDATA%\SQLStatsXRay\settings.json`. Passwords are never saved.
 
@@ -96,7 +113,7 @@ EXEC dbo.usp_DecodeStatsStream @DatabaseName = N'Northwind', @OutputDatabase = N
 
 ## Handle the output as customer data
 
-Statistics carry real values from your tables: every histogram step is a value taken from the column, and the string index holds pieces of the strings. Treat reports, saved streams and the collection tables as data from that database. Be careful where you paste or store them, and don't copy them out of a customer environment.
+Statistics carry real values from your tables: every histogram step is a value taken from the column, and the string index holds pieces of the strings. Treat reports, saved streams and the collection tables as data from that database. The data check leaves key values out, but its counts still describe the customer's data. Be careful where you paste or store them, and don't copy them out of a customer environment.
 
 ## Editing statistics
 

@@ -68,6 +68,30 @@
     part of STATS_STREAM; without -UseDac the row count is shown as an estimate. Only one
     DAC session is allowed per instance, and remote DAC is disabled by default.
 
+.PARAMETER VerifyData
+    Checks each histogram against the table data. The table is read only through a rowstore
+    index whose first key column is the statistics' leading column (the smallest such index),
+    with one seek per step: it counts the real EQ_ROWS, RANGE_ROWS and DISTINCT_RANGE_ROWS,
+    the largest number of rows for one value inside each step, the NULL rows and the rows
+    above the last step. The queries run under READ UNCOMMITTED, LOCK_TIMEOUT 1000, MAXDOP 1
+    and KEEPFIXED PLAN, which keeps them from triggering an automatic update of the
+    statistics they check. Each range is rated by q-error (how many times the estimate is
+    off, either way), and the results separate sampling error from modifications since the
+    update. Filtered, incremental and columnstore statistics, and statistics with no
+    supporting index, are skipped. Needs SELECT on the table. The results show step numbers
+    and counts, not key values.
+
+.PARAMETER VerifyPageBudget
+    Leaf pages -VerifyData may read per statistics object. Above it, the check becomes a
+    spot check: the NULL rows, both ends of the histogram, then steps at random while their
+    estimated pages fit. Default 100000 (about 780 MB).
+
+.PARAMETER VerifyTimeout
+    Query timeout of each -VerifyData query, in seconds. Default 60.
+
+.PARAMETER VerifyStepDelay
+    Pause between -VerifyData queries, in milliseconds, to spread the reads. Default 0.
+
 .PARAMETER StatsStream
     Offline mode: the STATS_STREAM as a hex string (with or without 0x).
 
@@ -103,7 +127,8 @@
     Opens SQLStatsXRay, the Windows Forms app (dark or light theme, saved per user). This is the default
     when the script runs without parameters. The app browses databases, tables and
     statistics on a server, or takes a hex string or file, and shows the report plus
-    header, histogram, density vector, trace flag 2388 and validation grids.
+    header, histogram, density vector, trace flag 2388 and validation grids. The Data check
+    tab runs the -VerifyData check for the selected statistics object on request (F6).
     With "Edit statistics" on, the header values, histogram steps (insert and delete
     with a right click) and density vector can be changed. "Generate script..." then
     rebuilds the STATS_STREAM with a new checksum and writes an
@@ -166,6 +191,22 @@ param(
 
     [Parameter(ParameterSetName = 'Server')]
     [switch]$UseDac,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$VerifyData,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [long]$VerifyPageBudget = 100000,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [int]$VerifyTimeout = 60,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [int]$VerifyStepDelay = 0,
 
     [Parameter(ParameterSetName = 'Hex', Mandatory = $true)]
     [string]$StatsStream,
@@ -1565,6 +1606,32 @@ function Format-TraceFlag2388Section($D) {
     return , $out
 }
 
+function Format-DataCheckSection($Check) {
+    # Summary, findings and the worst ranges. Step numbers and counts only: key values stay in the histogram section.
+    $out = @()
+    $out += New-Section 'DATA CHECK: HISTOGRAM AGAINST THE TABLE'
+    $out += Format-KeyValueTable $Check.Summary
+    if ($Check.Findings.Count -gt 0) { $out += ''; $out += @($Check.Findings | ForEach-Object { "* $_" }) }
+    $bad = @($Check.Steps | Where-Object { $_.Result -in 'Good', 'Fair', 'Poor', 'Partial' } |
+            Sort-Object { [Math]::Max([double]$_.EqQError, [double]$_.RangeQError) } -Descending | Select-Object -First 25)
+    if ($bad.Count -gt 0) {
+        $out += ''
+        $out += 'Ranges that differ most (largest EQ_ROWS or RANGE_ROWS q-error first; step numbers as in the histogram):'
+        $rows = foreach ($r in $bad) {
+            [pscustomobject]@{
+                Step = $(if ($null -ne $r.Step) { $r.Step } else { '' }); Kind = $r.Kind; Result = $r.Result
+                'EQ stats' = Format-Float $r.StatsEqRows; 'EQ table' = $r.TableEqRows; 'EQ q' = $r.EqQError
+                'RANGE stats' = Format-Float $r.StatsRangeRows; 'RANGE table' = $r.TableRangeRows; 'RANGE q' = $r.RangeQError
+                'DISTINCT stats' = Format-Float $r.StatsDistinct; 'DISTINCT table' = $r.TableDistinct; 'DISTINCT q' = $r.DistinctQError
+                'Max rows per value' = $r.MaxRowsPerValue
+            }
+        }
+        $cols = 'Step', 'Kind', 'Result', 'EQ stats', 'EQ table', 'EQ q', 'RANGE stats', 'RANGE table', 'RANGE q', 'DISTINCT stats', 'DISTINCT table', 'DISTINCT q', 'Max rows per value'
+        $out += Format-AsciiTable -Rows $rows -Columns $cols -RightAlign (@($cols | Select-Object -Skip 3) + 'Step')
+    }
+    return , $out
+}
+
 function Format-StatsReport($D, $Info) {
     $L = New-Object 'System.Collections.Generic.List[string]'
     $h = $D.Header
@@ -1846,10 +1913,12 @@ ORDER BY s.stats_id
 }
 
 function Get-StatsColumnNames($Connection, [int]$ObjectId, [int]$StatsId, [int]$Count) {
+    # sys.stats_columns lists an index's columns in index_column_id (definition) order; the stream follows key_ordinal
     $q = Invoke-Query $Connection @'
 SELECT c.name FROM sys.stats_columns sc
 JOIN sys.columns c ON c.object_id = sc.object_id AND c.column_id = sc.column_id
-WHERE sc.object_id = @o AND sc.stats_id = @s ORDER BY sc.stats_column_id;
+LEFT JOIN sys.index_columns ic ON ic.object_id = sc.object_id AND ic.index_id = sc.stats_id AND ic.column_id = sc.column_id AND ic.key_ordinal > 0
+WHERE sc.object_id = @o AND sc.stats_id = @s ORDER BY COALESCE(ic.key_ordinal, sc.stats_column_id);
 SELECT c.name FROM sys.index_columns ic
 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
 JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
@@ -2034,6 +2103,366 @@ EXEC sys.sp_executesql @cmd;
     return , $checks.ToArray()
 }
 
+function Test-DataCheckKeyType($Column) {
+    # Key types the data check binds as a parameter of the column's own type (not sql_variant or CLR types other than hierarchyid).
+    if ($Column.SystemTypeId -eq 240) { return $Column.UserTypeId -eq 128 }
+    return $Column.SystemTypeId -in 48, 52, 56, 127, 104, 59, 62, 60, 122, 106, 108, 40, 41, 42, 43, 61, 58, 36, 175, 167, 239, 231, 173, 165, 189
+}
+
+function Add-DataCheckKey($Command, [string]$Name, $Column, $Step) {
+    <#
+      Binds a histogram key as a parameter of the column's own type and returns the T-SQL expression that reads it.
+      The comparison then runs in the column's type and collation, as the histogram was built: no conversion of the
+      column (the seek stays a seek) and no round trip through a string.
+    #>
+    $v = $Step.RangeHiKey
+    $p = $Command.Parameters.Add($Name, [Data.SqlDbType]::Int)
+    $expr = $Name
+    switch ($Column.SystemTypeId) {
+        48 { $p.SqlDbType = 'TinyInt'; $p.Value = $v }
+        52 { $p.SqlDbType = 'SmallInt'; $p.Value = $v }
+        56 { $p.Value = $v }
+        127 { $p.SqlDbType = 'BigInt'; $p.Value = $v }
+        104 { $p.SqlDbType = 'Bit'; $p.Value = $v }
+        59 { $p.SqlDbType = 'Real'; $p.Value = $v }
+        62 { $p.SqlDbType = $(if ($v -is [single]) { 'Real' } else { 'Float' }); $p.Value = $v }
+        60 { $p.SqlDbType = 'Money'; $p.Value = [decimal]::Parse($v, $script:Inv) }
+        122 { $p.SqlDbType = 'SmallMoney'; $p.Value = [decimal]::Parse($v, $script:Inv) }
+        { $_ -in 106, 108 } { $p.SqlDbType = 'Decimal'; $p.Precision = $Column.Precision; $p.Scale = $Column.Scale; $p.SqlValue = [Data.SqlTypes.SqlDecimal]::Parse($v) }
+        40 { $p.SqlDbType = 'Date'; $p.Value = $v }
+        41 { $p.SqlDbType = 'Time'; $p.Scale = $Column.Scale; $p.Value = $v }
+        42 { $p.SqlDbType = 'DateTime2'; $p.Scale = $Column.Scale; $p.Value = $v }
+        43 { $p.SqlDbType = 'DateTimeOffset'; $p.Scale = $Column.Scale; $p.Value = $v }
+        61 {
+            # from the stored days and 1/300 s ticks, so nothing is rounded on the way
+            $k = $Step.Record.KeyBytes
+            $p.SqlDbType = 'DateTime'; $p.SqlValue = [Data.SqlTypes.SqlDateTime]::new([BitConverter]::ToInt32($k, 4), [BitConverter]::ToInt32($k, 0))
+        }
+        58 { $p.SqlDbType = 'SmallDateTime'; $p.Value = $v }
+        36 { $p.SqlDbType = 'UniqueIdentifier'; $p.Value = $v }
+        { $_ -in 175, 167 } {
+            # sent as Unicode and converted on the server in the column's collation, so in its code page
+            $p.SqlDbType = 'NVarChar'; $p.Size = -1; $p.Value = $v
+            $len = $(if ($Column.MaxLength -eq -1) { 'max' } else { [string]$Column.MaxLength })
+            if ($Column.Collation -match '^\w+$') { $expr = "CAST($Name COLLATE $($Column.Collation) AS varchar($len))" } else { $expr = "CAST($Name AS varchar($len))" }
+        }
+        { $_ -in 239, 231 } { $p.SqlDbType = 'NVarChar'; $p.Size = $(if ($Column.MaxLength -eq -1) { -1 } else { [int]($Column.MaxLength / 2) }); $p.Value = $v }
+        { $_ -in 173, 165, 189 } { $p.SqlDbType = 'VarBinary'; $p.Size = $(if ($Column.MaxLength -eq -1) { -1 } else { $Column.MaxLength }); $p.Value = [byte[]]$v }
+        240 { $p.SqlDbType = 'VarBinary'; $p.Size = -1; $p.Value = [byte[]]$Step.Record.KeyBytes; $expr = "CAST($Name AS hierarchyid)" }
+    }
+    return $expr
+}
+
+function Invoke-DataCheckQuery($Ctx, $Lo, $Hi, [switch]$Nulls, [long]$Cap) {
+    <#
+      One seek on the chosen index for the range (Lo, Hi]. The rows arrive in key order, so GROUP BY is a stream
+      aggregate: one pass gives EQ_ROWS (the group equal to Hi), RANGE_ROWS, DISTINCT_RANGE_ROWS and the largest
+      group inside the range. TOP (@cap) bounds the rows a step can read; KEEPFIXED PLAN keeps the compile from
+      triggering an automatic update of the statistics being checked.
+    #>
+    $cmd = $Ctx.Connection.CreateCommand()
+    $cmd.CommandTimeout = $Ctx.Timeout
+    $null = $cmd.Parameters.Add('@cap', [Data.SqlDbType]::BigInt)
+    $cmd.Parameters['@cap'].Value = $Cap
+    $col = $Ctx.ColumnSql
+    $from = "$($Ctx.TableSql) AS t WITH (INDEX($($Ctx.IndexSql)), FORCESEEK)"
+    if ($Nulls) {
+        $cmd.CommandText = "SELECT COUNT_BIG(*) AS eq_rows, CAST(0 AS bigint) AS range_rows, 0 AS distinct_rows, CAST(0 AS bigint) AS max_value_rows, COUNT_BIG(*) AS rows_read " +
+        "FROM (SELECT TOP (@cap) t.$col FROM $from WHERE t.$col IS NULL) AS x OPTION (KEEPFIXED PLAN, MAXDOP 1);"
+    } else {
+        $where = @(); $eq = '0'
+        if ($Lo) { $where += "t.$col > " + (Add-DataCheckKey $cmd '@lo' $Ctx.Column $Lo) }
+        if ($Hi) {
+            $h = Add-DataCheckKey $cmd '@hi' $Ctx.Column $Hi
+            $where += "t.$col <= $h"
+            $eq = "CASE WHEN x.$col = $h THEN 1 ELSE 0 END"
+        }
+        $cmd.CommandText = @"
+SELECT ISNULL(SUM(CASE WHEN g.k = 1 THEN g.c END), 0) AS eq_rows, ISNULL(SUM(CASE WHEN g.k = 0 THEN g.c END), 0) AS range_rows,
+       COUNT(CASE WHEN g.k = 0 THEN 1 END) AS distinct_rows, ISNULL(MAX(CASE WHEN g.k = 0 THEN g.c END), 0) AS max_value_rows,
+       ISNULL(SUM(g.c), 0) AS rows_read
+FROM (SELECT $eq AS k, COUNT_BIG(*) AS c
+      FROM (SELECT TOP (@cap) t.$col FROM $from WHERE $($where -join ' AND ') ORDER BY t.$col) AS x
+      GROUP BY x.$col) AS g
+OPTION (KEEPFIXED PLAN, MAXDOP 1);
+"@
+    }
+    $r = $cmd.ExecuteReader()
+    try {
+        $null = $r.Read()
+        return @{
+            Eq = [int64]$r['eq_rows']; Range = [int64]$r['range_rows']; Distinct = [int64]$r['distinct_rows']
+            MaxValue = [int64]$r['max_value_rows']; Read = [int64]$r['rows_read']; Truncated = $false
+        }
+    } finally { $r.Close() }
+}
+
+function Get-DataCheckQError($Stats, $Table) {
+    # q-error: how many times the estimate is off, either way; both sides floored at 1 row, as estimates are.
+    $e = [Math]::Max([double]$Stats, 1.0); $a = [Math]::Max([double]$Table, 1.0)
+    return [Math]::Round([Math]::Max($e / $a, $a / $e), 2)
+}
+
+function Test-DataCheckExact($Stats, $Table) {
+    # stored counts are real (float32): exact within its precision
+    $s = [double]$Stats; $t = [double]$Table
+    return [Math]::Abs($s - $t) -le [Math]::Max(0.5, $t * 1e-5)
+}
+
+function Format-Invariant([string]$Format) {
+    return [string]::Format($script:Inv, $Format, [object[]]$args)
+}
+
+function New-DataCheckResult([string]$Reason) {
+    $r = [pscustomobject]@{ Result = 'Skipped'; Summary = [ordered]@{}; Findings = New-Object 'System.Collections.Generic.List[string]'; Steps = New-Object 'System.Collections.Generic.List[object]' }
+    if ($Reason) { $r.Summary['Result'] = 'Skipped'; $r.Summary['Reason'] = $Reason; $r.Findings.Add("Not checked: $Reason") }
+    return $r
+}
+
+function Test-StatsAgainstData {
+    <#
+      Checks the histogram against the table data. The table is read only through a rowstore index whose first key
+      is the statistics' leading column (the smallest one), with one seek per step, under READ UNCOMMITTED,
+      LOCK_TIMEOUT 1000, MAXDOP 1 and KEEPFIXED PLAN, within a page budget. Above the budget it becomes a spot
+      check: the NULL step, both ends of the histogram, then steps at random, as long as their estimated pages fit.
+      Results carry step numbers and counts, not key values.
+    #>
+    param($D, $Connection, [int]$ObjectId, $Stat, [string]$QualifiedTable, [long]$PageBudget = 100000, [int]$TimeoutSeconds = 60, [int]$StepDelay = 0)
+    $started = [DateTime]::Now
+    $col = $D.Columns[0]
+    $real = @($D.Histogram | Where-Object { -not $_.IsNullStep })
+    $nullStep = @($D.Histogram | Where-Object { $_.IsNullStep }) | Select-Object -First 1
+    $reason = $null
+    if ($Stat.has_filter) { $reason = 'filtered statistics are not checked yet.' }
+    elseif ($Stat.Table.Columns.Contains('is_incremental') -and $Stat.is_incremental -eq $true) { $reason = 'incremental statistics are not checked yet.' }
+    elseif (-not $D.Blob -or ($real.Count -eq 0 -and -not $nullStep)) { $reason = 'the statistics have no histogram.' }
+    elseif (-not (Test-DataCheckKeyType $col)) { $reason = "keys of type $($col.TypeName) are not supported by the data check." }
+    if ($reason) { return New-DataCheckResult $reason }
+
+    # the histogram column: an index's first key (key_ordinal 1, not stats_column_id 1, which follows index_column_id)
+    $q = Invoke-Query $Connection @'
+DECLARE @c int = (SELECT TOP (1) sc.column_id FROM sys.stats_columns sc
+                  LEFT JOIN sys.index_columns ic ON ic.object_id = sc.object_id AND ic.index_id = sc.stats_id AND ic.column_id = sc.column_id AND ic.key_ordinal > 0
+                  WHERE sc.object_id = @o AND sc.stats_id = @s ORDER BY COALESCE(ic.key_ordinal, sc.stats_column_id));
+SELECT o.type, c.name AS column_name, c.is_nullable,
+       CAST(CASE WHEN EXISTS (SELECT 1 FROM sys.tables t WHERE t.object_id = o.object_id AND t.is_memory_optimized = 1) THEN 1 ELSE 0 END AS bit) AS memory_optimized
+FROM sys.objects o
+JOIN sys.columns c ON c.object_id = o.object_id AND c.column_id = @c
+WHERE o.object_id = @o;
+SELECT TOP (1) i.name, i.type_desc, SUM(p.rows) AS rows, SUM(au.data_pages) AS pages
+FROM sys.index_columns ic
+JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+JOIN sys.partitions p ON p.object_id = i.object_id AND p.index_id = i.index_id
+JOIN sys.allocation_units au ON au.container_id = p.partition_id AND au.type = 1
+WHERE ic.object_id = @o AND ic.column_id = @c AND ic.key_ordinal = 1
+  AND i.type IN (1, 2) AND i.is_disabled = 0 AND i.is_hypothetical = 0 AND i.has_filter = 0
+GROUP BY i.index_id, i.name, i.type_desc
+ORDER BY SUM(au.data_pages), i.index_id;
+'@ @{ '@o' = $ObjectId; '@s' = [int]$Stat.stats_id }
+    $meta = @($q[0].Rows)[0]
+    $ix = @($q[1].Rows)[0]
+    if (-not $meta) { $reason = 'the leading column of the statistics was not found.' }
+    elseif (([string]$meta.type).Trim() -ne 'U') { $reason = 'only tables are checked (not indexed views).' }
+    elseif ($meta.memory_optimized) { $reason = 'memory-optimized tables are not checked (they do not support READ UNCOMMITTED).' }
+    elseif (-not $ix) { $reason = "no enabled, unfiltered rowstore index has [$($meta.column_name)] as its first key column; the check only reads through such an index." }
+    if ($reason) { return New-DataCheckResult $reason }
+
+    $result = New-DataCheckResult
+    $summary = $result.Summary; $findings = $result.Findings
+    $indexRows = [double]$ix.rows; $indexPages = [double]$ix.pages
+    $rowsPerPage = [Math]::Max(1.0, $indexRows / [Math]::Max(1.0, $indexPages))
+    $full = $indexPages -le $PageBudget
+    $quote = { param([string]$Name) '[' + $Name.Replace(']', ']]') + ']' }
+    $ctx = @{
+        Connection = $Connection; Timeout = $TimeoutSeconds; Column = $col; TableSql = $QualifiedTable
+        ColumnSql = (& $quote ([string]$meta.column_name)); IndexSql = (& $quote ([string]$ix.name))
+    }
+
+    # ranges to count: the NULL rows, every step (previous key, key], and the rows above the last key
+    $work = New-Object 'System.Collections.Generic.List[object]'
+    if ($meta.is_nullable) {
+        $work.Add(@{ Kind = 'NULL step'; Step = $(if ($nullStep) { $nullStep.Step }); Nulls = $true
+                Eq = $(if ($nullStep) { $nullStep.EqRows } else { [single]0 }); Range = [single]0; Distinct = [single]0; Avg = $null })
+    }
+    for ($i = 0; $i -lt $real.Count; $i++) {
+        $s = $real[$i]
+        $work.Add(@{ Kind = 'Step'; Step = $s.Step; Lo = $(if ($i -gt 0) { $real[$i - 1] }); Hi = $s; Eq = $s.EqRows; Range = $s.RangeRows; Distinct = $s.DistinctRangeRows; Avg = $s.AvgRangeRows })
+    }
+    if ($real.Count -gt 0) { $work.Add(@{ Kind = 'Above last step'; Step = $null; Lo = $real[$real.Count - 1]; Eq = [single]0; Range = [single]0; Distinct = [single]0; Avg = $null }) }
+
+    $order = @(0..($work.Count - 1))
+    if (-not $full) {
+        # spot check: NULL rows and both ends first (where ascending and descending keys show), then steps at random
+        $stepIdx = @($order | Where-Object { $work[$_].Kind -eq 'Step' })
+        $first = @($order | Where-Object { $work[$_].Kind -ne 'Step' })
+        if ($stepIdx.Count -gt 0) { $first += $stepIdx[$stepIdx.Count - 1]; if ($stepIdx.Count -gt 1) { $first += $stepIdx[0] } }
+        $rng = New-Object Random ([int]$Stat.stats_id)
+        $order = $first + @($stepIdx | Where-Object { $_ -notin $first } | Sort-Object { $rng.Next() })
+    }
+
+    $outcome = @{}
+    $spent = 0.0; $errors = 0; $lastError = $null
+    $session = $Connection.CreateCommand()
+    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;'
+    $null = $session.ExecuteNonQuery()
+    try {
+        foreach ($i in $order) {
+            $w = $work[$i]
+            $remaining = $PageBudget - $spent
+            $cost = ([double]$w.Eq + [double]$w.Range) / $rowsPerPage
+            if ($errors -ge 3 -or $remaining -le 0 -or (-not $full -and $cost -gt $remaining)) { continue }
+            $cap = [int64][Math]::Max(1, [Math]::Floor($remaining * $rowsPerPage))
+            try {
+                $c = Invoke-DataCheckQuery $ctx $w.Lo $w.Hi -Nulls:([bool]$w.Nulls) -Cap $cap
+                $c.Truncated = $c.Read -ge $cap
+                $outcome[$i] = $c
+                $spent += $c.Read / $rowsPerPage
+                $errors = 0
+            } catch {
+                $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }
+                $errors++; $lastError = $e.Message; $outcome[$i] = @{ Error = $e.Message }
+            }
+            if ($StepDelay -gt 0) { Start-Sleep -Milliseconds $StepDelay }
+        }
+    } finally {
+        $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT -1;'
+        try { $null = $session.ExecuteNonQuery() } catch { }
+    }
+    $updatedDuring = $false
+    try {
+        $after = (Invoke-Query $Connection 'SELECT last_updated FROM sys.dm_db_stats_properties(@o, @s)' @{ '@o' = $ObjectId; '@s' = [int]$Stat.stats_id })[0].Rows[0].last_updated
+        $updatedDuring = $after -is [datetime] -and $Stat.sp_last_updated -is [datetime] -and $after -ne $Stat.sp_last_updated
+    } catch { }
+
+    # ---- per range results
+    $statsRows = [double]$D.Blob.Rows
+    $minRows = [Math]::Max(10.0, $statsRows * 0.001)
+    $fullscan = $D.Blob.RowsSampled -ge $D.Blob.Rows
+    $mods = $Stat.sp_modification_counter
+    if ($mods -is [DBNull]) { $mods = $null }
+    $expectExact = $fullscan -and $null -ne $mods -and $mods -eq 0
+    $label = { param($Row) if ($Row.Kind -eq 'Step') { "step $($Row.Step)" } elseif ($Row.Kind -eq 'NULL step') { 'the NULL step' } else { 'the range above the last step' } }
+    $worst = @{ Eq = $null; Range = $null; Distinct = $null }
+    $rated = $null; $skew = @(); $tableTotal = [int64]0
+    for ($i = 0; $i -lt $work.Count; $i++) {
+        $w = $work[$i]; $o = $outcome[$i]
+        $row = [pscustomobject][ordered]@{
+            Step = $w.Step; Kind = $w.Kind; Result = ''; StatsEqRows = $w.Eq; TableEqRows = $null; EqQError = $null
+            StatsRangeRows = $w.Range; TableRangeRows = $null; RangeQError = $null; StatsDistinct = $w.Distinct; TableDistinct = $null; DistinctQError = $null
+            AvgRangeRows = $w.Avg; MaxRowsPerValue = $null; Note = ''
+        }
+        if (-not $o) { $row.Result = 'Not checked'; $row.Note = $(if ($errors -ge 3) { 'stopped after repeated errors' } else { 'outside the page budget' }) }
+        elseif ($o.Error) { $row.Result = 'Error'; $row.Note = $o.Error }
+        else {
+            $row.TableEqRows = $o.Eq; $row.TableRangeRows = $o.Range; $row.TableDistinct = $o.Distinct
+            $row.EqQError = Get-DataCheckQError $w.Eq $o.Eq
+            $row.RangeQError = Get-DataCheckQError $w.Range $o.Range
+            $row.DistinctQError = Get-DataCheckQError $w.Distinct $o.Distinct
+            if ($w.Kind -eq 'Step') { $row.MaxRowsPerValue = $o.MaxValue }
+            $tableTotal += $o.Eq + $o.Range
+            $qe = [Math]::Max($row.EqQError, $row.RangeQError)
+            if ($o.Truncated) { $row.Result = 'Partial'; $row.Note = 'stopped at the page budget: the table counts are lower bounds' }
+            elseif ((Test-DataCheckExact $w.Eq $o.Eq) -and (Test-DataCheckExact $w.Range $o.Range) -and (Test-DataCheckExact $w.Distinct $o.Distinct)) { $row.Result = 'Exact' }
+            elseif ($qe -le 2) { $row.Result = 'Good' } elseif ($qe -le 10) { $row.Result = 'Fair' } else { $row.Result = 'Poor' }
+            if ($w.Kind -eq 'Step' -and $o.MaxValue -ge 10 -and $o.MaxValue -ge 10 * [Math]::Max(1.0, [double]$w.Avg)) {
+                $row.Note = Format-Invariant 'a value inside the step has {0:N0} rows; AVG_RANGE_ROWS is {1}' $o.MaxValue (Format-Float $w.Avg)
+                $skew += $row
+            }
+            if (-not $o.Truncated) {
+                foreach ($k in 'Eq', 'Range', 'Distinct') {
+                    if ($null -eq $worst[$k] -or $row."$($k)QError" -gt $worst[$k]."$($k)QError") { $worst[$k] = $row }
+                }
+                $big = [Math]::Max([double]$w.Eq + [double]$w.Range, [double]($o.Eq + $o.Range))
+                if ($big -ge $minRows -and ($null -eq $rated -or $qe -gt $rated)) { $rated = $qe }
+            }
+        }
+        $result.Steps.Add($row)
+    }
+
+    # ---- summary
+    $rows = $result.Steps.ToArray()
+    $count ={ param([string]$R) @($rows | Where-Object { $_.Result -eq $R }).Count }
+    $checked = @($rows | Where-Object { $_.Result -in 'Exact', 'Good', 'Fair', 'Poor', 'Partial' })
+    $notChecked = & $count 'Not checked'
+    $partial = & $count 'Partial'
+    $failed = & $count 'Error'
+    $differ = @($checked | Where-Object { $_.Result -ne 'Exact' }).Count
+    if ($checked.Count -eq 0) { $result.Result = 'Not checked' }
+    elseif ($expectExact) { $result.Result = $(if ($differ -eq 0) { 'Exact match' } else { 'Differs' }) }
+    elseif ($null -eq $rated -or $rated -le 2) { $result.Result = 'Good' } elseif ($rated -le 10) { $result.Result = 'Fair' } else { $result.Result = 'Poor' }
+
+    $summary['Result'] = $result.Result
+    $summary['Index read'] = Format-Invariant '{0} ({1}): {2:N0} leaf pages, {3:N0} rows' $ix.name $ix.type_desc $indexPages $indexRows
+    $summary['Coverage'] = $(if ($notChecked + $failed -eq 0) { "every range: $($real.Count) steps" + $(if ($meta.is_nullable) { ', NULL rows' } else { '' }) + ' and rows above the last step' }
+        else { Format-Invariant "spot check: $($rows.Count - $notChecked - $failed) of $($rows.Count) ranges (page budget {0:N0} pages)" $PageBudget })
+    $summary['Pages read (estimated)'] = Format-Invariant '{0:N0}' ([Math]::Ceiling($spent))
+    $summary['Duration'] = Format-Invariant '{0:0.0} s' ([DateTime]::Now - $started).TotalSeconds
+    $summary['Sample'] = $(if ($fullscan) { Format-Invariant 'FULLSCAN ({0:N0} rows)' $D.Blob.Rows } else { Format-Invariant '{0:0.##}% ({1:N0} of {2:N0} rows)' (100.0 * $D.Blob.RowsSampled / [Math]::Max(1, $D.Blob.Rows)) $D.Blob.RowsSampled $D.Blob.Rows })
+    $modPct = $(if ($null -ne $mods -and $statsRows -gt 0) { 100.0 * $mods / $statsRows } else { $null })
+    $summary['Modifications since the update'] = $(if ($null -eq $mods) { 'unknown' } else { Format-Invariant '{0:N0} ({1:0.##}% of the rows)' $mods $modPct })
+    if ($notChecked + $failed + $partial -eq 0) { $summary['Rows in the table now'] = Format-Invariant '{0:N0} (statistics: {1:N0})' $tableTotal $D.Blob.Rows }
+    $above = $rows | Where-Object { $_.Kind -eq 'Above last step' -and $null -ne $_.TableRangeRows }
+    if ($above) { $summary['Rows above the last step'] = Format-Invariant '{0:N0} (leading column type: {1})' $above.TableRangeRows $D.LeadingColumnType }
+    foreach ($k in @(@('Eq', 'EQ_ROWS', 'StatsEqRows', 'TableEqRows'), @('Range', 'RANGE_ROWS', 'StatsRangeRows', 'TableRangeRows'), @('Distinct', 'DISTINCT_RANGE_ROWS', 'StatsDistinct', 'TableDistinct'))) {
+        $r = $worst[$k[0]]
+        if ($r) { $summary["Worst $($k[1]) q-error"] = Format-Invariant '{0} at {1} (statistics {2}, table {3:N0})' $r."$($k[0])QError" (& $label $r) (Format-Float $r.($k[2])) $r.($k[3]) }
+    }
+    $summary['Ranges by result'] = (@('Exact', 'Good', 'Fair', 'Poor', 'Partial', 'Error', 'Not checked') | ForEach-Object { $n = & $count $_; if ($n) { "$_ $n" } }) -join ', '
+    $summary['Steps hiding a frequent value'] = $skew.Count
+    if ($updatedDuring) { $summary['Statistics updated during the check'] = 'yes' }
+
+    # ---- findings
+    $pctText = $(if ($null -ne $modPct) { Format-Invariant '{0:0.##}%' $modPct } else { '' })
+    if ($checked.Count -gt 0) {
+        if ($expectExact) {
+            if ($differ -eq 0) { $findings.Add('FULLSCAN statistics with no modifications since the update: every range read matches the table exactly.') }
+            else {
+                $text = "These are FULLSCAN statistics with no modifications since the update, so every range should match the table exactly, but $differ range(s) do not. " +
+                'The statistics were probably loaded with UPDATE STATISTICS ... WITH STATS_STREAM, or rows changed while the check ran (it reads under READ UNCOMMITTED).'
+                if ($Stat.no_recompute -eq $true) { $text += ' NORECOMPUTE is on, as it often is for statistics loaded from an edited stream.' }
+                $findings.Add($text)
+            }
+        } elseif ($null -eq $mods) {
+            $findings.Add('The modification counter is not available, so differences can be sampling error or data changes.')
+        } elseif ($mods -eq 0) {
+            $findings.Add("No rows changed since the update: the differences are sampling error, from a sample of $($summary['Sample']).")
+            if ($result.Result -in 'Fair', 'Poor') {
+                $advice = 'A higher sample rate (UPDATE STATISTICS ... WITH SAMPLE n PERCENT, or FULLSCAN) brings the histogram closer to the data'
+                if ($D.PersistedSamplePercent) { $advice += (Format-Invariant '; the persisted sample percent is {0:0.##}%, raise it' $D.PersistedSamplePercent) }
+                else { $advice += '; add PERSIST_SAMPLE_PERCENT = ON so automatic updates keep that rate' }
+                $findings.Add("$advice.")
+            } else { $findings.Add('The sample rate is enough for this histogram.') }
+        } elseif ($fullscan) {
+            $findings.Add((Format-Invariant "FULLSCAN statistics are exact when built, so the differences come from the {0:N0} modifications since the update ($pctText of the rows), not from sampling." $mods))
+        } else {
+            $findings.Add((Format-Invariant "The differences mix sampling error and {0:N0} modifications since the update ($pctText of the rows). Update the statistics and check again to tell them apart." $mods))
+        }
+    }
+    # rows outside the histogram's ends: new keys after the update (ascending/descending key), or keys the sample missed
+    $changed = $null -eq $mods -or $mods -gt 0
+    if ($above -and $above.TableRangeRows -gt 0) {
+        if ($changed) { $findings.Add((Format-Invariant '{0:N0} rows are above the last step, where the histogram has no data (ascending key). Leading column type: {1}.' $above.TableRangeRows $D.LeadingColumnType)) }
+        else { $findings.Add((Format-Invariant '{0:N0} rows are above the last step: keys the sample missed, as no rows changed since the update.' $above.TableRangeRows)) }
+    }
+    $firstStep = $rows | Where-Object { $_.Kind -eq 'Step' } | Select-Object -First 1
+    if ($firstStep -and $null -ne $firstStep.TableRangeRows -and $firstStep.StatsRangeRows -eq 0 -and $firstStep.TableRangeRows -gt 0) {
+        if ($changed) { $findings.Add((Format-Invariant '{0:N0} rows are below the first step''s key, where the histogram has none (descending key).' $firstStep.TableRangeRows)) }
+        else { $findings.Add((Format-Invariant '{0:N0} rows are below the first step''s key: keys the sample missed, as no rows changed since the update.' $firstStep.TableRangeRows)) }
+    }
+    if ($skew.Count -gt 0) {
+        $top = $skew | Sort-Object { $_.MaxRowsPerValue / [Math]::Max(1.0, [double]$_.AvgRangeRows) } -Descending | Select-Object -First 1
+        $findings.Add((Format-Invariant ('{0} step(s) hide a value with at least 10 times AVG_RANGE_ROWS (largest: {1:N0} rows at step {2}, AVG_RANGE_ROWS {3}). ' +
+                    'Equality predicates on such a value are estimated at AVG_RANGE_ROWS.') $skew.Count $top.MaxRowsPerValue $top.Step (Format-Float $top.AvgRangeRows)))
+    }
+    if ($partial -gt 0) { $findings.Add("$partial range(s) stopped at the page budget; their table counts are lower bounds.") }
+    if ($notChecked -gt 0 -and $errors -lt 3) {
+        $findings.Add((Format-Invariant '{0} range(s) were not read: the index has {1:N0} leaf pages and the page budget is {2:N0}. Raise the budget to check every step.' $notChecked $indexPages $PageBudget))
+    }
+    if ($failed -gt 0) { $findings.Add("$failed range(s) failed: $lastError") }
+    if ($updatedDuring) { $findings.Add('The statistics were updated by another session while the check ran; the comparison uses the stream read before the check.') }
+    return $result
+}
+
 #endregion
 
 #region ---------------------------------------------------------------- windows forms app
@@ -2198,6 +2627,7 @@ function Get-GuiDefaultSettings {
     return [ordered]@{
         Theme = 'Dark'; ServerInstance = ''; Servers = @(); SqlAuthentication = $false; Login = ''; TrustServerCertificate = $true
         Validate = $true; UseDac = $false; HexDump = $false; FullPrecision = $false; StringIndexNodes = 300; SampledScanValues = 20; TrieOrientation = 'LeftToRight'
+        CheckPageBudget = 100000; CheckTimeout = 60; CheckStepDelay = 0
     }
 }
 
@@ -2213,6 +2643,9 @@ function Read-GuiSettings {
     if ($settings.Theme -notin 'Light', 'Dark') { $settings.Theme = 'Dark' }
     if ($settings.TrieOrientation -notin 'TopDown', 'LeftToRight') { $settings.TrieOrientation = 'LeftToRight' }
     foreach ($k in 'StringIndexNodes', 'SampledScanValues') { $settings[$k] = [int][Math]::Min([Math]::Max(0, [int]$settings[$k]), 1000000) }
+    $settings.CheckPageBudget = [long][Math]::Min([Math]::Max(1, [long]$settings.CheckPageBudget), 1000000000)
+    $settings.CheckTimeout = [int][Math]::Min([Math]::Max(1, [int]$settings.CheckTimeout), 3600)
+    $settings.CheckStepDelay = [int][Math]::Min([Math]::Max(0, [int]$settings.CheckStepDelay), 60000)
     return $settings
 }
 
@@ -2238,9 +2671,11 @@ function Get-GuiPalette {
 }
 
 function Get-GuiResultColor([string]$Result) {
-    # Validation results (Test-StatsAgainstServer) in the Security Review status colors.
-    if ($script:GuiTheme -eq 'Dark') { $map = @{ OK = '7CD6AE'; MISMATCH = 'FF9696'; INFO = '91C9FF'; SKIPPED = 'BCC5D0' } }
-    else { $map = @{ OK = '207A5C'; MISMATCH = 'B83939'; INFO = '2D69AA'; SKIPPED = '646E7A' } }
+    # Validation results (Test-StatsAgainstServer) in the Security Review status colors, and the data check ratings.
+    if ($script:GuiTheme -eq 'Dark') { $map = @{ OK = '7CD6AE'; MISMATCH = 'FF9696'; INFO = '91C9FF'; SKIPPED = 'BCC5D0'; WARN = 'F2C46D' } }
+    else { $map = @{ OK = '207A5C'; MISMATCH = 'B83939'; INFO = '2D69AA'; SKIPPED = '646E7A'; WARN = '9A6700' } }
+    $alias = @{ 'Exact' = 'OK'; 'Exact match' = 'OK'; 'Good' = 'OK'; 'Fair' = 'WARN'; 'Poor' = 'MISMATCH'; 'Differs' = 'MISMATCH'; 'Error' = 'MISMATCH'; 'Partial' = 'SKIPPED'; 'Not checked' = 'SKIPPED'; 'Skipped' = 'SKIPPED' }
+    if ($Result -and $alias.ContainsKey($Result)) { $Result = $alias[$Result] }
     if ($Result -and $map.ContainsKey($Result)) { return [Drawing.ColorTranslator]::FromHtml('#' + $map[$Result]) }
     return (Get-GuiPalette).Text
 }
@@ -2615,6 +3050,8 @@ function Update-GuiCommandState {
     $g.Run.Enabled = $busy -or ($on -and $g.Tables.SelectedIndex -ge 0)
     $g.Run.Text = $(if ($busy) { 'Cancel  (Esc)' } else { 'Decode  (F5)' })
     $g.Progress.Visible = $busy
+    $current = Get-GuiCurrentResult
+    $g.CheckData.Enabled = -not $busy -and $on -and $current -and $current.PSObject.Properties['Target']
     $s = $g.Settings
     $g.DecodeHint.Text = 'Validation {0}, DAC {1}. Change in Settings (Ctrl+,).' -f $(if ($s.Validate) { 'on' } else { 'off' }), $(if ($s.UseDac) { 'on' } else { 'off' })
 }
@@ -2658,15 +3095,86 @@ function Start-GuiDecode([hashtable]$Offline) {
     $pending = Get-GuiPendingEdits
     if ($pending -and [Windows.Forms.MessageBox]::Show($g.Form, "$($pending.Count) statistics object(s) have edits that a new decode will discard. Continue?", 'SQLStatsXRay', 'YesNo', 'Warning') -ne 'Yes') { return }
     $g.ReportName = $(if ($p.Database) { 'StatsStream_' + ("$($p.Database)_$($p.Table)" -replace '[\[\]\\/:*?"<>|\s]', '') } else { 'StatsStream_report' })
-    # The decode runs in its own runspace so the window stays responsive and can cancel it.
+    Start-GuiJob $p 'Decoding'
+}
+
+function Start-GuiJob([hashtable]$Parameters, [string]$Activity, $Check) {
+    # The script runs in its own runspace so the window stays responsive and can cancel it.
+    $g = $script:App
     $ps = [PowerShell]::Create()
     $ps.Runspace = [RunspaceFactory]::CreateRunspace()
     $ps.Runspace.Open()
-    $null = $ps.AddCommand($script:DecoderPath).AddParameters($p)
-    $g.Job = @{ PowerShell = $ps; Async = $ps.BeginInvoke(); Started = [DateTime]::Now; FullPrecision = [bool]$p.FullPrecision }
+    $null = $ps.AddCommand($script:DecoderPath).AddParameters($Parameters)
+    $g.Job = @{ PowerShell = $ps; Async = $ps.BeginInvoke(); Started = [DateTime]::Now; FullPrecision = [bool]$Parameters.FullPrecision; Activity = $Activity; Check = $Check }
     Update-GuiCommandState
-    Set-GuiStatus 'Decoding...'
+    Set-GuiStatus "$Activity..."
     $g.Timer.Start()
+}
+
+function Start-GuiDataCheck {
+    # Checks the selected statistics object's histogram against its table (opt-in: it reads the table through an index).
+    $g = $script:App
+    if ($g.Job) { return }
+    $D = Get-GuiCurrentResult
+    if (-not $D -or -not $D.PSObject.Properties['Target']) { Show-GuiMessage 'The data check needs statistics decoded from a server. Connect (Ctrl+N), decode a table (F5), then pick a statistics object.' 'Warning'; return }
+    if (-not $g.Conn -or $g.Conn.Server -ne $D.Target.Server) { Show-GuiMessage "Connect to $($D.Target.Server) to check these statistics against their table." 'Warning'; return }
+    if (Get-GuiPendingEdits) { Set-GuiStatus 'The data check reads the statistics as stored on the server, not your edits.' }
+    $s = $g.Settings
+    $p = @{
+        GuiRun = $true; ServerInstance = $g.Conn.Server; Database = $D.Target.Database; Table = $D.Target.Table; Statistics = [string[]]@($D.Target.Statistics)
+        VerifyData = $true; VerifyPageBudget = [long]$s.CheckPageBudget; VerifyTimeout = [int]$s.CheckTimeout; VerifyStepDelay = [int]$s.CheckStepDelay
+        FullPrecision = [bool]$s.FullPrecision; TrustServerCertificate = [bool]$g.Conn.Trust
+    }
+    if ($g.Conn.SqlAuth) { $p.Credential = New-Object Management.Automation.PSCredential ($g.Conn.Login, $g.Conn.Password) }
+    Start-GuiJob $p "Checking $($D.Target.Statistics) against the table" @{ Index = $g.Picker.SelectedIndex; Result = $D }
+}
+
+function Complete-GuiDataCheck($Job, $Result, [string[]]$Notes) {
+    $g = $script:App
+    $D = $Job.Check.Result
+    $new = @($Result.Objects) | Select-Object -First 1
+    if (-not $new -or -not $new.PSObject.Properties['DataCheck']) { Set-GuiStatus 'Data check failed.'; Show-GuiMessage ((@('The data check returned no result.') + $Notes) -join [Environment]::NewLine) 'Error'; return }
+    $check = $new.DataCheck
+    if ($D.Blob -and $new.Blob -and $D.Blob.Updated -ne $new.Blob.Updated) {
+        # compared with the statistics as they are now, which differ from the decoded ones shown in the other tabs
+        $check.Findings.Insert(0, 'The statistics were updated on the server after this decode: the check used the current statistics. Decode again (F5) to see them.')
+    }
+    $D | Add-Member DataCheck $check -Force
+    $lines = @('', ('#' * 100), "  Data check: $($new.Label)", ('#' * 100)) + [string[]](Format-DataCheckSection $check)
+    $g.Report.AppendText((@($Notes) + $lines) -join [Environment]::NewLine)
+    $g.HasReport = $true
+    if ($g.Picker.SelectedIndex -eq $Job.Check.Index) { Show-GuiDataCheck $D; $g.Tabs.SelectedTab = $g.CheckPage }
+    $detail = $(if ($check.Summary['Coverage']) { 'Read ' + $check.Summary['Coverage'] } else { 'Not checked: ' + $check.Summary['Reason'] })
+    Set-GuiStatus ('Data check of {0}: {1}. {2}' -f $D.Target.Statistics, $check.Result, $detail.TrimEnd('.') + '.')
+}
+
+function Show-GuiDataCheck($D) {
+    $g = $script:App
+    $check = $null
+    if ($D -and $D.PSObject.Properties['DataCheck']) { $check = $D.DataCheck }
+    $summary = @(); $steps = @()
+    if ($check) {
+        $summary = foreach ($k in $check.Summary.Keys) { [pscustomobject]@{ Field = $k; Value = [string]$check.Summary[$k]; Result = $(if ($k -eq 'Result') { [string]$check.Summary[$k] }) } }
+        $steps = $check.Steps.ToArray()
+        $g.CheckFindings.Text = ($check.Findings | ForEach-Object { [char]0x2022 + ' ' + $_ }) -join ([Environment]::NewLine + [Environment]::NewLine)
+    } else {
+        $g.CheckFindings.Text = $(if ($D -and $D.PSObject.Properties['Target']) { 'Not checked yet. Check against the table (F6) reads the table through an index and compares every step with the real counts.' }
+            elseif ($D) { 'The data check needs statistics decoded from a server.' } else { '' })
+    }
+    $grid = $g.Grids.CheckSummary
+    Set-GuiGrid $grid $summary Field, Value, Result
+    $grid.Columns['Result'].Visible = $false
+    Set-GuiGrid $g.Grids.CheckSteps $steps Step, Kind, Result, StatsEqRows, TableEqRows, EqQError, StatsRangeRows, TableRangeRows, RangeQError,
+    StatsDistinct, TableDistinct, DistinctQError, AvgRangeRows, MaxRowsPerValue, Note
+    # the summary gets the room its rows and columns need; the findings and the ranges take the rest
+    $outer = $g.CheckSplits[0]; $inner = $g.CheckSplits[1]
+    if ($summary) {
+        $w = $grid.Columns.GetColumnsWidth('Visible') + [Windows.Forms.SystemInformation]::VerticalScrollBarWidth + 4
+        $h = $grid.ColumnHeadersHeight + $grid.Rows.GetRowsHeight('Visible') + [Windows.Forms.SystemInformation]::HorizontalScrollBarHeight + 4
+        try { $inner.SplitterDistance = [int][Math]::Max(120, [Math]::Min($w, $inner.Width - 240)) } catch { }
+        try { $outer.SplitterDistance = [int][Math]::Max(80, [Math]::Min($h, $outer.Height * 0.55)) } catch { }
+    }
+    Update-GuiCommandState
 }
 
 function Stop-GuiDecode {
@@ -2695,10 +3203,11 @@ function Complete-GuiDecode {
     if ($failure -is [Management.Automation.PipelineStoppedException]) { Set-GuiStatus 'Cancelled.'; return }
     if ($failure -or -not $result) {
         $message = $(if ($failure) { $failure.Message } else { 'The decoder returned no result.' })
-        Set-GuiStatus 'Decode failed.'
+        Set-GuiStatus $(if ($job.Check) { 'Data check failed.' } else { 'Decode failed.' })
         Show-GuiMessage (@($message) + $notes -join [Environment]::NewLine) 'Error'
         return
     }
+    if ($job.Check) { Complete-GuiDataCheck $job $result $notes; return }
 
     $g.Results = @($result.Objects)
     $g.HasReport = $true
@@ -2843,7 +3352,9 @@ function Show-GuiResult($D) {
         foreach ($grid in $g.Grids.Values) { $grid.Rows.Clear(); $grid.Columns.Clear() }
         $g.ChartSteps = @(); $g.Chart.Invalidate()
         Show-GuiTrie $null
+        $g.CheckFindings.Text = ''
         Set-GuiEditMode
+        Update-GuiCommandState
         return
     }
     if (-not $D.PSObject.Properties['EditModel']) { $D | Add-Member EditModel (New-StatsEditModel $D) }
@@ -2875,6 +3386,7 @@ function Show-GuiResult($D) {
         $validation = $null
         if ($D.PSObject.Properties['Validation']) { $validation = $D.Validation }
         Set-GuiGrid $g.Grids.Validation $validation Check, Server, Decoded, Result
+        Show-GuiDataCheck $D
     } finally { $g.Loading = $false }
     Set-GuiEditMode
 }
@@ -4058,6 +4570,18 @@ function Show-GuiSettingsDialog {
     Add-GuiRow $d.Layout '' (& $note ('Reads the current Snapshot Ctr of the trace flag 2388 history from sys.sysobjvalues, which only the dedicated admin connection ' +
             'can query. Needs sysadmin; the DAC allows one session per instance, and remote DAC is off by default. Off: the Snapshot Ctr is estimated.'))
 
+    Add-GuiRow $d.Layout '' (New-GuiHeading 'Data check (F6)')
+    # page budget, query timeout and pause on one row
+    $budget = New-GuiControl NumericUpDown @{ Minimum = 1; Maximum = 1000000000; Value = [long]$s.CheckPageBudget; Width = $numberWidth; ThousandsSeparator = $true }
+    $timeout = New-GuiControl NumericUpDown @{ Minimum = 1; Maximum = 3600; Value = [int]$s.CheckTimeout; Width = [int](70 * $sc) }
+    $delay = New-GuiControl NumericUpDown @{ Minimum = 0; Maximum = 60000; Value = [int]$s.CheckStepDelay; Width = [int](80 * $sc) }
+    $checkRow = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $false; Anchor = 'Left'; Margin = (New-Object Windows.Forms.Padding 0) }
+    $checkLabel = { param([string]$Text) New-GuiControl Label @{ Text = $Text; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 16, 6, 4, 3) } }
+    $checkRow.Controls.AddRange(@($budget, (& $checkLabel 'Timeout (s)'), $timeout, (& $checkLabel 'Pause per step (ms)'), $delay))
+    Add-GuiRow $d.Layout 'Page budget' $checkRow
+    Add-GuiRow $d.Layout '' (& $note ('Leaf pages one check may read (8 KB each; 100,000 is about 780 MB). On a larger index the check reads the NULL rows, both ends of ' +
+            'the histogram, then steps at random while they fit. The pause spreads the queries on a busy server.') 3)
+
     Add-GuiRow $d.Layout '' (New-GuiHeading 'Report')
     $hexDump = New-GuiControl CheckBox @{ Text = 'Include the layout map and a hex dump'; AutoSize = $true; Checked = [bool]$s.HexDump }
     Add-GuiRow $d.Layout '' $hexDump
@@ -4075,24 +4599,26 @@ function Show-GuiSettingsDialog {
     Add-GuiRow $d.Layout 'Synopsis values' $scan
     Add-GuiRow $d.Layout '' (& $note ('Values the report prints per density vector from the distinct value synopsis that sampled updates keep: the smallest ' +
             'hash values seen, which SQL Server uses to estimate distinct counts and to merge statistics. 0 = no limit.') 3)
-    Add-GuiRow $d.Layout '' (New-GuiControl Label @{ Text = 'The theme changes at once; the other options apply to the next decode.'; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 3, 6, 3, 0) })
+    Add-GuiRow $d.Layout '' (New-GuiControl Label @{ Text = 'The theme changes at once; the other options apply to the next decode or data check.'; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 3, 6, 3, 0) })
     $buttons = Add-GuiDialogButtons $d 'OK'
     $defaults = New-GuiControl Button @{ Text = 'Restore defaults'; AutoSize = $true; Padding = (New-Object Windows.Forms.Padding 8, 2, 8, 2); Margin = (New-Object Windows.Forms.Padding 3, 3, 24, 3) }
     $buttons.Panel.Controls.Add($defaults)
     $buttons.Ok.DialogResult = 'OK'
-    $g.Dlg = @{ Theme = $theme; Validate = $validate; Dac = $dac; HexDump = $hexDump; FullPrecision = $fullPrecision; Trie = $trie; Scan = $scan }
+    $g.Dlg = @{ Theme = $theme; Validate = $validate; Dac = $dac; HexDump = $hexDump; FullPrecision = $fullPrecision; Trie = $trie; Scan = $scan; Budget = $budget; Timeout = $timeout; Delay = $delay }
     $defaults.Add_Click({
             $x = $script:App.Dlg
             $def = Get-GuiDefaultSettings
             $x.Theme.SelectedItem = $def.Theme; $x.Validate.Checked = $def.Validate; $x.Dac.Checked = $def.UseDac
             $x.HexDump.Checked = $def.HexDump; $x.FullPrecision.Checked = $def.FullPrecision
             $x.Trie.Value = $def.StringIndexNodes; $x.Scan.Value = $def.SampledScanValues
+            $x.Budget.Value = $def.CheckPageBudget; $x.Timeout.Value = $def.CheckTimeout; $x.Delay.Value = $def.CheckStepDelay
         })
     try { $result = $d.Form.ShowDialog($g.Form) }
     finally { $g.Dlg = $null; $d.Form.Dispose() }
     if ($result -ne 'OK') { return }
     $s.Validate = $validate.Checked; $s.UseDac = $dac.Checked; $s.HexDump = $hexDump.Checked; $s.FullPrecision = $fullPrecision.Checked
     $s.StringIndexNodes = [int]$trie.Value; $s.SampledScanValues = [int]$scan.Value
+    $s.CheckPageBudget = [long]$budget.Value; $s.CheckTimeout = [int]$timeout.Value; $s.CheckStepDelay = [int]$delay.Value
     if ([string]$theme.SelectedItem -ne $script:GuiTheme) { Set-GuiTheme ([string]$theme.SelectedItem) } else { Save-GuiSettings }
     Update-GuiCommandState
     Set-GuiStatus 'Settings saved. Decode options apply to the next decode.'
@@ -4500,6 +5026,34 @@ function Show-DecoderWindow {
         $tabs.TabPages.Add($page)
         $g.Grids[$t[0]] = $grid
     }
+
+    # ---- data check: the button and a note, then summary | findings, then one row per range
+    $g.CheckPage = New-GuiControl TabPage @{ Text = 'Data check'; Padding = (New-Object Windows.Forms.Padding 4) }
+    $checkBar = New-GuiControl FlowLayoutPanel @{ Dock = 'Top'; AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0) }
+    $g.CheckData = New-GuiControl Button @{ Text = 'Check against the table  (F6)'; AutoSize = $true; Tag = 'Primary'; Enabled = $false; Padding = (New-Object Windows.Forms.Padding 8, 2, 8, 2); Margin = (New-Object Windows.Forms.Padding 3, 3, 3, 6) }
+    $checkHint = New-GuiControl Label @{
+        AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 10, 9, 3, 6)
+        Text = 'One index seek per step, within the page budget (Settings). Shows step numbers and counts, not key values.'
+    }
+    $checkBar.Controls.AddRange(@($g.CheckData, $checkHint))
+    $checkSplit = New-GuiControl SplitContainer @{ Dock = 'Fill'; Orientation = 'Horizontal'; SplitterWidth = 6 }
+    $topSplit = New-GuiControl SplitContainer @{ Dock = 'Fill'; SplitterWidth = 6 }
+    foreach ($name in 'CheckSummary', 'CheckSteps') {
+        $g.Grids[$name] = New-GuiControl DataGridView @{
+            Name = $name; Dock = 'Fill'; ReadOnly = $true; AllowUserToAddRows = $false; AllowUserToDeleteRows = $false; RowHeadersVisible = $false
+            AutoSizeColumnsMode = 'AllCells'; ClipboardCopyMode = 'EnableWithAutoHeaderText'; BorderStyle = 'None'
+        }
+    }
+    $g.CheckFindings = New-GuiControl TextBox @{ Dock = 'Fill'; ReadOnly = $true; Multiline = $true; WordWrap = $true; ScrollBars = 'Vertical'; BorderStyle = 'None' }
+    $topSplit.Panel1.Controls.Add($g.Grids.CheckSummary)
+    $topSplit.Panel2.Controls.Add($g.CheckFindings)
+    $checkSplit.Panel1.Controls.Add($topSplit)
+    $checkSplit.Panel2.Controls.Add($g.Grids.CheckSteps)
+    $g.CheckPage.Controls.Add($checkSplit)
+    $g.CheckPage.Controls.Add($checkBar)
+    $tabs.TabPages.Add($g.CheckPage)
+    $g.CheckSplits = @($checkSplit, $topSplit)
+    $g.Tabs = $tabs
     $right.Controls.Add($tabs, 0, 1)
     $split.Panel2.Controls.Add($right)
     $g.HistMenu = New-Object Windows.Forms.ContextMenuStrip
@@ -4524,7 +5078,7 @@ function Show-DecoderWindow {
             $job = $script:App.Job
             if (-not $job) { $script:App.Timer.Stop(); return }
             if ($job.Async.IsCompleted) { Complete-GuiDecode }
-            else { Set-GuiStatus ('Decoding... {0:0} s' -f ([DateTime]::Now - $job.Started).TotalSeconds) }
+            else { Set-GuiStatus ('{0}... {1:0} s' -f $job.Activity, ([DateTime]::Now - $job.Started).TotalSeconds) }
         })
     $g.Run.Add_Click({ if ($script:App.Job) { Stop-GuiDecode } else { Start-GuiDecode } })
     $g.Database.Add_SelectedIndexChanged({ if (-not $script:App.Loading) { Invoke-GuiBrowse Tables } })
@@ -4625,6 +5179,14 @@ function Show-DecoderWindow {
             try { $s.SplitterDistance = [int][Math]::Min([Math]::Max(60, ($s.Height - $s.SplitterWidth) * $script:App.HistRatio), [Math]::Max(60, $s.Height - $s.SplitterWidth - 60)) } catch { }
         })
     $g.HistSplit.Add_SplitterMoved({ param($s, $e) if ($s.Height -gt 0) { $script:App.HistRatio = $s.SplitterDistance / [double]($s.Height - $s.SplitterWidth) } })
+    $g.CheckData.Add_Click({ Start-GuiDataCheck })
+    $g.Grids.CheckSummary.Add_CellFormatting({
+            # the Result row's value in its rating color
+            param($s, $e)
+            if ($e.RowIndex -ge 0 -and $s.Columns[$e.ColumnIndex].Name -eq 'Value' -and [string]$s.Rows[$e.RowIndex].Cells['Field'].Value -eq 'Result') {
+                $e.CellStyle.ForeColor = Get-GuiResultColor ([string]$e.Value)
+            }
+        })
     $form.Add_KeyDown({
             param($s, $e)
             $app = $script:App
@@ -4634,6 +5196,7 @@ function Show-DecoderWindow {
                 elseif ($app.Conn) { Set-GuiStatus 'Pick a table first.' }
                 else { Set-GuiStatus 'Connect to a server first (Ctrl+N), or paste a STATS_STREAM (Ctrl+Shift+V).' }
             }
+            if ($e.KeyCode -eq 'F6' -and -not $app.Job) { $e.Handled = $true; Start-GuiDataCheck }
             if ($e.KeyCode -eq 'Escape' -and $app.Job) { $e.Handled = $true; Stop-GuiDecode }
         })
     $form.Add_Load({
@@ -4763,11 +5326,16 @@ EXEC sys.sp_executesql @cmd;
             if ($st.Table.Columns.Contains('has_persisted_sample')) { $info['Has persisted sample'] = $st.has_persisted_sample }
             $d | Add-Member ServerInfo $info
             # Where an edited copy of these statistics would be loaded back (the app's script generator).
-            $d | Add-Member Target ([pscustomobject]@{ Database = $Database; Table = $qualified; Statistics = $statName; NoRecompute = [bool]$st.no_recompute })
+            $d | Add-Member Target ([pscustomobject]@{ Server = [string]$csb['Data Source']; Database = $Database; Table = $qualified; Statistics = $statName; NoRecompute = [bool]$st.no_recompute })
 
             if ($Validate) {
                 $checks = Test-StatsAgainstServer $d $cn $qualified $statName $tf2388
                 $d | Add-Member Validation $checks
+            }
+            if ($VerifyData) {
+                try { $check = Test-StatsAgainstData -D $d -Connection $cn -ObjectId $target.ObjectId -Stat $st -QualifiedTable $qualified -PageBudget $VerifyPageBudget -TimeoutSeconds $VerifyTimeout -StepDelay $VerifyStepDelay }
+                catch { $check = New-DataCheckResult "the check failed: $($_.Exception.Message)" }
+                $d | Add-Member DataCheck $check
             }
             $objects += $d
             if ($buildReport) {
@@ -4778,6 +5346,7 @@ EXEC sys.sp_executesql @cmd;
                     $nbad = @($d.Validation | Where-Object { $_.Result -eq 'MISMATCH' }).Count
                     $allLines.Add($(if ($nbad -eq 0) { 'VALIDATION PASSED' } else { "VALIDATION FAILED: $nbad check(s)" }))
                 }
+                if ($VerifyData) { $allLines.AddRange([string[]](Format-DataCheckSection $d.DataCheck)) }
                 $allLines.Add('')
             }
         }

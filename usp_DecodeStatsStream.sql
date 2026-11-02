@@ -556,11 +556,13 @@ WHERE p.object_id = @o
                    MAX(CASE fld WHEN 'unused20' THEN lo END), CASE WHEN MAX(CASE fld WHEN 'flags' THEN i END) & 1 = 1 THEN 0 ELSE 1 END
             FROM #F WHERE grp = 'c' GROUP BY idx;
 
-            -- column names (on a lock timeout the decode continues with Column1..N)
+            -- column names (on a lock timeout the decode continues with Column1..N); an index's columns
+            -- follow key_ordinal, as the stream does (sys.stats_columns lists them in index_column_id order)
             BEGIN TRY
                 INSERT #Names (name) EXEC @proc N'
 SELECT c.name FROM sys.stats_columns sc JOIN sys.columns c ON c.object_id = sc.object_id AND c.column_id = sc.column_id
-WHERE sc.object_id = @o AND sc.stats_id = @st ORDER BY sc.stats_column_id;', N'@o int, @st int', @objId, @statsId;
+LEFT JOIN sys.index_columns ic ON ic.object_id = sc.object_id AND ic.index_id = sc.stats_id AND ic.column_id = sc.column_id AND ic.key_ordinal > 0
+WHERE sc.object_id = @o AND sc.stats_id = @st ORDER BY COALESCE(ic.key_ordinal, sc.stats_column_id);', N'@o int, @st int', @objId, @statsId;
                 IF (SELECT COUNT(*) FROM #Names) < @ncols
                 BEGIN
                     -- nonclustered index statistics carry the clustering key as trailing columns
