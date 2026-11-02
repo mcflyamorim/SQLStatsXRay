@@ -59,13 +59,15 @@ It skips filtered, incremental and columnstore statistics, indexed views, memory
 - **Distinct values counted by page.** Values repeat within pages, so the distinct-value estimate counts each value's pages, not its rows. On a table whose values cluster by page, SQL Server's sampled statistic estimated 4,864 distinct values (true 40,001); the same pages gave 37,503 here.
 - **Five histogram algorithms**, all using every one of the 200 steps (SQL Server often stops well short): equal rows per step, biggest frequency changes, frequent values first, least variance (greedy v-optimal), and **Workload**: steps where your queries filter, read from **Query Store** (seek and predicate values, weighted by executions).
 - **Scored before they are written.** Every candidate and the current statistics get a q-error score for every distinct value, 1,000 random ranges and the workload, using the estimation rules measured on SQL Server 2025; the best one is written.
+- **A verdict, not a wall of numbers.** The report opens with one sentence: better than the current statistics, about the same, or not better (then loading it is not recommended). It names any measure that gets worse. Below it, only the chosen histogram is shown next to SQL Server's current statistics, in plain terms: "95% of values within 1.45x of the real count". `-ShowCandidates` (the app's **All algorithms** tab) lists every algorithm tried with all its scores.
+- **Strings too.** `char`, `varchar`, `nchar` and `nvarchar` keys are ordered and compared by the server in the column's collation. The string index SQL Server keeps for `LIKE` estimates is rebuilt from the same rows the way SQL Server builds it: on full scans of six test tables (binary, case-insensitive and SQL collations, long strings) it came out byte for byte identical to SQL Server's, and `LIKE` estimates matched. UTF-8 collations and double-byte code pages (Japanese, Chinese, Korean) get the histogram without a string index, so `LIKE` falls back to SQL Server's guesses.
 - **A whole table from one read.** With `-AllStatistics` (or "Every statistics object of the table" in the app), a sample is read once and serves every statistics object on the table; SQL Server samples the table again for each one.
 
-![The builder's results: the sample, the Query Store workload, and every candidate scored next to SQL Server's current statistics](assets/screenshot-builder.png)
+![The builder's results: the verdict, the sample and the Query Store workload, then the chosen histogram's accuracy next to SQL Server's current statistics](assets/screenshot-builder.png)
 
 Against the whole table, in the lab: on a column whose values cluster by page, equality estimates were off by 8.93x at the 95th percentile with SQL Server's statistic, 3.85x with a build from the same pages, and 1.11x with the adaptive sampler. On a table with a Query Store workload, the workload's 95th percentile went from 5.31x to 2.59x. A full-scan build of 20 million rows took 4.2 s, as long as SQL Server's parallel `FULLSCAN` (and 5 times less than SQL Server on one core); a sampled build takes under a second.
 
-Limits of this version: statistics on one column of numbers, dates and times, `uniqueidentifier` or binary data (no strings yet: their statistics carry a string index the builder cannot write), on tables. Nonclustered index statistics carry the clustering key and are skipped. Scores of a sampled build are measured against the sample; score the loaded statistics with a full scan for a verdict.
+Limits of this version: statistics on one column of numbers, dates and times, strings, `uniqueidentifier` or binary data, on tables. Nonclustered index statistics carry the clustering key and are skipped. Scores of a sampled build are measured against the sample; score the loaded statistics with a full scan for a verdict.
 
 **NORECOMPUTE is recommended** but not added by default: without it, the next automatic update replaces the built histogram with SQL Server's own; with it, the statistics never update by themselves, so rebuild them when the data changes and keep them out of maintenance jobs that update statistics.
 
@@ -76,8 +78,8 @@ Limits of this version: statistics on one column of numbers, dates and times, `u
 # A new statistics object on a column, from a full scan
 .\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.Orders -Column ShipDate -Build -Sample FULLSCAN -OutputScript .\build.sql
 
-# Every statistics object of a table, from one read
-.\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.Orders -Build -AllStatistics -OutputScript .\build.sql
+# Every statistics object of a table, from one read, with every algorithm's scores
+.\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.Orders -Build -AllStatistics -ShowCandidates -OutputScript .\build.sql
 ```
 
 The binary layout is documented in [STATS_STREAM-format.md](STATS_STREAM-format.md).
@@ -103,7 +105,7 @@ Double-click `SQLStatsXRay.cmd`, or run:
 - **File > Connect...** to a server, then pick a database, filter the table list and choose a statistic. Browsing stays disabled until you connect.
 - **File > Paste STATS_STREAM...** decodes a stream copied from SSMS (the whole DBCC row or just the `0x...` value), with no server needed. **File > Open STATS_STREAM file...** does the same from a file.
 - Tabs: Report, Header, Histogram (with a chart), Density vector, String index (tree view, left to right or top down), Columns, TF 2388, Validation and Data check.
-- **Tools > Build statistics (beta)...** (Ctrl+B) builds a histogram of our own for the statistics object shown, a new one on a column, or every statistics object of the table (see [Statistics builder](#statistics-builder-beta)). The results window shows the report and the script; **Show histogram** opens the built histogram in the tabs.
+- **Tools > Build statistics (beta)...** (Ctrl+B) builds a histogram of our own for the statistics object shown, a new one on a column, or every statistics object of the table (see [Statistics builder](#statistics-builder-beta)). The results window shows the verdict and the report, every algorithm's scores (**All algorithms**) and the script; **Show histogram** opens the built histogram in the tabs.
 - **Check against the table (F6)** on the Data check tab compares the selected statistics object's histogram with the table data (see [Checking histograms against the data](#checking-histograms-against-the-data)). It runs only when you ask, one statistics object at a time.
 - **Edit statistics** turns on editing of the header, histogram steps (insert and delete with a right click) and density vector. **Generate script...** builds the edited stream with a new checksum and writes the `UPDATE STATISTICS ... WITH STATS_STREAM` script, optionally with `NORECOMPUTE` and a commented block that restores the original statistics. The app never runs the script itself.
 - **Tools > Settings...** holds the theme, connection defaults and report limits. They are saved per user in `%LOCALAPPDATA%\SQLStatsXRay\settings.json`. Passwords are never saved.

@@ -222,6 +222,31 @@ On disk these nodes are written in pre-order (H, anari Carnes, ungry, Coyote Imp
 
 The occurrences add up to (strings sampled − NULLs). The nodes with occurrences, plus one when there are NULLs, equal the distinct count. Before the node encoder was checked, the decoders read every node as 5 bytes, which misread tries with a string repeated 16 or more times in the sample (3 of 446 tries in the lab).
 
+#### How SQL Server builds it
+
+From `COnDiskHistogram::AddValue`, `CTrieOnDisk::InsertString`, `FInsertSuffix`, `FAddNewChild` and `Flatten` in `sqllang.dll` 17.0.5035.5. The statistics builder follows these rules, and on serial (MAXDOP 1) `FULLSCAN` builds of six lab tables its tries were byte for byte identical to SQL Server's.
+
+- **Which columns.** char, varchar (including `max`), nchar and nvarchar, except UTF-8 collations. Trace flag 2317 turns the trie off (presence bit 1 is cleared).
+- **Input.** Every row StatMan feeds to the histogram (all rows for `FULLSCAN`, the sampled rows otherwise), in the collation's sort order, with a flag saying whether the row equals the previous one under the collation (so trailing spaces and, under CI, case don't count).
+- **Which rows reach the trie.** No randomness: an accumulator starts at `y − x`; each row adds `x`, and when it reaches `y` it subtracts `y` and the row is accepted. `y = R`, `x = min(2824 for 8-bit types or 2409 for n-types, R / 20 + 10, R)` (the division is on an unsigned 32-bit integer). `R` is the number of rows StatMan *expects*: the table rows for `FULLSCAN`, about pages sampled × rows / pages for a sample. It is not stored in the stream.
+- **Duplicates.** An accepted row equal to the previous accepted row only adds 1 to the previous node's count. If the previous row was rejected, the bytes inserted are that previous row's.
+- **Strings.** The stored bytes as they are (char padding kept). Over 80 characters (bytes for 8-bit types, UTF-16 units for n-types), the first 40 and the last 40 are kept. An empty string ends at the root. A NULL only counts in `nulls`, and the first one adds 1 to the distinct count.
+- **Insertion.** A radix trie of whole strings. Characters are compared one at a time in the column's collation, and children are kept in ascending collation order of their first character. A split keeps the tail pointing into the old segment.
+- **Character buffer.** Before a new segment is appended, the builder looks for it, exactly and in binary, anywhere in the buffer; the leftmost occurrence is reused. A partial match is not used.
+- **Budget.** 0x50000 bytes of in-memory cost: 48 per node, 1 or 2 per appended character. When an insert would go over, the trie is rebuilt: the existing occurrences are fed into a new trie that accepts `distinct` out of every `2 × count`. The string that overflowed is then inserted, with **half its length** for n-types (the character count is passed where a byte count is expected). Finally, `y` is multiplied by `floor(2 × count / distinct)`.
+- **Node count.** Every node ever allocated, the root included. Splits and rebuilds never free nodes in the written trie.
+- **Parallel builds.** Each thread builds a trie over its own range, and the tries are merged in thread registration order. The result depends on how the rows were split, so a parallel build can't be reproduced from the data alone.
+
+**Import checks** (Msg 9105, state 99):
+
+- marker and version
+- nulls ≤ sampled and distinct ≤ sampled
+- buffer length ≤ 282,483 characters and node count ≤ 65,536
+- every node segment lies inside the buffer
+- sampled = nulls + Σ occurrences
+
+The 0x80/0x40 flags are **not** checked, but the loader rebuilds the tree from them alone. A writer must produce flags that describe exactly the node count, in pre-order; the builder walks its trie to check this before it writes the stream.
+
 ### 4.3 Update history
 
 The item starts with an int32 record count, followed by 76-byte records, newest first. The current update is not included.
@@ -286,7 +311,7 @@ On columnstore index statistics, bit 6 is the only bit set (`InitPointers` rejec
 - **Histogram item.** It is rebuilt: int64 offsets (relative to the item), then the records. A changed step takes its record layout from the original record or a neighbor. A key in the fixed part keeps its length (char, nchar and binary are padded). A key in the variable part gets a new end offset, and the record length can change. An empty variable key drops the variable section and clears status bit 0x20.
 - **Shifting items.** When the histogram changes size, every later item moves. The offset array is recomputed, and the distinct value synopsis's per-vector offsets (relative to the variable section) shift by the same amount. Bytes after the last item are copied unchanged.
 - **Lengths.** The stream length (offset 24) and blob length (offset 32) are rewritten.
-- **The string index (trie) is not rebuilt.** After key edits it still describes the original keys, which only affects LIKE estimates. SQL Server accepts the stream anyway.
+- **The string index (trie) is not rebuilt by key edits.** It still describes the original keys, which only affects LIKE estimates. SQL Server accepts the stream anyway. The statistics builder replaces it with one built from the rows it read (section 4.2). When the source stream has none, as with an empty statistic (`SAMPLE 0 ROWS`), it inserts item bit 1 in bit order and sets the bit in the presence mask.
 - **Import behavior.** The import keeps the stream's Updated date. It clears NORECOMPUTE unless `NORECOMPUTE` is part of the same statement. `ROWCOUNT` / `PAGECOUNT` cannot be combined with a column statistic ("is not a statistics collection").
 - **Read-back differences.** After an import, `DBCC SHOW_STATISTICS ... WITH STATS_STREAM` returns the same stream, except the uninitialized bytes of the column definitions (offsets +2 and +20 of each, see section 2) and therefore the checksum.
 - **Editable key types.** RANGE_HI_KEY can be edited for all types the decoder reads except sql_variant, hierarchyid and other CLR types. For those types the other step values can still be edited.

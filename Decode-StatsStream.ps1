@@ -99,8 +99,11 @@
     the current statistics against the rows read (q-error per distinct value and over random
     ranges), and writes the script that loads the best candidate: CREATE STATISTICS ... WITH
     STATS_STREAM for a new statistics object (-Column), UPDATE STATISTICS ... WITH STATS_STREAM for
-    an existing one (-Statistics, one column). Nothing is changed on the server. v1 handles
-    numbers, dates and times, uniqueidentifier and binary columns.
+    an existing one (-Statistics, one column). Nothing is changed on the server. It handles
+    numbers, dates and times, uniqueidentifier, binary and character columns (char, varchar,
+    nchar, nvarchar: ordered by the server in the column's collation, with the string index for
+    LIKE built from the same rows the way SQL Server builds it; none for UTF-8 collations and
+    double-byte code pages).
 
 .PARAMETER Column
     -Build: the column of a new statistics object.
@@ -123,6 +126,10 @@
 .PARAMETER AllStatistics
     -Build: builds every statistics object of the table the builder supports, from ONE read of the
     table (SQL Server reads it once per statistics object), and writes one script.
+
+.PARAMETER ShowCandidates
+    -Build: also lists every algorithm tried with all its scores. By default the report shows a
+    verdict and only the chosen histogram next to SQL Server's current statistics.
 
 .PARAMETER NoWorkload
     -Build: does not read the Query Store workload.
@@ -285,6 +292,10 @@ param(
     [Parameter(ParameterSetName = 'Server')]
     [Parameter(ParameterSetName = 'ConnStr')]
     [switch]$AllStatistics,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$ShowCandidates,
 
     [Parameter(ParameterSetName = 'Server')]
     [Parameter(ParameterSetName = 'ConnStr')]
@@ -1475,7 +1486,8 @@ function ConvertTo-StatsStream($Model) {
     $origKeys = @($D.Histogram | Where-Object { -not $_.IsNullStep } | ForEach-Object { [Convert]::ToBase64String([byte[]]$_.Record.KeyBytes) })
     $newKeys = @($keySteps | ForEach-Object { [Convert]::ToBase64String($_.KeyBytes) })
     $keysChanged = ($origKeys -join '|') -ne ($newKeys -join '|')
-    if ($keysChanged -and $kc.SystemTypeId -in 175, 167, 35, 239, 231, 99) { $warnings.Add('String keys were not checked for collation order; keep them sorted as the column collation sorts.') }
+    # (the builder's keys come in the server's own order: no warning for them)
+    if ($keysChanged -and $kc.SystemTypeId -in 175, 167, 35, 239, 231, 99 -and -not $Model.PSObject.Properties['ServerOrder']) { $warnings.Add('String keys were not checked for collation order; keep them sorted as the column collation sorts.') }
 
     # ---- histogram item: int64 offset per step (relative to the item), then the records
     $records = @(foreach ($st in $keySteps) { , (New-StatsHistogramRecord $st $raw) })
@@ -1518,13 +1530,19 @@ function ConvertTo-StatsStream($Model) {
     $allItems = @($D.VariableItems)
     $drop = @(); if ($Model.PSObject.Properties['DropBits']) { $drop = @($Model.DropBits) }
     $items = @($allItems | Where-Object { [int]$_.Bit -notin $drop })
+    # a string index the source stream lacks (an empty statistic, or one loaded without it) is added in bit order
+    $added = $Model.PSObject.Properties['ReplaceItems'] -and $Model.ReplaceItems.ContainsKey(1) -and -not @($items | Where-Object { [int]$_.Bit -eq 1 }).Count
+    if ($added) { $items = @(@($items) + [pscustomobject]@{ Bit = 1; RelativeOffset = 0; StreamOffset = 0; Length = 0 } | Sort-Object { [int]$_.Bit }) }
     $varBase = 332 + 8 * ($items.Count + 1)
     $newData = @()
     foreach ($it in $items) {
-        $data = [byte[]](Get-Bytes $raw $it.StreamOffset $it.Length)
+        $data = [byte[]]@(); if ($it.Length) { $data = [byte[]](Get-Bytes $raw $it.StreamOffset $it.Length) }
         switch ([int]$it.Bit) {
             0 { $data = $hist.ToArray() }
-            1 { if ($keysChanged) { $warnings.Add('The string index (trie) used for LIKE estimates was not rebuilt; it still describes the original keys.') } }
+            1 {
+                if ($Model.PSObject.Properties['ReplaceItems'] -and $Model.ReplaceItems.ContainsKey(1)) { $data = [byte[]]$Model.ReplaceItems[1] }
+                elseif ($keysChanged) { $warnings.Add('The string index (trie) used for LIKE estimates was not rebuilt; it still describes the original keys.') }
+            }
             4 { if ($h['Unfiltered Rows'] -ne $o['Unfiltered Rows']) { $data = [BitConverter]::GetBytes([int64]$h['Unfiltered Rows']) } }
             7 { if ($h['Pages sampled'] -ne $o['Pages sampled']) { $data = [BitConverter]::GetBytes([int64]$h['Pages sampled']) } }
             10 { if ($h['Persisted sample percent'] -ne $o['Persisted sample percent']) { $data = [BitConverter]::GetBytes([double]$h['Persisted sample percent']) } }
@@ -1556,7 +1574,7 @@ function ConvertTo-StatsStream($Model) {
     $out = New-Object 'System.Collections.Generic.List[byte]'
     $out.AddRange([byte[]](Get-Bytes $raw 0 $B))
     $out.AddRange($fixed)
-    if ($drop.Count -gt 0) {
+    if ($drop.Count -gt 0 -or $added) {
         # presence bitmask of the items kept
         [uint64]$mask = 0
         foreach ($it in $items) { $mask = $mask -bor [uint64][Math]::Pow(2, [int]$it.Bit) }
@@ -2628,7 +2646,13 @@ namespace SQLStatsXRay.Builder {
   public double NullRows, ReadRows, NonNullRows;
   public int MaxEntries = 100000;
   public bool Compacted;
-  double mergeLimit;
+  // Text columns: SQL Server's collation decides the order, so keys are the values' positions in the server's order
+  // (the rows arrive sorted); values from elsewhere get a position from the server too. TextEncoding counts their bytes.
+  public bool TextKeys;
+  public System.Text.Encoding TextEncoding;
+  // the string index, fed with the rows as they arrive (in collation order, before light values are merged)
+  public TrieBuilder Trie;
+  double mergeLimit, seq;
 
   // Values in SQL Server's order: SqlDecimal, SqlGuid and SqlBinary compare as SQL Server does.
   public static object Sortable(object v) {
@@ -2653,19 +2677,20 @@ namespace SQLStatsXRay.Builder {
    while (r.Read()) {
     double n = Convert.ToDouble(r.GetValue(1));
     ReadRows += n;
-    if (r.IsDBNull(0)) { NullRows += n; continue; }
+    if (r.IsDBNull(0)) { NullRows += n; if (Trie != null) Trie.AddNulls(n); continue; }
     object raw;
     try { raw = r.GetValue(0); }
     catch (OverflowException) { raw = r.GetType().GetMethod("GetSqlValue", new[] { typeof(int) }).Invoke(r, new object[] { 0 }); }
+    if (Trie != null) Trie.AddValue(raw, n);
     Add(raw, n, pages ? Convert.ToDouble(r.GetValue(2)) : n);
    }
   }
 
   public void Add(object raw, double n, double units) {
    var e = new Entry();
-   e.Key = Sortable(raw); e.Raw = raw; e.Rows = n; e.LastRows = n; e.Distinct = 1; e.SumSq = n * n; e.Units = units; e.Ones = units == 1 ? 1 : 0;
-   byte[] b = raw as byte[];
-   e.Bytes = b != null ? b.Length * n : 0;
+   e.Key = TextKeys ? (object)(seq++) : Sortable(raw); e.Raw = raw; e.Rows = n; e.LastRows = n; e.Distinct = 1; e.SumSq = n * n; e.Units = units; e.Ones = units == 1 ? 1 : 0;
+   byte[] b = raw as byte[]; string s = raw as string;
+   e.Bytes = b != null ? b.Length * n : (s != null && TextEncoding != null ? TextEncoding.GetByteCount(s) * n : 0);
    Entries.Add(e);
    NonNullRows += n;
    if (Entries.Count >= 2 * MaxEntries) Compact();
@@ -2713,8 +2738,8 @@ namespace SQLStatsXRay.Builder {
 
   // An exactly counted value at its place in the order (the true minimum or maximum, a workload value): inserted when
   // the sample missed it, its count corrected when the sample saw it. Rows are in sample units (exact / scale).
-  public void InsertExact(object raw, double rows) {
-   object key = Sortable(raw);
+  public void InsertExact(object raw, double rows) { InsertExact(raw, Sortable(raw), rows); }
+  public void InsertExact(object raw, object key, double rows) {
    int i = IndexBelow(key, true);
    if (i >= 0 && Compare(Entries[i].Key, key) == 0) {
     var x = Entries[i];
@@ -2729,6 +2754,210 @@ namespace SQLStatsXRay.Builder {
  }
 
  sealed class KeyComparer : IComparer<object> { public int Compare(object a, object b) { return Profile.Compare(a, b); } }
+
+ public sealed class TrieNode { public int Off, Len; public double Count; public TrieNode Child, Sibling; }
+
+ // The string index (trie) SQL Server keeps for LIKE estimates, built the way CTrieOnDisk builds it (SQL Server 2025,
+ // reverse engineered; see STATS_STREAM-format.md): every row in collation order, a deterministic acceptance rate,
+ // radix insertion comparing one character at a time in the column's collation (Rank: equal characters share a rank),
+ // segments reusing the leftmost exact match in the character buffer, and the 0x50000 cost budget with its rebuild.
+ public sealed class TrieBuilder {
+  public bool EightBit; public int[] Rank; public System.Text.Encoding Encoding;
+  public double Nulls, Count, Distinct, Cost = 0x30;
+  public TrieNode Root = new TrieNode();
+  public int Nodes = 1;
+  char[] buf = new char[4096]; public int BufLen;
+  double ax = 1, ay = 1, acc;                  // acceptance: x rows out of every y, evenly spaced
+  TrieNode last;
+  char[] sample = new char[80]; int sampleLen; object sampleSrc;
+  const double Limit = 0x50000;
+
+  public TrieBuilder(bool eightBit, int[] rank, System.Text.Encoding encoding) { EightBit = eightBit; Rank = rank; Encoding = encoding; SetAcceptance(1, 1); }
+  public void SetAcceptance(double x, double y) { ax = x; ay = y; acc = y - x; }
+
+  // InitialiseStringAcceptanceRate(R, 20): R is the estimated number of rows the statistics read.
+  public void Initialise(double r) {
+   if (r == 0 || r == -1) { SetAcceptance(1, 20); return; }
+   double x = Math.Min(EightBit ? 2824 : 2409, (double)((uint)((ulong)(long)r & 0xFFFFFFFF) / 20u) + 10);
+   SetAcceptance(Math.Min(x, r), r);
+  }
+
+  bool Accept() { acc += ax; if (acc >= ay) { acc -= ay; return true; } return false; }
+
+  public void AddNulls(double n) { for (double k = 0; k < n; k++) { if (Accept()) { if (Nulls == 0) Distinct++; Count++; Nulls++; } last = null; } }
+
+  // n rows of one value (rows equal under the collation arrive together, the first one not "same")
+  public void AddValue(object raw, double n) {
+   string s = raw as string;
+   if (s == null) return;
+   char[] u;
+   if (EightBit) { var b = Encoding.GetBytes(s); u = new char[b.Length]; for (int k = 0; k < b.Length; k++) u[k] = (char)b[k]; }
+   else u = s.ToCharArray();
+   for (double k = 0; k < n; k++) InsertString(u, u.Length, k > 0);
+  }
+
+  void SampleString(char[] s, int n) {
+   if (ReferenceEquals(s, sampleSrc) && s != sample) return;    // the same value's rows: already copied
+   if (n > 80) { Array.Copy(s, 0, sample, 0, 40); Array.Copy(s, n - 40, sample, 40, 40); sampleLen = 80; }
+   else { Array.Copy(s, 0, sample, 0, n); sampleLen = n; }
+   sampleSrc = s;
+  }
+
+  void InsertString(char[] s, int n, bool same) {
+   if (!Accept()) { SampleString(s, n); last = null; return; }
+   if (same && last != null) { last.Count++; Count++; return; }
+   if (!same) SampleString(s, n);
+   // (a duplicate after a rejected row inserts the previous row's bytes: the sample buffer)
+   var t = new char[sampleLen]; Array.Copy(sample, t, sampleLen);
+   if (InsertSuffix(Root, t, 0, t.Length)) { Count++; return; }
+   Rebuild(t, t.Length);
+  }
+
+  bool Need(double cost) { if (Cost + cost >= Limit) return false; Cost += cost; return true; }
+
+  bool InsertSuffix(TrieNode node, char[] s, int i, int n) {
+   while (true) {
+    int rem = n - i;
+    if (rem == 0) { if (node.Count == 0) Distinct++; node.Count++; last = node; return true; }
+    int m; TrieNode after;
+    TrieNode c = FindChild(node, s, i, n, out m, out after);
+    if (m == 0) { bool ok = AddNewChild(node, after, s, i, n); Distinct++; return ok; }
+    if (m == rem) {
+     if (c.Len == m) { if (c.Count == 0) Distinct++; c.Count++; last = c; return true; }
+     if (!Need(0x30)) return false;
+     Split(c, m, 1); Distinct++; last = c; return true;
+    }
+    if (m < c.Len) { if (!Need(0x30)) return false; Split(c, m, 0); }
+    node = c; i += m;
+   }
+  }
+
+  void Split(TrieNode c, int m, double count) {
+   var t = new TrieNode(); t.Off = c.Off + m; t.Len = c.Len - m; t.Count = c.Count; t.Child = c.Child;
+   c.Len = m; c.Child = t; c.Count = count; Nodes++;
+  }
+
+  // The child sharing a first character with s[i..], and how many characters match; or where a new child goes.
+  TrieNode FindChild(TrieNode node, char[] s, int i, int n, out int m, out TrieNode after) {
+   after = null; m = 0;
+   for (var c = node.Child; c != null; c = c.Sibling) {
+    int k = 0;
+    while (k < c.Len && i + k < n && Rank[buf[c.Off + k]] == Rank[s[i + k]]) k++;
+    if (k > 0) { m = k; return c; }
+    if (Rank[s[i]] < Rank[buf[c.Off]]) return null;
+    after = c;
+   }
+   return null;
+  }
+
+  bool AddNewChild(TrieNode parent, TrieNode after, char[] s, int i, int n) {
+   int len = n - i, off = Find(s, i, len);
+   if (off < 0) {
+    if (!Need(EightBit ? len : 2 * len)) return false;
+    if (BufLen + len > buf.Length) Array.Resize(ref buf, Math.Max(buf.Length * 2, BufLen + len));
+    Array.Copy(s, i, buf, BufLen, len); off = BufLen; BufLen += len;
+   }
+   if (!Need(0x30)) return false;
+   var nd = new TrieNode(); nd.Off = off; nd.Len = len; nd.Count = 1; Nodes++;
+   if (after == null) { nd.Sibling = parent.Child; parent.Child = nd; } else { nd.Sibling = after.Sibling; after.Sibling = nd; }
+   last = nd;
+   return true;
+  }
+
+  // the leftmost exact occurrence of the segment in the buffer (a binary match), or -1
+  int Find(char[] s, int i, int len) {
+   for (int p = 0; p + len <= BufLen; p++) {
+    if (buf[p] != s[i]) continue;
+    int k = 1; while (k < len && buf[p + k] == s[i + k]) k++;
+    if (k == len) return p;
+   }
+   return -1;
+  }
+
+  // Over budget: every string so far is sampled again into a new trie at distinct / (2 x count), and later rows are
+  // accepted half as often (or less).
+  void Rebuild(char[] t, int tn) {
+   var nw = new TrieBuilder(EightBit, Rank, Encoding);
+   nw.SetAcceptance(Distinct, 2 * Count);
+   for (double k = 0; k < Nulls; k++) nw.AddNulls(1);
+   InsertRecursively(Root, new char[0], nw);
+   // the string that overflowed goes in last, its character count passed where bytes are expected: n-types keep only
+   // the first half (SQL Server's behaviour, kept so the trie matches)
+   int len = EightBit ? tn : tn / 2;
+   var h = new char[len]; Array.Copy(t, h, len);
+   nw.InsertString(h, len, false);
+   buf = nw.buf; BufLen = nw.BufLen; Root = nw.Root; Nodes = nw.Nodes; Nulls = nw.Nulls; Count = nw.Count; Distinct = nw.Distinct; Cost = nw.Cost;
+   last = null;
+   ay *= Math.Floor(2 * Count / Distinct);
+  }
+
+  void InsertRecursively(TrieNode node, char[] prefix, TrieBuilder nw) {
+   var s = new char[prefix.Length + node.Len];
+   Array.Copy(prefix, s, prefix.Length); Array.Copy(buf, node.Off, s, prefix.Length, node.Len);
+   bool same = false;
+   for (double k = 0; k < node.Count; k++) { nw.InsertString(s, s.Length, same); same = true; }
+   for (var c = node.Child; c != null; c = c.Sibling) InsertRecursively(c, s, nw);
+  }
+
+  // The variable item: 0xFF, header, character buffer, nodes in pre-order, and the unused trailing byte.
+  public byte[] ToBytes() {
+   var o = new List<byte>();
+   o.Add(0xFF);
+   foreach (double v in new double[] { 1, Nulls, Count, Distinct, 40, 40, 0, 0, BufLen }) o.AddRange(BitConverter.GetBytes((int)v));
+   for (int k = 0; k < BufLen; k++) { if (EightBit) o.Add((byte)buf[k]); else o.AddRange(BitConverter.GetBytes((ushort)buf[k])); }
+   o.AddRange(BitConverter.GetBytes(Nodes));
+   int written = 0;
+   Write(Root, false, o, ref written);
+   // the loader rebuilds the tree from the node flags alone: they must describe exactly the node count
+   if (written != Nodes) throw new InvalidOperationException("Trie node count " + Nodes + " but " + written + " nodes written.");
+   o.Add(0);
+   return o.ToArray();
+  }
+
+  // SQL Server's import checks (CTrieInMemCore::FValidate) plus what its loader assumes without checking: the node flags,
+  // read as it reads them (children while 0x80 says a sibling follows), describe exactly the node count. Null = valid.
+  public static string Check(byte[] d, bool eightBit) {
+   try {
+    if (d.Length < 41 || d[0] != 0xFF || BitConverter.ToInt32(d, 1) != 1) return "marker or version";
+    uint nulls = BitConverter.ToUInt32(d, 5), sampled = BitConverter.ToUInt32(d, 9), distinct = BitConverter.ToUInt32(d, 13), bufLen = BitConverter.ToUInt32(d, 33);
+    if (nulls > sampled || distinct > sampled) return "NULLs or distinct above the strings sampled";
+    if (bufLen > 0x44F73) return "character buffer too long";
+    int p = 37 + (int)bufLen * (eightBit ? 1 : 2);
+    int nodeCount = BitConverter.ToInt32(d, p); p += 4;
+    if (nodeCount < 1 || nodeCount > 65536) return "node count";
+    double sum = 0; int read = 0;
+    ReadNode(d, ref p, bufLen, ref sum, ref read);   // the root, then its subtree
+    if (read != nodeCount) return "the node flags describe " + read + " nodes, the count says " + nodeCount;
+    if (p != d.Length - 1) return "bytes after the nodes";
+    if (sampled != nulls + sum) return "strings sampled <> NULLs + occurrences";
+    return null;
+   } catch (Exception e) { return "unreadable: " + e.Message; }
+  }
+
+  static bool ReadNode(byte[] d, ref int p, uint bufLen, ref double sum, ref int read) {
+   byte info = d[p];
+   uint reference = BitConverter.ToUInt32(d, p + 1); p += 5;
+   uint count = (uint)(info & 0x0F);
+   if ((info & 0x20) != 0) { count = BitConverter.ToUInt32(d, p); p += 4; } else if ((info & 0x10) != 0) { count = d[p]; p += 1; }
+   uint off = reference >> 8, len = reference & 0xFF;
+   if (off > bufLen || off + len > bufLen) throw new InvalidOperationException("segment outside the buffer");
+   sum += count; read++;
+   if (read > 65536) throw new InvalidOperationException("too many nodes");
+   if ((info & 0x40) != 0) { while (ReadNode(d, ref p, bufLen, ref sum, ref read)) { } }
+   return (info & 0x80) != 0;
+  }
+
+  void Write(TrieNode node, bool sibling, List<byte> o, ref int written) {
+   uint count = (uint)node.Count;
+   byte info = (byte)((node.Child != null ? 0x40 : 0) | (sibling ? 0x80 : 0));
+   if (count < 16) info |= (byte)count; else if (count < 256) info |= 0x10; else info |= 0x20;
+   o.Add(info);
+   o.AddRange(BitConverter.GetBytes((uint)((node.Off << 8) | node.Len)));
+   if (count >= 16 && count < 256) o.Add((byte)count); else if (count >= 256) o.AddRange(BitConverter.GetBytes(count));
+   written++;
+   for (var c = node.Child; c != null; c = c.Sibling) Write(c, c.Sibling != null, o, ref written);
+  }
+ }
  public static class Pilot {
   // Page of a row from the first 6 bytes of %%physloc%% (page id, file id).
   public static long PageOf(object v) {
@@ -2738,14 +2967,15 @@ namespace SQLStatsXRay.Builder {
   }
 
   // Rows of (page, value): rows per page and the intraclass correlation of the values' ranks between pages.
-  public static PilotStats Analyze(IDataReader r) {
+  public static PilotStats Analyze(IDataReader r, bool text) {
    var pages = new List<long>(); var keys = new List<object>();
    var ps = new PilotStats();
    while (r.Read()) {
     if (r.IsDBNull(1)) { ps.Nulls++; continue; }
     object raw;
     try { raw = r.GetValue(1); } catch (OverflowException) { raw = r.GetType().GetMethod("GetSqlValue", new[] { typeof(int) }).Invoke(r, new object[] { 1 }); }
-    pages.Add(PageOf(r.GetValue(0))); keys.Add(Profile.Sortable(raw));
+    // text: any consistent order serves the rank correlation, so the string's own ordering is enough here
+    pages.Add(PageOf(r.GetValue(0))); keys.Add(text ? (object)Convert.ToString(raw) : Profile.Sortable(raw));
    }
    var rank = new SortedDictionary<object, double>(new KeyComparer());
    foreach (var key in keys) if (!rank.ContainsKey(key)) rank.Add(key, 0);
@@ -3113,9 +3343,10 @@ function Initialize-StatsBuilder {
     Add-Type -TypeDefinition $script:BuilderCode -ReferencedAssemblies $refs
 }
 
-# Key types of v1: no strings (their statistics carry a string index the builder cannot write yet), sql_variant, CLR types
-# or rowversion.
-$script:BuildKeyTypes = 48, 52, 56, 127, 104, 59, 62, 60, 122, 106, 108, 40, 41, 42, 43, 61, 58, 36, 173, 165
+# Key types the builder supports: numbers, dates and times, uniqueidentifier, binary, and char / varchar / nchar / nvarchar
+# (ordered by the server in the column's collation). Not sql_variant, CLR types, rowversion, text or ntext.
+$script:BuildKeyTypes = 48, 52, 56, 127, 104, 59, 62, 60, 122, 106, 108, 40, 41, 42, 43, 61, 58, 36, 173, 165, 175, 167, 239, 231
+$script:BuildTextTypes = 175, 167, 239, 231
 
 function Get-StatsBuildTarget($Connection, [string]$TableName, [string]$StatName, [string]$ColumnName) {
     <# The table, its column and, for an existing statistics object, the object (one column only in v1). #>
@@ -3138,19 +3369,24 @@ function Get-StatsBuildTarget($Connection, [string]$TableName, [string]$StatName
     if (-not $ColumnName) { throw 'Give -Column for a new statistics object, or -Statistics for an existing one.' }
     $c = @((Invoke-Query $Connection @'
 SELECT c.name, c.column_id, c.system_type_id, c.user_type_id, TYPE_NAME(c.system_type_id) AS type_name, c.max_length, c.precision, c.scale,
-       c.collation_name, c.is_nullable, c.is_computed, o.type AS object_type
+       c.collation_name, CAST(COLLATIONPROPERTY(c.collation_name, 'CodePage') AS int) AS code_page, c.is_nullable, c.is_computed, o.type AS object_type
 FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id WHERE c.object_id = @o AND c.name = @c
 '@ @{ '@o' = $t.ObjectId; '@c' = $ColumnName })[0].Rows)[0]
     if (-not $c) { throw "Column [$ColumnName] not found on $qualified." }
     if (([string]$c.object_type).Trim() -ne 'U') { throw 'The builder works on tables (not views).' }
-    if ([int]$c.system_type_id -notin $script:BuildKeyTypes) { throw "Columns of type $($c.type_name) are not supported by the builder yet (v1: numbers, dates and times, uniqueidentifier, binary)." }
+    if ([int]$c.system_type_id -notin $script:BuildKeyTypes) { throw "Columns of type $($c.type_name) are not supported by the builder yet (numbers, dates and times, uniqueidentifier, binary and character columns)." }
     $type = [string]$c.type_name
     switch ($type) {
         { $_ -in 'decimal', 'numeric' } { $type += "($($c.precision),$($c.scale))" }
         { $_ -in 'datetime2', 'time', 'datetimeoffset' } { $type += "($($c.scale))" }
         { $_ -in 'binary', 'varbinary' } { $type += $(if ([int]$c.max_length -eq -1) { '(max)' } else { "($($c.max_length))" }) }
         'float' { if ([int]$c.max_length -eq 4) { $type = 'real' } }
+        { $_ -in 'char', 'varchar' } { $type += $(if ([int]$c.max_length -eq -1) { '(max)' } else { "($($c.max_length))" }) }
+        { $_ -in 'nchar', 'nvarchar' } { $type += $(if ([int]$c.max_length -eq -1) { '(max)' } else { "($([int]$c.max_length / 2))" }) }
     }
+    $isText = [int]$c.system_type_id -in $script:BuildTextTypes
+    # temporary copies of the column (template, ranks) keep its collation
+    $typeFull = $(if ($isText) { "$type COLLATE $($c.collation_name)" } else { $type })
     $size = (Invoke-Query $Connection @'
 SELECT SUM(p.rows) AS rows, SUM(au.data_pages) AS pages FROM sys.partitions p
 JOIN sys.allocation_units au ON au.container_id = p.partition_id AND au.type = 1
@@ -3158,7 +3394,8 @@ WHERE p.object_id = @o AND p.index_id IN (0, 1)
 '@ @{ '@o' = $t.ObjectId })[0].Rows[0]
     [pscustomobject]@{
         ObjectId = $t.ObjectId; Table = $qualified; SchemaName = $t.Schema; TableName = $t.Table; Stat = $stat; StatName = $(if ($stat) { [string]$stat.name } else { $null })
-        Column = [string]$c.name; ColumnSql = '[' + ([string]$c.name).Replace(']', ']]') + ']'; ColumnType = $type; SystemTypeId = [int]$c.system_type_id
+        Column = [string]$c.name; ColumnSql = '[' + ([string]$c.name).Replace(']', ']]') + ']'; ColumnType = $type; ColumnTypeFull = $typeFull; SystemTypeId = [int]$c.system_type_id
+        IsText = $isText; Collation = $(if ($isText) { [string]$c.collation_name } else { '' }); CodePage = $(if ($isText -and [int]$c.system_type_id -in 175, 167) { [int]$c.code_page } else { 0 })
         IsNullable = [bool]$c.is_nullable; Rows = [int64]$(if ($size.rows -is [DBNull]) { 0 } else { $size.rows }); Pages = [int64]$(if ($size.pages -is [DBNull]) { 0 } else { $size.pages })
     }
 }
@@ -3208,7 +3445,7 @@ function Read-StatsBuildProfile($Connection, $Target, $Plan, [int]$Seed, [int]$T
     $session = $Connection.CreateCommand()
     $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;'
     $null = $session.ExecuteNonQuery()
-    $profile = New-Object SQLStatsXRay.Builder.Profile
+    $profile = New-StatsBuildProfile $Target $Connection $Plan
     $sw = [Diagnostics.Stopwatch]::StartNew()
     try {
         $r = $cmd.ExecuteReader()
@@ -3241,7 +3478,7 @@ EXEC sys.sp_executesql @cmd;
     }
     $null = Invoke-Query $Connection (@"
 IF OBJECT_ID('tempdb..#xray_template') IS NOT NULL DROP TABLE #xray_template;
-CREATE TABLE #xray_template (c $($Target.ColumnType) $(if ($Target.IsNullable) { 'NULL' } else { 'NOT NULL' }));
+CREATE TABLE #xray_template (c $($Target.ColumnTypeFull) $(if ($Target.IsNullable) { 'NULL' } else { 'NOT NULL' }));
 INSERT #xray_template (c) SELECT TOP (1) $($Target.ColumnSql) FROM $($Target.Table) WITH (READUNCOMMITTED) WHERE $($Target.ColumnSql) IS NOT NULL;
 CREATE STATISTICS s ON #xray_template (c) WITH FULLSCAN;
 "@)
@@ -3272,7 +3509,8 @@ function New-StatsBuildStream($Template, $Steps, $Built) {
         $bytes = ConvertTo-SqlKeyBytes $text $col $fixed
         # the key must decode back to the same value, in SQL Server's order
         $back = ConvertFrom-SqlBytes -Data $bytes -SystemTypeId $col.SystemTypeId -UserTypeId $col.UserTypeId -MaxLength $col.MaxLength -Precision $col.Precision -Scale $col.Scale -CollationId $col.CollationId
-        if ([SQLStatsXRay.Builder.Profile]::Compare([SQLStatsXRay.Builder.Profile]::Sortable($back), $s.Key) -ne 0) { throw "Key $text does not round-trip through the stream format." }
+        $same = $(if ($col.SystemTypeId -in $script:BuildTextTypes) { [string]$back -ceq [string]$s.Raw } else { [SQLStatsXRay.Builder.Profile]::Compare([SQLStatsXRay.Builder.Profile]::Sortable($back), $s.Key) -eq 0 })
+        if (-not $same) { throw "Key $text does not round-trip through the stream format." }
         $st = New-StatsEditStep $null $col $tpl
         $st.Key = $text; $st.KeyBytes = $bytes
         $st.EqRows = [single]$s.Eq; $st.RangeRows = [single]$s.Range; $st.StoredAvg = [single]$s.Avg
@@ -3286,11 +3524,119 @@ function New-StatsBuildStream($Template, $Steps, $Built) {
     if ($h.Contains('Unfiltered Rows')) { $h['Unfiltered Rows'] = [int64]$Built.Rows }
     $model.Vectors[0].AllDensity = [single]$Built.AllDensity
     $model.Vectors[0].ColumnAverageLength = [single]$Built.AverageLength
-    $model | Add-Member DropBits @(3, 5, 7)
+    $model | Add-Member ServerOrder $true
+    $notes = New-Object 'System.Collections.Generic.List[string]'
+    # the string index (bit 1) of the template describes other strings: replaced by the one built from the rows read,
+    # (added when the template has none), or left out for UTF-8 and double-byte code pages
+    $drop = @(3, 5, 7)
+    if ($Built.Trie) {
+        $problem = [SQLStatsXRay.Builder.TrieBuilder]::Check([byte[]]$Built.Trie, ($col.SystemTypeId -in 175, 167))
+        if ($problem) { throw "The built string index is not valid ($problem)." }
+        $model | Add-Member ReplaceItems @{ 1 = [byte[]]$Built.Trie }
+    } else {
+        $drop += 1
+        if ($col.SystemTypeId -in $script:BuildTextTypes) { $notes.Add('No string index: LIKE estimates on this statistic fall back to SQL Server''s guesses (UTF-8 and double-byte code pages are not supported by it).') }
+    }
+    $model | Add-Member DropBits $drop
     $out = ConvertTo-StatsStream $model
     $problems = @(Test-StatsStreamMatchesModel $out.Bytes $model)
     if ($problems) { throw "The built stream does not decode back to the histogram: $($problems -join ', ')." }
-    return [pscustomobject]@{ Bytes = $out.Bytes; Warnings = $out.Warnings; Model = $model }
+    return [pscustomobject]@{ Bytes = $out.Bytes; Warnings = @($out.Warnings) + $notes.ToArray(); Model = $model }
+}
+
+function Get-StatsBuildCharRanks($Connection, $Target) {
+    <#
+      The trie compares one character at a time in the column's collation: each possible character (the 256 bytes of a
+      char/varchar code page, or the 65,536 UTF-16 code units) ranked by the server, equal characters sharing a rank.
+      Cached per type family and collation.
+    #>
+    $wide = $Target.SystemTypeId -in 239, 231
+    $cacheKey = "$wide|$($Target.Collation)"
+    if (-not $script:CharRankCache) { $script:CharRankCache = @{} }
+    if ($script:CharRankCache.ContainsKey($cacheKey)) { return , $script:CharRankCache[$cacheKey] }
+    $coll = $Target.Collation
+    if ($coll -notmatch '^\w+$') { throw "Unexpected collation name '$coll'." }
+    if ($wide) {
+        $sql = @"
+WITH n AS (SELECT TOP (65536) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS u FROM sys.all_columns a CROSS JOIN sys.all_columns b)
+SELECT u, DENSE_RANK() OVER (ORDER BY CAST(CAST(u % 256 AS binary(1)) + CAST(u / 256 AS binary(1)) AS nvarchar(1)) COLLATE $coll) AS r FROM n;
+"@
+    } else {
+        # each byte as the Unicode character the column's code page gives it, converted back on the server in the collation
+        $enc = [Text.Encoding]::GetEncoding($Target.CodePage)
+        $values = (0..255 | ForEach-Object { "($_, NCHAR($([int]$enc.GetString([byte[]]@([byte]$_))[0])))" }) -join ', '
+        $sql = "SELECT b AS u, DENSE_RANK() OVER (ORDER BY CAST(c COLLATE $coll AS varchar(1))) AS r FROM (VALUES $values) v(b, c);"
+    }
+    $rank = New-Object 'int[]' $(if ($wide) { 65536 } else { 256 })
+    foreach ($r in (Invoke-Query $Connection $sql)[0].Rows) { $rank[[int]$r.u] = [int]$r.r }
+    $script:CharRankCache[$cacheKey] = $rank
+    return , $rank
+}
+
+function New-StatsBuildProfile($Target, $Connection, $Plan) {
+    <#
+      A profile for the column; text keys are ranked by the server (see SQLStatsXRay.Builder.Profile.TextKeys). Character
+      columns also get the string index builder, which sees the rows as SQL Server's does: R is the estimated number of
+      rows read (the table's rows for a full scan, sampled pages x rows per page otherwise). No string index for UTF-8
+      collations (SQL Server builds none) or double-byte code pages (characters split across bytes).
+    #>
+    $p = New-Object SQLStatsXRay.Builder.Profile
+    if ($Target.IsText) {
+        $p.TextKeys = $true
+        $wide = $Target.SystemTypeId -in 239, 231
+        $p.TextEncoding = $(if ($wide) { [Text.Encoding]::Unicode } else { try { [Text.Encoding]::GetEncoding($Target.CodePage) } catch { [Text.Encoding]::GetEncoding(1252) } })
+        if ($Connection -and $Plan -and ($wide -or $Target.CodePage -notin 65001, 932, 936, 949, 950, 1361)) {
+            $p.Trie = New-Object SQLStatsXRay.Builder.TrieBuilder ((-not $wide), (Get-StatsBuildCharRanks $Connection $Target), $p.TextEncoding)
+            $p.Trie.Initialise($(if ($Plan.Full) { [double]$Target.Rows } else { [Math]::Round([double]$Plan.Pages * $Target.Rows / [Math]::Max(1, $Target.Pages)) }))
+        }
+    }
+    return , $p
+}
+
+function Get-StatsBuildRanks($Connection, $Target, $Profile, [object[]]$Values) {
+    <#
+      Positions of outside values (the current histogram's keys, Query Store values, the true minimum and maximum) among a
+      text profile's keys, in the column's collation: the profile key itself when equal, otherwise a fraction between the
+      two keys around it (values in the same gap get distinct fractions in their own order, equal values the same one).
+      One sort on the server of the profile's keys and the values together.
+    #>
+    $result = New-Object 'double[]' $Values.Count
+    if ($Values.Count -eq 0) { return , $result }
+    $keys = New-Object Data.DataTable; $null = $keys.Columns.Add('ord', [double]); $null = $keys.Columns.Add('v', [string])
+    foreach ($e in $Profile.Entries) { $null = $keys.Rows.Add([double]$e.Key, [string]$e.Raw) }
+    $ext = New-Object Data.DataTable; $null = $ext.Columns.Add('i', [int]); $null = $ext.Columns.Add('v', [string])
+    for ($i = 0; $i -lt $Values.Count; $i++) { $null = $ext.Rows.Add($i, [string]$Values[$i]) }
+    $type = $Target.ColumnTypeFull
+    $null = Invoke-Query $Connection "DROP TABLE IF EXISTS #xray_keys; DROP TABLE IF EXISTS #xray_ext; CREATE TABLE #xray_keys (ord float NOT NULL, v $type NOT NULL); CREATE TABLE #xray_ext (i int NOT NULL, v $type NOT NULL);"
+    try {
+        foreach ($pair in @(@('#xray_keys', $keys), @('#xray_ext', $ext))) {
+            $bulk = New-Object Data.SqlClient.SqlBulkCopy $Connection
+            $bulk.DestinationTableName = $pair[0]; $bulk.BulkCopyTimeout = 0
+            $bulk.WriteToServer($pair[1]); $bulk.Close()
+        }
+        $q = Invoke-Query $Connection @'
+WITH u AS (
+    SELECT v, ord, NULL AS i, 0 AS src FROM #xray_keys
+    UNION ALL SELECT v, NULL, i, 1 FROM #xray_ext
+), w AS (
+    -- the last profile key at or before each value (keys sort before equal values)
+    SELECT i, v, MAX(ord) OVER (ORDER BY v, src ROWS UNBOUNDED PRECEDING) AS ord_le FROM u
+), x AS (
+    SELECT w.i, w.v, w.ord_le, CASE WHEN k.v = w.v THEN 1 ELSE 0 END AS eq
+    FROM w LEFT JOIN #xray_keys k ON k.ord = w.ord_le WHERE w.i IS NOT NULL
+)
+SELECT i, ord_le, eq,
+       DENSE_RANK() OVER (PARTITION BY ISNULL(ord_le, -1), eq ORDER BY v) AS j,
+       COUNT(*) OVER (PARTITION BY ISNULL(ord_le, -1), eq) AS n
+FROM x;
+'@
+        foreach ($r in $q[0].Rows) {
+            $base = $(if ($r.ord_le -is [DBNull]) { -1.0 } else { [double]$r.ord_le })
+            # n bounds the dense rank, so the fraction stays inside the gap
+            $result[[int]$r.i] = $(if ([int]$r.eq -eq 1) { $base } else { $base + [double]$r.j / ([double]$r.n + 1) })
+        }
+    } finally { try { $null = Invoke-Query $Connection 'DROP TABLE IF EXISTS #xray_keys; DROP TABLE IF EXISTS #xray_ext;' } catch { } }
+    return , $result
 }
 
 function Get-StatsBuildIndex($Connection, [int]$ObjectId, [string]$ColumnName) {
@@ -3444,7 +3790,8 @@ ORDER BY x.executions DESC;
                 while ($r.Read()) {
                     if ($r.IsDBNull(1)) { continue }
                     $raw = $(try { $r.GetValue(1) } catch { $r.GetSqlValue(1) })
-                    $typed["$($g.Name)|$($chunk[[int]$r.GetValue(0)])"] = [SQLStatsXRay.Builder.Profile]::Sortable($raw)
+                    # text values stay strings: the server ranks them against the profile in the column's collation later
+                    $typed["$($g.Name)|$($chunk[[int]$r.GetValue(0)])"] = $(if ($col.IsText) { [string]$raw } else { [SQLStatsXRay.Builder.Profile]::Sortable($raw) })
                 }
             } finally { $r.Close() }
         }
@@ -3480,7 +3827,7 @@ function Get-AdaptiveSamplePlan($Connection, $Target, [string]$Sample, [int]$See
     $cmd.CommandText = "SELECT SUBSTRING(%%physloc%%, 1, 6), $($Target.ColumnSql) FROM $($Target.Table) TABLESAMPLE SYSTEM (" + $pilotPct.ToString('0.######', $script:Inv) +
     " PERCENT) REPEATABLE ($($Seed + 7919)) WITH (INDEX(0)) OPTION (KEEPFIXED PLAN, MAXDOP 1);"
     $r = $cmd.ExecuteReader()
-    try { $pilot = [SQLStatsXRay.Builder.Pilot]::Analyze($r) } finally { $r.Close() }
+    try { $pilot = [SQLStatsXRay.Builder.Pilot]::Analyze($r, [bool]$Target.IsText) } finally { $r.Close() }
     $base.Pilot = $pilot
     if ($pilot.Pages -lt 8 -or $pilot.RowsPerPage -le 0) { $base.Rule += '; pilot too small, SQL Server''s size kept'; return $base }
     # useful rows SQL Server's sample would hold, then the pages that give as many here
@@ -3517,7 +3864,7 @@ function Read-StatsBuildShared($Connection, $Target, $Columns, $Plan, [int]$Seed
     $sw = [Diagnostics.Stopwatch]::StartNew()
     try {
         if ($Plan.Full) {
-            foreach ($c in $cols) { $profiles[$c.Column] = (Read-StatsBuildProfile $Connection ([pscustomobject]@{ Table = $Target.Table; ColumnSql = $c.ColumnSql }) $Plan $Seed $TimeoutSeconds).Profile }
+            foreach ($c in $cols) { $profiles[$c.Column] = (Read-StatsBuildProfile $Connection $c $Plan $Seed $TimeoutSeconds).Profile }
         } else {
             $list = (0..($cols.Count - 1) | ForEach-Object { "$($cols[$_].ColumnSql) AS c$_" }) -join ', '
             $session.CommandText = "DROP TABLE IF EXISTS #xray_sample; SELECT SUBSTRING(%%physloc%%, 1, 6) AS pg, $list INTO #xray_sample FROM $($Target.Table) TABLESAMPLE SYSTEM (" +
@@ -3526,7 +3873,7 @@ function Read-StatsBuildShared($Connection, $Target, $Columns, $Plan, [int]$Seed
             for ($i = 0; $i -lt $cols.Count; $i++) {
                 $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds
                 $cmd.CommandText = "SELECT c$i, COUNT_BIG(*), COUNT(DISTINCT pg) FROM #xray_sample GROUP BY c$i ORDER BY c$i OPTION (MAXDOP 1);"
-                $p = New-Object SQLStatsXRay.Builder.Profile
+                $p = New-StatsBuildProfile $cols[$i] $Connection $Plan
                 $r = $cmd.ExecuteReader()
                 try { $p.Read($r) } finally { $r.Close() }
                 $profiles[$cols[$i].Column] = $p
@@ -3566,35 +3913,57 @@ function Invoke-StatsBuildColumn {
     if ($p.Entries.Count -eq 0) { throw "No values read from [$($Target.Column)]: the table is empty or the column is all NULL." }
     $scale = $(if ($Plan.Full -or $p.ReadRows -le 0) { 1.0 } else { $TableRows / $p.ReadRows })
     $col = $Template.Columns[0]
-    $refined = 0; $index = $null; $refinedWorkload = 0
+    $refined = 0; $index = $null; $refinedWorkload = 0; $isText = [bool]$Target.IsText
+    $mmValues = @()
     if ($Plan.Sampler -eq 'Adaptive' -and -not $Plan.Full) {
         # the true minimum and maximum, with exact counts, when an index makes them cheap (the first step must be the minimum)
         $ix = Get-StatsBuildIndex $Connection $Target.ObjectId $Target.Column
         if ($ix) {
             $index = [string]$ix.name
             $mm = @((Read-ResultSets $Connection "SELECT MIN($($Target.ColumnSql)) AS lo, MAX($($Target.ColumnSql)) AS hi FROM $($Target.Table) WITH (INDEX([$($index.Replace(']', ']]'))])) OPTION (KEEPFIXED PLAN, MAXDOP 1);")[0])[0]
-            foreach ($v in @($mm.lo, $mm.hi)) {
-                if ($v -is [DBNull] -or $null -eq $v) { continue }
-                $one = New-Object 'System.Collections.Generic.List[SQLStatsXRay.Builder.Step]'
-                $st = New-Object SQLStatsXRay.Builder.Step; $st.Raw = $v; $st.Key = [SQLStatsXRay.Builder.Profile]::Sortable($v); $one.Add($st)
-                $null = Invoke-StatsBuildRefine $Connection $Target $col $one $index $TimeoutSeconds
-                $p.InsertExact($v, $st.Eq / $scale)
-            }
-            # the workload's equality values, heaviest first (up to 200 seeks): a sample rarely holds light values
-            if ($WorkloadInfo -and $WorkloadInfo.Workload.EqValues.Count -gt 0) {
-                $wq = $WorkloadInfo.Workload
-                $order = @(0..($wq.EqValues.Count - 1) | Sort-Object { $wq.EqWeights[$_] } -Descending | Select-Object -First 200)
-                $one = New-Object 'System.Collections.Generic.List[SQLStatsXRay.Builder.Step]'
-                # workload values are kept sortable (SqlGuid, SqlBinary, SqlDecimal); back to plain values for the seeks and keys
-                $values = @($order | ForEach-Object { $v = $wq.EqValues[$_]; if ($v -is [Data.SqlTypes.SqlGuid] -or $v -is [Data.SqlTypes.SqlBinary]) { $v.Value } else { $v } })
-                foreach ($v in $values) { $st = New-Object SQLStatsXRay.Builder.Step; $st.Raw = $v; $st.Key = [SQLStatsXRay.Builder.Profile]::Sortable($v); $one.Add($st) }
-                $null = Invoke-StatsBuildRefine $Connection $Target $col $one $index $TimeoutSeconds
-                foreach ($st in $one) { if ($st.Eq -gt 0) { $p.InsertExact($st.Raw, $st.Eq / $scale) } }
-                $refinedWorkload = $one.Count
-            }
+            $mmValues = @(@($mm.lo, $mm.hi) | Where-Object { $_ -isnot [DBNull] -and $null -ne $_ })
         }
     }
-    $workload = $(if ($WorkloadInfo -and $WorkloadInfo.Workload.Count -gt 0) { $WorkloadInfo.Workload } else { $null })
+    $wq = $(if ($WorkloadInfo -and $WorkloadInfo.Workload.Count -gt 0) { $WorkloadInfo.Workload } else { $null })
+    $currentKeys = @()
+    if ($Target.Stat -and $Template.Label -ne 'template') { $currentKeys = @($Template.Histogram | Where-Object { -not $_.IsNullStep } | ForEach-Object { $_.RangeHiKey }) }
+    # sort keys of outside values: the value itself, or for text its position among the profile's keys in the column's
+    # collation (ranked once, on the server, before any value is inserted)
+    $rank = New-Object 'System.Collections.Generic.Dictionary[string,double]' ([StringComparer]::Ordinal)
+    if ($isText) {
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $outside = @($mmValues) + @($currentKeys) + $(if ($wq) { @($wq.EqValues) + @($wq.Lo) + @($wq.Hi) } else { @() })
+        $texts = @($outside | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ } | Where-Object { $seen.Add($_) })
+        $ranks = Get-StatsBuildRanks $Connection $Target $p $texts
+        for ($i = 0; $i -lt $texts.Count; $i++) { $rank[$texts[$i]] = $ranks[$i] }
+    }
+    $keyOf = { param($v) if ($null -eq $v) { return $null }; if ($isText) { return $rank[[string]$v] }; return [SQLStatsXRay.Builder.Profile]::Sortable($v) }
+    if ($index) {
+        foreach ($v in $mmValues) {
+            $one = New-Object 'System.Collections.Generic.List[SQLStatsXRay.Builder.Step]'
+            $st = New-Object SQLStatsXRay.Builder.Step; $st.Raw = $v; $st.Key = & $keyOf $v; $one.Add($st)
+            $null = Invoke-StatsBuildRefine $Connection $Target $col $one $index $TimeoutSeconds
+            $p.InsertExact($v, $st.Key, $st.Eq / $scale)
+        }
+        # the workload's equality values, heaviest first (up to 200 seeks): a sample rarely holds light values
+        if ($wq -and $wq.EqValues.Count -gt 0) {
+            $order = @(0..($wq.EqValues.Count - 1) | Sort-Object { $wq.EqWeights[$_] } -Descending | Select-Object -First 200)
+            $one = New-Object 'System.Collections.Generic.List[SQLStatsXRay.Builder.Step]'
+            # workload values are kept sortable (SqlGuid, SqlBinary, SqlDecimal); back to plain values for the seeks and keys
+            $values = @($order | ForEach-Object { $v = $wq.EqValues[$_]; if ($v -is [Data.SqlTypes.SqlGuid] -or $v -is [Data.SqlTypes.SqlBinary]) { $v.Value } else { $v } })
+            foreach ($v in $values) { $st = New-Object SQLStatsXRay.Builder.Step; $st.Raw = $v; $st.Key = & $keyOf $wq.EqValues[$order[$one.Count]]; $one.Add($st) }
+            $null = Invoke-StatsBuildRefine $Connection $Target $col $one $index $TimeoutSeconds
+            foreach ($st in $one) { if ($st.Eq -gt 0) { $p.InsertExact($st.Raw, $st.Key, $st.Eq / $scale) } }
+            $refinedWorkload = $one.Count
+        }
+    }
+    $workload = $wq
+    if ($wq -and $isText) {
+        # the same predicates, with ranked keys
+        $workload = New-Object SQLStatsXRay.Builder.Workload
+        for ($i = 0; $i -lt $wq.EqValues.Count; $i++) { $workload.AddEquality((& $keyOf $wq.EqValues[$i]), $wq.EqWeights[$i]) }
+        for ($i = 0; $i -lt $wq.Lo.Count; $i++) { $workload.AddRange((& $keyOf $wq.Lo[$i]), $wq.LoInclusive[$i], (& $keyOf $wq.Hi[$i]), $wq.HiInclusive[$i], $wq.RangeWeights[$i]) }
+    }
     $objective = $(if ($workload) { 'workload' } elseif ($WorkloadInfo -and $WorkloadInfo.RangeWeight -gt $WorkloadInfo.EqWeight) { 'ranges' } else { 'equality' })
     $names = @($Algorithms | Where-Object { $_ -ne 'Workload' -or $workload })
     $candidates = New-Object 'System.Collections.Generic.List[object]'
@@ -3603,11 +3972,11 @@ function Invoke-StatsBuildColumn {
         $candidates.Add([pscustomobject]@{ Name = $x.Name; Steps = $x.Steps; NullEq = $p.NullRows * $scale; Score = $x.Score; Seconds = $x.Seconds; Current = $false })
     }
     $current = $null
-    if ($Target.Stat -and $Template.Label -ne 'template') {
+    if ($currentKeys.Count -gt 0) {
         $cs = New-Object 'System.Collections.Generic.List[SQLStatsXRay.Builder.Step]'
         foreach ($h in @($Template.Histogram | Where-Object { -not $_.IsNullStep })) {
             $x = New-Object SQLStatsXRay.Builder.Step
-            $x.Key = [SQLStatsXRay.Builder.Profile]::Sortable($h.RangeHiKey); $x.Eq = $h.EqRows; $x.Range = $h.RangeRows; $x.Distinct = $h.DistinctRangeRows; $x.Avg = $h.AvgRangeRows
+            $x.Key = & $keyOf $h.RangeHiKey; $x.Eq = $h.EqRows; $x.Range = $h.RangeRows; $x.Distinct = $h.DistinctRangeRows; $x.Avg = $h.AvgRangeRows
             $cs.Add($x)
         }
         $nullEq = [double]$Template.Blob.NullStepEqRows
@@ -3624,13 +3993,15 @@ function Invoke-StatsBuildColumn {
 
     $distinct = $p.DistinctValues()
     if (-not $Plan.Full) { $distinct = [SQLStatsXRay.Builder.Histogram]::EstimateDistinct($p.SampleUnits(), $distinct, $p.ValuesSeenOnce(), $p.SampleUnits() * $scale) }
-    $keyLength = $(if ($Target.SystemTypeId -eq 165) { $p.DataBytes() / [Math]::Max(1, $p.ReadRows) } else {
+    # variable-length keys (varbinary, varchar, nvarchar): their average bytes; fixed ones: the record's key size
+    $keyLength = $(if ($Target.SystemTypeId -in 165, 167, 231) { $p.DataBytes() / [Math]::Max(1, $p.ReadRows) } else {
             $rec = @($Template.Histogram | Where-Object { -not $_.IsNullStep })[0].Record
             [double]($rec.FixedEnd - 16) * $p.NonNullRows / [Math]::Max(1, $p.ReadRows) })
     $now = [datetime](Invoke-Query $Connection 'SELECT GETDATE() AS d')[0].Rows[0].d
     $built = [pscustomobject]@{
         Updated = $now; Rows = [Math]::Round($TableRows); RowsSampled = $p.ReadRows; NullRows = $p.NullRows * $scale
         AllDensity = 1.0 / [Math]::Max(1, $distinct + $(if ($p.NullRows -gt 0) { 1 } else { 0 })); AverageLength = $keyLength
+        Trie = $(if ($p.Trie) { , $p.Trie.ToBytes() } else { $null })
     }
     $stream = New-StatsBuildStream $Template $best.Steps $built
     [pscustomobject]@{
@@ -3704,7 +4075,7 @@ function Invoke-StatsBuild {
     $tableRows = $(if ($plan.Full) { $read.Profile.ReadRows } else { [double]$target.Rows })
     $wl = $null; $wlStatus = 'not read'
     if ($UseWorkload) {
-        $w = Get-StatsBuildWorkload $Connection $target.SchemaName $target.TableName @([pscustomobject]@{ Name = $target.Column; ColumnType = $target.ColumnType; SystemTypeId = $target.SystemTypeId })
+        $w = Get-StatsBuildWorkload $Connection $target.SchemaName $target.TableName @([pscustomobject]@{ Name = $target.Column; ColumnType = $target.ColumnType; SystemTypeId = $target.SystemTypeId; IsText = $target.IsText })
         $wl = $w.Columns[$target.Column]; $wlStatus = $w.Status
     }
     $c = Invoke-StatsBuildColumn $Connection $target $template $read.Profile $plan $tableRows $Algorithms $wl $Seed $TimeoutSeconds
@@ -3753,7 +4124,7 @@ function Invoke-StatsBuildTable {
     $anyProfile = @($read.Profiles.Values)[0]
     $tableRows = $(if ($plan.Full) { $anyProfile.ReadRows } else { [double]$first.Rows })
     $w = $null
-    if ($UseWorkload) { $w = Get-StatsBuildWorkload $Connection $first.SchemaName $first.TableName @($columns | ForEach-Object { [pscustomobject]@{ Name = $_.Column; ColumnType = $_.ColumnType; SystemTypeId = $_.SystemTypeId } }) }
+    if ($UseWorkload) { $w = Get-StatsBuildWorkload $Connection $first.SchemaName $first.TableName @($columns | ForEach-Object { [pscustomobject]@{ Name = $_.Column; ColumnType = $_.ColumnType; SystemTypeId = $_.SystemTypeId; IsText = $_.IsText } }) }
     $results = New-Object 'System.Collections.Generic.List[object]'; $items = New-Object 'System.Collections.Generic.List[object]'
     foreach ($e in $eligible) {
         try {
@@ -3795,44 +4166,117 @@ function Format-StatsBuildCandidates($C) {
     return , (Format-AsciiTable -Rows $rows -Columns $cols -RightAlign ($cols | Select-Object -Skip 1))
 }
 
+function Get-StatsBuildVerdict($C) {
+    <#
+      The built histogram against SQL Server's current statistics, on the measure the best one was chosen by:
+      Better, Same (within 5%), Worse, or New (nothing to compare with). Any other measure that gets more than 25%
+      worse is named, so a win on equality cannot hide a loss on ranges.
+    #>
+    $measures = [ordered]@{ equality = @('EqP95', 'equality estimates'); ranges = @('RangeP95', 'range estimates'); workload = @('WorkloadP95', 'the workload''s estimates') }
+    $m = $measures[$C.Objective]
+    $built = $C.Best.Score.($m[0])
+    if (-not $C.Current) {
+        return [pscustomobject]@{ Level = 'New'; Short = 'New'; Text = Format-Invariant 'New statistics: nothing to compare with. 95% of {0} are within {1:0.##}x of the real count.' $m[1] $built }
+    }
+    $now = $C.Current.Score.($m[0])
+    $level = $(if ($built -le $now / 1.05) { 'Better' } elseif ($built -le $now * 1.05) { 'Same' } else { 'Worse' })
+    $worse = foreach ($k in $measures.Keys) {
+        if ($k -eq $C.Objective) { continue }
+        $x = $measures[$k]; $nb = $C.Best.Score.($x[0]); $nc = $C.Current.Score.($x[0])
+        if (-not [double]::IsNaN($nb) -and -not [double]::IsNaN($nc) -and $nb -gt $nc * 1.25) { Format-Invariant '{0} get worse ({1:0.##}x -> {2:0.##}x)' $x[1] $nc $nb }
+    }
+    $text = switch ($level) {
+        'Better' { Format-Invariant 'Better than the current statistics: {0} at the 95th percentile go from {1:0.##}x off to {2:0.##}x.' $m[1] $now $built }
+        'Same' { Format-Invariant 'About as good as the current statistics ({0} at the 95th percentile: {1:0.##}x now, {2:0.##}x built); loading it gains little.' $m[1] $now $built }
+        default { Format-Invariant 'Not better than the current statistics: {0} at the 95th percentile go from {1:0.##}x off to {2:0.##}x. Loading it is not recommended.' $m[1] $now $built }
+    }
+    if ($worse) { $text += ' But ' + (@($worse) -join ' and ') + '.' }
+    if (-not $C.Plan.Full) { $text += ' Measured against the sample.' }
+    [pscustomobject]@{ Level = $level; Short = $level + $(if ($worse -and $level -ne 'Worse') { ' (but worse on some)' } else { '' }); Text = $text }
+}
+
+function Format-StatsBuildComparison($C) {
+    # The chosen histogram next to SQL Server's current statistics, in words.
+    $hasWorkload = @(@($C.Current) + @($C.Best) | Where-Object { $_ -and -not [double]::IsNaN($_.Score.WorkloadP95) }).Count -gt 0
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $add = {
+        param([string]$Label, [string]$Property, [string]$Format)
+        $o = [ordered]@{ Measure = $Label }
+        if ($C.Current) { $o['Now (SQL Server)'] = Format-Invariant $Format $C.Current.Score.$Property }
+        $o["Built ($($C.Best.Name))"] = Format-Invariant $Format $C.Best.Score.$Property
+        $rows.Add([pscustomobject]$o)
+    }
+    & $add 'Equality: 95% of values within' EqP95 '{0:0.##}x'
+    & $add 'Equality: worst value' EqMax '{0:0.##}x'
+    & $add 'Equality: values off by more than 10x' ValuesOver10 '{0:N0}'
+    & $add 'Ranges: 95% of ranges within' RangeP95 '{0:0.##}x'
+    if ($hasWorkload) { & $add 'Workload: 95% of executions within' WorkloadP95 '{0:0.##}x' }
+    $o = [ordered]@{ Measure = 'Histogram steps' }
+    foreach ($x in @($C.Current) + @($C.Best) | Where-Object { $_ }) { $o[$(if ($x.Current) { 'Now (SQL Server)' } else { "Built ($($C.Best.Name))" })] = Format-Invariant '{0:N0}' (@($x.Steps).Count + $(if ($x.NullEq -gt 0) { 1 } else { 0 })) }
+    $rows.Add([pscustomobject]$o)
+    $cols = @($rows[0].PSObject.Properties.Name)
+    return , (Format-AsciiTable -Rows $rows -Columns $cols -RightAlign ($cols | Select-Object -Skip 1))
+}
+
 function Format-StatsBuildWorkload($W, [string]$Status) {
     if (-not $W) { return "Query Store: $Status" }
     Format-Invariant 'Query Store: {0} {1} plan(s) filter on the column; {2:N0} equality value(s) and {3:N0} range(s) read, {4:N0} predicate(s) without a usable value (variables, expressions). Equality weight {5:N0}, range weight {6:N0} (executions).' `
         $Status $W.Plans $W.Equality $W.Ranges $W.Unread $W.EqWeight $W.RangeWeight
 }
 
-function Format-StatsBuildReport($B) {
+function Format-StatsBuildReport($B, [switch]$ShowCandidates) {
+    # The verdict first, then the chosen histogram next to the current statistics; every candidate only on request.
     $t = $B.Target
     $out = @()
     $out += New-Section "STATISTICS BUILDER (BETA): $($t.Table).$('[' + $t.Column + ']') ($($t.ColumnType))"
+    # the verdict, wrapped at 130 characters
+    $line = ''
+    foreach ($word in ((Get-StatsBuildVerdict $B).Text -split ' ')) {
+        if ($line -and $line.Length + 1 + $word.Length -gt 130) { $out += $line; $line = $word } else { $line = ($line + ' ' + $word).TrimStart() }
+    }
+    $out += $line
+    $out += ''
     $info = [ordered]@{
         'Target'          = $(if ($B.IsNew) { "new statistics [$($B.StatName)]" } else { "existing statistics [$($B.StatName)]" })
         'Sample'          = Format-StatsBuildSample $B.Plan $t
-        'Rows read'       = Format-Invariant '{0:N0} of {1:N0} ({2:0.0} s)' $B.Profile.ReadRows $B.TableRows $B.ReadSeconds
-        'NULL rows read'  = Format-Invariant '{0:N0}' $B.Profile.NullRows
+        'Rows read'       = Format-Invariant '{0:N0} of {1:N0}, {2:N0} NULL ({3:0.0} s)' $B.Profile.ReadRows $B.TableRows $B.Profile.NullRows $B.ReadSeconds
         'Distinct values' = Format-Invariant '{0:N0}{1}' $B.Distinct $(if ($B.Plan.Full) { '' } else { ' (estimated from the sample)' })
-        'Profile entries' = Format-Invariant '{0:N0}{1}' $B.Profile.Entries.Count $(if ($B.Profile.Compacted) { ' (light values merged to bound memory: scores inside merged runs are approximate)' } else { '' })
-        'Objective'       = "$($B.Objective) (best by $(switch ($B.Objective) { 'workload' { 'the workload''s p95 q-error' } 'ranges' { 'range p95: the workload filters mostly by range' } default { 'equality p95 per distinct value' } }))"
+        'Histogram'       = "$($B.Best.Name), the best of $(@($B.Candidates).Count) algorithm(s) on $(switch ($B.Objective) { 'workload' { 'the Query Store workload''s estimates' } 'ranges' { 'range estimates (the workload filters mostly by range)' } default { 'equality estimates per distinct value' } })"
     }
     if ($B.Refined) { $info['Exact counts'] = "EQ_ROWS of the $($B.Refined) step keys counted with seeks on [$($B.RefineIndex)]; true minimum and maximum added$(if ($B.RefinedWorkload) { "; $($B.RefinedWorkload) workload values counted before choosing the steps" })" }
+    if ($B.Profile.Compacted) { $info['Memory'] = 'light values merged to bound memory: scores inside merged runs are approximate' }
     $out += Format-KeyValueTable $info
     $out += Format-StatsBuildWorkload $B.Workload $B.WorkloadStatus
     $out += ''
-    $out += 'Candidates, scored by q-error (1 = exact) against the rows read; equality per distinct value, ranges over 1,000 random ranges, workload by executions:'
-    $out += Format-StatsBuildCandidates $B
+    $out += 'Estimate accuracy against the rows read: how many times an estimate is off from the real count (1x = exact).'
+    $out += Format-StatsBuildComparison $B
     if (-not $B.Plan.Full) {
         $out += 'These scores are measured against the sample, not the table. They favour histograms that underestimate distinct values (each value'
         $out += 'the sample saw looks at least "scale" rows big), which can make SQL Server''s current statistics look better than they are.'
         $out += 'For a verdict, score the loaded statistics against a full scan (-Statistics <name> -Build -Sample FULLSCAN).'
+    }
+    if ($ShowCandidates) {
+        $out += ''
+        $out += 'Every algorithm tried, scored by q-error (1 = exact); equality per distinct value, ranges over 1,000 random ranges, workload by executions:'
+        $out += Format-StatsBuildCandidates $B
+    } elseif (@($B.Candidates).Count -gt 1) {
+        $out += "Also tried: $((@($B.Candidates | Where-Object { $_ -ne $B.Best } | ForEach-Object Name)) -join ', ') (-ShowCandidates lists their scores)."
     }
     foreach ($w in $B.Stream.Warnings) { $out += "Note: $w" }
     $out += "The script $(if ($B.IsNew) { 'creates' } else { 'updates' }) [$($B.StatName)] with the $($B.Best.Name) histogram. Nothing was changed on the server; NORECOMPUTE is recommended (see the script)."
     return , $out
 }
 
-function Format-StatsBuildTableReport($T) {
+function Format-StatsBuildTableReport($T, [switch]$ShowCandidates) {
     $out = @()
     $out += New-Section "STATISTICS BUILDER (BETA): every statistics object of $($T.Table), from one read"
+    $verdicts = @{}
+    foreach ($c in @($T.Results)) { $verdicts[$c.StatName] = Get-StatsBuildVerdict $c }
+    if (@($T.Results).Count) {
+        $count = { param($l) @($verdicts.Values | Where-Object Level -eq $l).Count }
+        $out += Format-Invariant '{0} better than the current statistics, {1} about the same, {2} not better, {3} new. Loading the ones that are not better is not recommended.' (& $count 'Better') (& $count 'Same') (& $count 'Worse') (& $count 'New')
+        $out += ''
+    }
     $out += Format-KeyValueTable ([ordered]@{
             'Sample'     = Format-StatsBuildSample $T.Plan $T.Target
             'Rows read'  = Format-Invariant '{0:N0} of {1:N0}, {2} column(s), one read ({3:0.0} s); SQL Server reads the table once per statistics object' $T.RowsRead $T.TableRows $T.Columns $T.ReadSeconds
@@ -3843,14 +4287,26 @@ function Format-StatsBuildTableReport($T) {
     if (@($T.Results).Count) {
         $rows = foreach ($c in $T.Results) {
             [pscustomobject]@{
-                Statistics = $c.StatName; Column = $c.Target.Column; Algorithm = $c.Best.Name; Objective = $c.Objective
-                'Eq p95 now' = $(if ($c.Current) { Format-Invariant '{0:0.##}' $c.Current.Score.EqP95 } else { '' }); 'Eq p95 built' = Format-Invariant '{0:0.##}' $c.Best.Score.EqP95
-                'Range p95 now' = $(if ($c.Current) { Format-Invariant '{0:0.##}' $c.Current.Score.RangeP95 } else { '' }); 'Range p95 built' = Format-Invariant '{0:0.##}' $c.Best.Score.RangeP95
+                Statistics = $c.StatName; Column = $c.Target.Column; Verdict = $verdicts[$c.StatName].Short; Algorithm = $c.Best.Name; 'Chosen on' = $c.Objective
+                'Equality now' = $(if ($c.Current) { Format-Invariant '{0:0.##}x' $c.Current.Score.EqP95 } else { '' }); 'Equality built' = Format-Invariant '{0:0.##}x' $c.Best.Score.EqP95
+                'Ranges now' = $(if ($c.Current) { Format-Invariant '{0:0.##}x' $c.Current.Score.RangeP95 } else { '' }); 'Ranges built' = Format-Invariant '{0:0.##}x' $c.Best.Score.RangeP95
                 'Used by (executions)' = Format-Invariant '{0:N0}' $c.Usage
             }
         }
         $out += ''
-        $out += Format-AsciiTable -Rows $rows -Columns Statistics, Column, Algorithm, Objective, 'Eq p95 now', 'Eq p95 built', 'Range p95 now', 'Range p95 built', 'Used by (executions)' -RightAlign 'Eq p95 now', 'Eq p95 built', 'Range p95 now', 'Range p95 built', 'Used by (executions)'
+        $out += 'Estimate accuracy against the rows read: 95% of values (equality) or of random ranges are within this many times the real count (1x = exact).'
+        $out += Format-AsciiTable -Rows $rows -Columns Statistics, Column, Verdict, Algorithm, 'Chosen on', 'Equality now', 'Equality built', 'Ranges now', 'Ranges built', 'Used by (executions)' -RightAlign 'Equality now', 'Equality built', 'Ranges now', 'Ranges built', 'Used by (executions)'
+        if (-not $T.Plan.Full) { $out += 'Measured against the sample, not the table: for a verdict, score the loaded statistics with -Sample FULLSCAN.' }
+        foreach ($c in @($T.Results)) {
+            if ($verdicts[$c.StatName].Level -ne 'New') { $out += "  [$($c.StatName)]: $($verdicts[$c.StatName].Text)" }
+        }
+        if ($ShowCandidates) {
+            foreach ($c in @($T.Results)) {
+                $out += ''
+                $out += "[$($c.StatName)]: every algorithm tried, scored by q-error (1 = exact):"
+                $out += Format-StatsBuildCandidates $c
+            }
+        } else { $out += 'Every algorithm''s scores: -ShowCandidates.' }
     }
     if (@($T.Skipped).Count) {
         $out += ''
@@ -4669,7 +5125,7 @@ function Show-GuiBuildDialog {
     Add-GuiRow $d.Layout 'Column' $column
     $name = New-GuiControl TextBox @{ Width = [int](260 * $sc); Text = $(if ($columns.Count) { "xray_$($columns[0])" } else { '' }) }
     Add-GuiRow $d.Layout 'New statistics name' $name
-    Add-GuiRow $d.Layout '' (& $note 'One-column statistics on numbers, dates and times, uniqueidentifier and binary columns (v1). Nonclustered index statistics also carry the clustering key and are skipped.')
+    Add-GuiRow $d.Layout '' (& $note 'One-column statistics on numbers, dates and times, uniqueidentifier, binary and character columns (char, varchar, nchar, nvarchar; ordered by the server in the column''s collation). Nonclustered index statistics also carry the clustering key and are skipped.')
 
     Add-GuiRow $d.Layout '' (New-GuiHeading 'Sample')
     $sampler = New-GuiControl ComboBox @{ DropDownStyle = 'DropDownList'; Width = [int](260 * $sc) }
@@ -4733,7 +5189,10 @@ function Complete-GuiBuild($Job, $Result, [string[]]$Notes) {
     if (-not $b -or -not $b.Script) { Set-GuiStatus 'Build failed.'; Show-GuiMessage ((@('The builder returned no script.') + $Notes) -join [Environment]::NewLine) 'Error'; return }
     $g.Report.AppendText(([Environment]::NewLine + ((@($Notes) + @($Result.Lines | Where-Object { $_ -notlike 'Script written to*' })) -join [Environment]::NewLine)))
     $g.HasReport = $true
-    $summary = $(if ($Job.Build.All) { "$(@($b.Results).Count) statistics object(s) built from one read, $(@($b.Skipped).Count) skipped" } else { "[$($b.StatName)]: $($b.Best.Name), objective $($b.Objective)" })
+    $summary = $(if ($Job.Build.All) {
+            $levels = @($b.Results | ForEach-Object { (Get-StatsBuildVerdict $_).Level })
+            "$(@($b.Results).Count) statistics object(s) built from one read ($(@($levels | Where-Object { $_ -eq 'Better' }).Count) better than now), $(@($b.Skipped).Count) skipped"
+        } else { "[$($b.StatName)]: $($b.Best.Name), $(switch ((Get-StatsBuildVerdict $b).Level) { 'Better' { 'better than now' } 'Same' { 'about the same as now' } 'Worse' { 'not better than now' } default { 'new' } })" })
     Set-GuiStatus "Statistics built: $summary. Nothing was changed on the server."
     Show-GuiBuildResult $b $Result.Lines $Job.Build
 }
@@ -4751,9 +5210,21 @@ function Show-GuiBuildResult($B, [string[]]$Lines, $Info) {
     $pages = @{}
     # the report without the script (the background run appends it after a SCRIPT heading; it has its own tab)
     $summary = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($l in @($Lines)) { if ($l -eq '  SCRIPT') { if ($summary.Count -gt 1) { $summary.RemoveRange($summary.Count - 2, 2) }; break }; if ($l -notlike 'Script written to*') { $summary.Add($l) } }
+    foreach ($l in @($Lines)) {
+        if ($l -eq '  SCRIPT') { if ($summary.Count -gt 1) { $summary.RemoveRange($summary.Count - 2, 2) }; break }
+        if ($l -like 'Script written to*') { continue }
+        $summary.Add(($l -replace '\(-ShowCandidates lists their scores\)', '(scores in the All algorithms tab)' -replace '^Every algorithm''s scores: -ShowCandidates\.$', 'Every algorithm''s scores: the All algorithms tab.'))
+    }
     $summaryText = ($summary.ToArray() -join [Environment]::NewLine).Trim()
-    foreach ($t in @(@('Summary', $summaryText), @('Script', [string]$B.Script))) {
+    # every candidate's scores, which the summary leaves out
+    $all = New-Object 'System.Collections.Generic.List[string]'
+    $all.Add('Every algorithm tried, scored by q-error (1 = exact) against the rows read; equality per distinct value, ranges over 1,000 random ranges, workload by executions.')
+    foreach ($c in $(if ($Info.All) { @($B.Results) } else { @($B) })) {
+        $all.Add('')
+        if ($Info.All) { $all.Add("[$($c.StatName)] ($($c.Target.Column)), chosen on $($c.Objective):") } else { $all.Add("Chosen on $($c.Objective):") }
+        $all.AddRange([string[]](Format-StatsBuildCandidates $c))
+    }
+    foreach ($t in @(@('Summary', $summaryText), @('All algorithms', ($all.ToArray() -join [Environment]::NewLine)), @('Script', [string]$B.Script))) {
         $page = New-GuiControl TabPage @{ Text = $t[0]; Padding = (New-Object Windows.Forms.Padding 4) }
         $box = New-GuiControl TextBox @{ Dock = 'Fill'; ReadOnly = $true; Multiline = $true; WordWrap = $false; ScrollBars = 'Both'; MaxLength = 0; Font = $mono; BorderStyle = 'None'; Text = $t[1] }
         $page.Controls.Add($box); $tabs.TabPages.Add($page); $pages[$t[0]] = $box
@@ -6870,7 +7341,7 @@ if ($PSCmdlet.ParameterSetName -in 'Hex', 'File') {
                 [IO.File]::WriteAllText([IO.Path]::GetFullPath($OutputScript), $b.Script, (New-Object Text.UTF8Encoding $true))
             }
             if ($buildReport) {
-                $allLines.AddRange([string[]]$(if ($AllStatistics) { Format-StatsBuildTableReport $b } else { Format-StatsBuildReport $b }))
+                $allLines.AddRange([string[]]$(if ($AllStatistics) { Format-StatsBuildTableReport $b -ShowCandidates:$ShowCandidates } else { Format-StatsBuildReport $b -ShowCandidates:$ShowCandidates }))
                 if ($OutputScript) { $allLines.Add("Script written to $([IO.Path]::GetFullPath($OutputScript)).") }
                 else { $allLines.AddRange([string[]](New-Section 'SCRIPT')); $allLines.AddRange([string[]]($b.Script -split "`r`n")) }
             }
