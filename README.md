@@ -67,7 +67,7 @@ It skips filtered, incremental and columnstore statistics, indexed views, memory
 
 `-Build` (the app's **Tools > Build statistics (beta)...**, Ctrl+B) builds a histogram of its own for a column from the table data, compares it with the statistics SQL Server has, and writes the script that loads it. It never changes the server: you run the script.
 
-![The Build statistics dialog: what to build, the sampler and sample size, the algorithms and NORECOMPUTE](assets/screenshot-builder-dialog.png)
+![The Build statistics dialog: what to build, the sampler and sample size, the algorithms, a focus range and NORECOMPUTE](assets/screenshot-builder-dialog.png)
 
 - **Two samplers.** *SQL Server* reads the pages SQL Server would: its default sample size was reverse engineered from the engine (`pages x 15 x rows^0.55 / rows + 1,024`, the whole table under 8 MB) and matched SQL Server's own sampled page counts. *Adaptive* first reads a pilot of about 64 pages to measure rows per page and how much the column's values cluster by page, then reads as many *useful* rows as SQL Server's sample would hold (up to 4 times its pages by default). With an index on the column it also counts each step key and the true minimum and maximum exactly. Both take `Default`, `FULLSCAN`, `<n> PERCENT` or `<n> ROWS`.
 - **Distinct values counted by page.** Values repeat within pages, so the distinct-value estimate counts each value's pages, not its rows. On a table whose values cluster by page, SQL Server's sampled statistic estimated 4,864 distinct values (true 40,001); the same pages gave 37,503 here.
@@ -76,6 +76,7 @@ It skips filtered, incremental and columnstore statistics, indexed views, memory
 - **A verdict, not a wall of numbers.** The report opens with one sentence: better than the current statistics, about the same, or not better (then loading it is not recommended). It names any measure that gets worse. Below it, only the chosen histogram is shown next to SQL Server's current statistics, in plain terms: "95% of values within 1.45x of the real count". `-ShowCandidates` (the app's **All algorithms** tab) lists every algorithm tried with all its scores.
 - **Strings too.** `char`, `varchar`, `nchar` and `nvarchar` keys are ordered and compared by the server in the column's collation. The string index SQL Server keeps for `LIKE` estimates is rebuilt from the same rows the way SQL Server builds it: on full scans of six test tables (binary, case-insensitive and SQL collations, long strings) it came out byte for byte identical to SQL Server's, and `LIKE` estimates matched. UTF-8 collations and double-byte code pages (Japanese, Chinese, Korean) get the histogram without a string index, so `LIKE` falls back to SQL Server's guesses.
 - **A whole table from one read.** With `-AllStatistics` (or "Every statistics object of the table" in the app), a sample is read once and serves every statistics object on the table; SQL Server samples the table again for each one.
+- **A focus range for the rows queries look at.** `-FocusLast '6 months'` (or `'30 days'`, `'1 year'`, `'newest 10%'`), or `-FocusFrom` / `-FocusTo` with values or T-SQL expressions, gives most of the 200 steps to that range and counts it exactly; the rest of the table keeps a few coarse steps with correct counts, so the histogram still describes the whole table. The app's Build dialog offers the same presets: time spans for date and time columns, the newest share of rows for any column, and a hint when the statistic is ascending. [Details below](#focus-range).
 
 ![The builder's results: the verdict and the sample, then the chosen histogram's accuracy next to SQL Server's current statistics](assets/screenshot-builder.png)
 
@@ -91,6 +92,9 @@ Limits of this version: statistics on one column of numbers, dates and times, st
 
 # A new statistics object on a column, from a full scan
 .\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.Orders -Column ShipDate -Build -Sample FULLSCAN -OutputScript .\build.sql
+
+# The last 6 months of orders get 180 of the 200 steps
+.\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.Orders -Statistics st_OrderDate -Build -FocusLast '6 months' -OutputScript .\build.sql
 
 # Every statistics object of a table, from one read, with every algorithm's scores
 .\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.Orders -Build -AllStatistics -ShowCandidates -OutputScript .\build.sql
@@ -108,6 +112,18 @@ The four algorithms only differ in where they put the keys between the smallest 
 | **VOptimal** | Starts with one step per value and keeps merging the neighbours whose merge adds the least variance, so the values in a step are close in size (greedy v-optimal). | Equality estimates in general: the values inside a step really are close to AVG_RANGE_ROWS. Often the best overall. | The slowest of the four on columns with many distinct values; ranges are not what it optimizes. |
 
 Every candidate is scored the same way, on every distinct value and 1,000 random ranges, and the best on equality is written. The app's Build dialog shows each description when you hover an algorithm. `-ShowCandidates` (the **All algorithms** tab) prints them under the scores.
+
+### Focus range
+
+Users often know which rows matter: the last months of orders, the open tickets, the newest ids. A focus range spends the histogram there without giving up the rest of the table:
+
+- **The range is counted exactly** (through an index on the column when there is one, else a scan) and gets `-FocusSteps` of the 200 steps (180 by default).
+- **The rest keeps correct counts** in a few coarse steps, rescaled so the histogram adds up to the table. That matters: in the lab, SQL Server 2025's estimator scaled every estimate by the table's rows over the histogram's own total, so a histogram of only the recent rows estimated recent dates 3.5x too high and everything older at 1 row (1.35 million rows estimated at 1).
+- **The report scores both sides**, now and built: inside the range, where the build is judged, and outside it, the price of the moved steps.
+- **Presets.** `'<n> days'`, `'<n> weeks'`, `'<n> months'`, `'<n> years'` count back from today's midnight on date and time columns (from the newest value when no row is that recent, as in an old copy). `'newest <n>%'` takes the newest share of the rows on any column, the natural choice for an ascending key.
+- **It moves.** The range is worked out when the script is built: rebuild on a schedule with the same focus, or newer rows fall outside it.
+
+In the lab (1.9 million orders over 7 years, SQL Server's default sample), `-FocusLast '6 months'` on the order date took equality estimates inside the range from 2.2x off to exact, while values outside went from 2.95x to 3.25x. On a `datetime2` order time, the last 30 days' day and week ranges became exact (1.33x and 1.12x before), and ranges of a few hours inside the focus were no better than SQL Server's, since a step there still spans several hours. Character columns and `-AllStatistics` builds do not take a focus range yet.
 
 ## Advisors
 

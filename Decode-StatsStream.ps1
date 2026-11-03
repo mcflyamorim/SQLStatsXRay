@@ -144,6 +144,23 @@
     -Build -Sampler Adaptive: the most pages the adaptive sampler reads, as a multiple of SQL Server's
     sample (default 4). 0 = no limit.
 
+.PARAMETER FocusLast
+    -Build: a focus range on the rows most queries look at. '7 days', '3 months', '6 months', '1 year'
+    (date and time columns: back from now, or from the newest value when no row is that recent), or
+    'newest 10%' of the rows (any column). The range is counted exactly and gets -FocusSteps of the 200
+    steps; the rest of the table keeps a few coarse steps with correct counts, so the histogram still
+    describes the whole table. The report scores accuracy inside and outside the range.
+
+.PARAMETER FocusFrom
+    -Build: the focus range's start, a value ('2026-05-01', 1000000) or a T-SQL expression
+    (DATEADD(MONTH, -6, GETDATE())) evaluated with SELECT on the server. Open-ended when left out.
+
+.PARAMETER FocusTo
+    -Build: the focus range's end, as -FocusFrom. Open-ended (up to the newest value) when left out.
+
+.PARAMETER FocusSteps
+    -Build with a focus range: steps for the range (default 180 of 200).
+
 .PARAMETER NewStatisticsName
     -Build -Column: name of the new statistics object (default xray_<column>).
 
@@ -351,6 +368,22 @@ param(
     [Parameter(ParameterSetName = 'Server')]
     [Parameter(ParameterSetName = 'ConnStr')]
     [double]$AdaptiveLimit = 4,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [string]$FocusLast,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [string]$FocusFrom,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [string]$FocusTo,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [int]$FocusSteps = 180,
 
     [Parameter(ParameterSetName = 'Server')]
     [Parameter(ParameterSetName = 'ConnStr')]
@@ -3209,6 +3242,42 @@ namespace SQLStatsXRay.Builder {
    }
   }
 
+  // A focus range: the entries from fromKey to toKey (null = open end) replaced by an exact read of that range, and the
+  // entries outside it rescaled so the profile adds up to the table's rows (the 2025 CE scales estimates by the table's
+  // rows over the histogram's own total). Exact entries are kept in sample units (rows / scale) and count no value as
+  // seen once, so the distinct values inside the range stay exact.
+  public void ReplaceRange(object fromKey, object toKey, Profile exact, double scale, double tableRows) {
+   int a = fromKey == null ? 0 : IndexBelow(fromKey, false) + 1;
+   int b = toKey == null ? Entries.Count - 1 : IndexBelow(toKey, true);
+   double removed = 0;
+   if (b >= a) { for (int i = a; i <= b; i++) removed += Entries[i].Rows; Entries.RemoveRange(a, b - a + 1); }
+   var inserted = new List<Entry>(exact.Entries.Count);
+   double inside = 0;
+   foreach (var e in exact.Entries) {
+    var x = new Entry();
+    x.Key = e.Key; x.Raw = e.Raw; x.Rows = e.Rows / scale; x.LastRows = e.LastRows / scale; x.Distinct = e.Distinct;
+    x.SumSq = e.SumSq / (scale * scale); x.Units = Math.Max(x.Rows, 1e-9); x.Ones = 0; x.Bytes = e.Bytes / scale;
+    inserted.Add(x); inside += x.Rows;
+   }
+   Entries.InsertRange(a, inserted);
+   if (exact.Compacted) Compacted = true;
+   double outside = NonNullRows - removed;
+   double want = tableRows / scale - NullRows - inside;
+   double f = outside > 0 && want > 0 ? want / outside : 1;
+   for (int i = 0; i < Entries.Count; i++) {
+    if (i >= a && i < a + inserted.Count) continue;
+    var e = Entries[i]; e.Rows *= f; e.LastRows *= f; e.SumSq *= f * f; e.Bytes *= f;
+   }
+   NonNullRows = inside + outside * f;
+  }
+
+  // rows, distinct values, sampling units and values seen once of the entries from index a to b
+  public double[] Totals(int a, int b) {
+   var t = new double[4];
+   for (int i = Math.Max(0, a); i <= b && i < Entries.Count; i++) { var e = Entries[i]; t[0] += e.Rows; t[1] += e.Distinct; t[2] += e.Units; t[3] += e.Ones; }
+   return t;
+  }
+
   public double DistinctValues() { double d = 0; foreach (var e in Entries) d += e.Distinct; return d; }
   public double ValuesSeenOnce() { double d = 0; foreach (var e in Entries) d += e.Ones; return d; }
   public double SampleUnits() { double d = 0; foreach (var e in Entries) d += e.Units; return d; }
@@ -3494,6 +3563,8 @@ namespace SQLStatsXRay.Builder {
 
  public sealed class Candidate {
   public string Name; public List<int> Keys; public List<Step> Steps; public Score Score; public double Seconds;
+  // with a focus range: the scores inside it and outside it
+  public Score Inside, Outside;
  }
 
  // The sample advisor's one read: (value, page, rows) in key order, kept in flat lists so any page sample of the
@@ -3634,13 +3705,7 @@ namespace SQLStatsXRay.Builder {
    System.Threading.Tasks.Parallel.For(0, names.Length, delegate (int i) {
     var sw = System.Diagnostics.Stopwatch.StartNew();
     List<int> keys;
-    switch (names[i]) {
-     case "EqualRows": keys = EqualRows(p, max); break;
-     case "MaxDiff": keys = MaxDiff(p, max); break;
-     case "FrequentFirst": keys = FrequentFirst(p, max); break;
-     case "VOptimal": keys = VOptimal(p, max); break;
-     default: throw new ArgumentException("Unknown algorithm " + names[i]);
-    }
+    keys = Keys(names[i], p, max);
     var c = new Candidate();
     c.Name = names[i]; c.Keys = keys; c.Steps = FromPositions(p, keys, scale);
     c.Score = Evaluate(p, c.Steps, nullEq, scale, ranges, seed);
@@ -3648,6 +3713,105 @@ namespace SQLStatsXRay.Builder {
     result[i] = c;
    });
    return result;
+  }
+
+  static List<int> Keys(string name, Profile p, int max) {
+   switch (name) {
+    case "EqualRows": return EqualRows(p, max);
+    case "MaxDiff": return MaxDiff(p, max);
+    case "FrequentFirst": return FrequentFirst(p, max);
+    case "VOptimal": return VOptimal(p, max);
+    default: throw new ArgumentException("Unknown algorithm " + name);
+   }
+  }
+
+  // With a focus range (profile entries a to b): FocusSteps steps for the range, the others split between the entries
+  // below and above it by their rows (at least two each, so a part keeps its first and last value). Each part runs the
+  // algorithm on its own entries, so the first step stays the column's smallest value and the range's ends are keys;
+  // steps a part cannot use go where the most rows share a step (Fill).
+  public static Candidate[] BuildAllFocus(Profile p, string[] names, int max, int a, int b, int focusSteps, double scale, double nullEq, int ranges, int seed) {
+   int n = p.Entries.Count;
+   int nb = a, nf = b - a + 1, na = n - 1 - b;
+   double rb = 0, ra = 0;
+   for (int i = 0; i < a; i++) rb += p.Entries[i].Rows;
+   for (int i = b + 1; i < n; i++) ra += p.Entries[i].Rows;
+   int fb = Math.Min(Math.Max(1, focusSteps), nf);
+   int minB = Math.Min(2, nb), minA = Math.Min(2, na);
+   fb = Math.Min(fb, max - minB - minA);
+   int rest = max - fb;
+   int bb = nb == 0 ? 0 : Math.Max(minB, (int)Math.Round(rest * (ra + rb > 0 ? rb / (ra + rb) : 0.5)));
+   bb = Math.Min(Math.Min(bb, nb), rest - minA);
+   int ab = Math.Min(na, rest - bb);
+   var parts = new List<int[]>();   // start, count, budget
+   if (nb > 0) parts.Add(new[] { 0, nb, bb });
+   parts.Add(new[] { a, nf, fb });
+   if (na > 0) parts.Add(new[] { b + 1, na, ab });
+   var result = new Candidate[names.Length];
+   System.Threading.Tasks.Parallel.For(0, names.Length, delegate (int i) {
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    var keys = new List<int>();
+    foreach (var part in parts) {
+     if (part[2] <= 0) continue;
+     var sub = new Profile(); sub.Entries = p.Entries.GetRange(part[0], part[1]);
+     foreach (int k in Keys(names[i], sub, part[2])) keys.Add(part[0] + k);
+    }
+    keys.Sort();
+    keys = Fill(p, keys, max);
+    var c = new Candidate();
+    c.Name = names[i]; c.Keys = keys; c.Steps = FromPositions(p, keys, scale);
+    c.Score = Evaluate(p, c.Steps, nullEq, scale, ranges, seed);
+    var z = EvaluateZones(p, c.Steps, scale, ranges, seed, a, b);
+    c.Inside = z[0]; c.Outside = z[1];
+    c.Seconds = sw.Elapsed.TotalSeconds;
+    result[i] = c;
+   });
+   return result;
+  }
+
+  // Scores inside the focus range (entries a to b) and outside it: every value of the zone, and random ranges that stay
+  // inside one part (the range, the entries below it, or above it). A zone with no entries scores Values = 0.
+  public static Score[] EvaluateZones(Profile p, IList<Step> steps, double scale, int ranges, int seed, int a, int b) {
+   int n = p.Entries.Count;
+   var estLast = new double[n]; var estInner = new double[n]; var pe = new double[n + 1]; var pa = new double[n + 1];
+   Estimates(p, steps, scale, estLast, estInner, pe, pa, null);
+   var inside = new List<int[]>(); var outside = new List<int[]>();
+   if (b >= a) inside.Add(new[] { a, b });
+   if (a > 0) outside.Add(new[] { 0, a - 1 });
+   if (b < n - 1) outside.Add(new[] { b + 1, n - 1 });
+   return new[] { ZoneScore(p, estLast, estInner, pe, pa, scale, inside, ranges, seed), ZoneScore(p, estLast, estInner, pe, pa, scale, outside, ranges, seed) };
+  }
+
+  static Score ZoneScore(Profile p, double[] estLast, double[] estInner, double[] pe, double[] pa, double scale, List<int[]> parts, int ranges, int seed) {
+   var score = new Score();
+   var qs = new List<double>(); var ws = new List<double>(); var rs = new List<double>();
+   int size = 0;
+   foreach (var part in parts) {
+    size += part[1] - part[0] + 1;
+    for (int i = part[0]; i <= part[1]; i++) {
+     var e = p.Entries[i];
+     double actLast = e.LastRows * scale;
+     qs.Add(QError(estLast[i], actLast)); ws.Add(1); rs.Add(actLast);
+     double inner = e.Distinct - 1;
+     if (inner > 0) { double actInner = (e.Rows - e.LastRows) / inner * scale; qs.Add(QError(estInner[i], actInner)); ws.Add(inner); rs.Add(actInner * inner); }
+    }
+   }
+   if (size == 0) { score.EqP95 = score.EqMax = score.EqGeoMean = score.EqP95ByRows = score.RangeP95 = score.RangeGeoMean = score.RangeMax = double.NaN; return score; }
+   double[] q = qs.ToArray(), wv = ws.ToArray(), rv = rs.ToArray();
+   double w = 0, lg = 0;
+   for (int i = 0; i < q.Length; i++) { w += wv[i]; lg += wv[i] * Math.Log(q[i]); if (q[i] > score.EqMax) score.EqMax = q[i]; if (q[i] > 10) score.ValuesOver10 += wv[i]; }
+   score.Values = w; score.EqGeoMean = w > 0 ? Math.Exp(lg / w) : 1;
+   score.EqP95 = Percentile(q, wv, 0.95); score.EqP95ByRows = Percentile(q, rv, 0.95);
+   var rnd = new Random(seed); var rq = new double[ranges]; double rl = 0;
+   for (int k = 0; k < ranges; k++) {
+    // a part picked by its number of entries, then a range inside it
+    int pick = rnd.Next(size), at = 0; int[] part = parts[0];
+    foreach (var x in parts) { int len = x[1] - x[0] + 1; if (pick < at + len) { part = x; break; } at += len; }
+    int lo = part[0] + rnd.Next(part[1] - part[0] + 1), hi = part[0] + rnd.Next(part[1] - part[0] + 1);
+    if (lo > hi) { int t = lo; lo = hi; hi = t; }
+    rq[k] = QError(pe[hi + 1] - pe[lo], pa[hi + 1] - pa[lo]); rl += Math.Log(rq[k]); if (rq[k] > score.RangeMax) score.RangeMax = rq[k];
+   }
+   score.RangeGeoMean = ranges > 0 ? Math.Exp(rl / ranges) : 1; score.RangeP95 = Percentile(rq, null, 0.95);
+   return score;
   }
 
   // Haas-Stokes Duj1: distinct values of N rows from a sample of n rows with d distinct values, f1 of them seen once.
@@ -4314,15 +4478,111 @@ function Read-StatsBuildShared($Connection, $Target, $Columns, $Plan, [int]$Seed
     return [pscustomobject]@{ Profiles = $profiles; Seconds = $sw.Elapsed.TotalSeconds }
 }
 
+function Add-StatsBuildKey($Command, [string]$Name, $Column, $Raw) {
+    # A value read from the column, bound as a parameter of the column's own type; returns the expression that reads it.
+    $keyText = Format-SqlValue $Raw $Column.SystemTypeId $Column.Scale
+    $fake = [pscustomobject]@{ RangeHiKey = $(if ($Column.SystemTypeId -in 60, 122, 106, 108) { $keyText } else { $Raw }); Record = [pscustomobject]@{ KeyBytes = $null } }
+    if ($Column.SystemTypeId -eq 61) { $fake.Record.KeyBytes = ConvertTo-SqlDateTimeBytes ([datetime]$Raw) }
+    Add-DataCheckKey $Command $Name $Column $fake
+}
+
+# Quick focus ranges: time spans for date and time columns, the newest share of the rows for any column
+$script:FocusDateTypes = 40, 42, 43, 58, 61
+$script:FocusPresets = 'Last 7 days', 'Last 30 days', 'Last 3 months', 'Last 6 months', 'Last year', 'Newest 10% of rows', 'Newest 25% of rows'
+
+function Resolve-StatsBuildFocus {
+    <#
+      The focus range's bounds as values of the column. -FocusLast: '<n> days|weeks|months|years' back from now (date and
+      time columns), or 'newest <n>%' of the rows read; or -FocusFrom / -FocusTo: a value ('2026-05-01', 1000000) or a
+      T-SQL expression (DATEADD(MONTH, -6, GETDATE())), evaluated with SELECT on the server. A time span that holds no
+      rows (an old copy of the data) is counted back from the column's newest value instead.
+    #>
+    param($Connection, $Target, $Column, $Profile, [string]$From, [string]$To, [string]$Last, [int]$Steps = 180)
+    if ($Target.IsText) { throw 'A focus range works on numbers, dates and times, uniqueidentifier and binary columns; character columns are not supported yet.' }
+    if ($Steps -lt 10 -or $Steps -gt 196) { throw '-FocusSteps takes 10 to 196 (the other steps cover the rest of the table).' }
+    $type = $Target.ColumnType
+    $value = {
+        param([string]$Text, [string]$Which)
+        # a literal first (converted by the server, as in a WHERE clause), then an expression
+        try { return (Invoke-Query $Connection "SELECT CAST(@v AS $type) AS v" @{ '@v' = $Text })[0].Rows[0].v }
+        catch {
+            try { return (Invoke-Query $Connection "SELECT CAST(($Text) AS $type) AS v")[0].Rows[0].v }
+            catch { throw "-Focus${Which}: '$Text' is neither a $type value nor an expression the server can evaluate ($($_.Exception.GetBaseException().Message))." }
+        }
+    }
+    $lastEntry = $Profile.Entries[$Profile.Entries.Count - 1]
+    $fromRaw = $null; $toRaw = $null; $label = ''
+    if ($Last) {
+        $l = $Last.Trim()
+        if ($l -match '^(?i)(?:last\s+)?(\d+)\s*(day|week|month|year)s?$' -or $l -match '^(?i)last\s+(year|month|week|day)()$') {
+            $n = $(if ($Matches[2]) { [int]$Matches[1] } else { 1 }); $unit = $(if ($Matches[2]) { $Matches[2] } else { $Matches[1] }).ToLowerInvariant()
+            if ($Target.SystemTypeId -notin $script:FocusDateTypes) { throw "'$Last' needs a date or time column; [$($Target.Column)] is $type. Use 'newest 10%' or -FocusFrom." }
+            # back from today's midnight, as "the last 30 days" is usually meant
+            $today = $(if ($Target.SystemTypeId -eq 43) { 'TODATETIMEOFFSET(CAST(CAST(SYSDATETIMEOFFSET() AS date) AS datetime2), DATEPART(TZOFFSET, SYSDATETIMEOFFSET()))' } else { 'CAST(CAST(SYSDATETIME() AS date) AS datetime2)' })
+            $fromRaw = (Invoke-Query $Connection "SELECT CAST(DATEADD($unit, -$n, $today) AS $type) AS v")[0].Rows[0].v
+            $span = $(if ($n -eq 1) { "last $unit" } else { "last $n ${unit}s" })
+            $label = $span
+            if ([SQLStatsXRay.Builder.Profile]::Compare($lastEntry.Key, [SQLStatsXRay.Builder.Profile]::Sortable($fromRaw)) -lt 0) {
+                # no row that recent: the span ends at the newest value instead of now
+                $c = $Connection.CreateCommand()
+                $expr = Add-StatsBuildKey $c '@m' $Column $lastEntry.Raw
+                $c.CommandText = "SELECT CAST(DATEADD($unit, -$n, CAST(CAST($expr AS date) AS datetime2)) AS $type)"
+                $fromRaw = $c.ExecuteScalar()
+                $label = "$span before the newest value (no row is that recent)"
+            }
+        } elseif ($l -match '^(?i)newest\s+(\d+(?:\.\d+)?)\s*(?:%|percent)(?:\s+of\s+(?:the\s+)?rows)?$') {
+            $pct = [double]::Parse($Matches[1], $script:Inv)
+            if ($pct -le 0 -or $pct -ge 100) { throw "'$Last': the share of rows must be above 0 and below 100." }
+            # the value where the newest rows reach the share (by the rows read)
+            $want = $Profile.NonNullRows * $pct / 100; $acc = 0.0
+            for ($i = $Profile.Entries.Count - 1; $i -ge 0; $i--) { $acc += $Profile.Entries[$i].Rows; if ($acc -ge $want) { $fromRaw = $Profile.Entries[$i].Raw; break } }
+            if ($null -eq $fromRaw) { $fromRaw = $Profile.Entries[0].Raw }
+            $label = "newest $($Matches[1])% of the rows"
+        } else { throw "-FocusLast takes '<n> days', '<n> weeks', '<n> months', '<n> years' or 'newest <n>%', not '$Last'." }
+    } else {
+        if (-not $From -and -not $To) { return $null }
+        if ($From) { $fromRaw = & $value $From 'From' }
+        if ($To) { $toRaw = & $value $To 'To' }
+        if ($fromRaw -is [DBNull] -or $toRaw -is [DBNull]) { throw 'A focus bound evaluated to NULL.' }
+    }
+    $fromKey = $(if ($null -ne $fromRaw) { [SQLStatsXRay.Builder.Profile]::Sortable($fromRaw) })
+    $toKey = $(if ($null -ne $toRaw) { [SQLStatsXRay.Builder.Profile]::Sortable($toRaw) })
+    if ($null -ne $fromKey -and $null -ne $toKey -and [SQLStatsXRay.Builder.Profile]::Compare($fromKey, $toKey) -gt 0) { throw 'The focus range starts after it ends (-FocusFrom is above -FocusTo).' }
+    $show = { param($v) if ($null -eq $v) { '' } else { Format-SqlValue $v $Column.SystemTypeId $Column.Scale } }
+    $bounds = $(if ($null -eq $toRaw) { "from $(& $show $fromRaw)" } elseif ($null -eq $fromRaw) { "up to $(& $show $toRaw)" } else { "$(& $show $fromRaw) to $(& $show $toRaw)" })
+    [pscustomobject]@{ From = $fromRaw; To = $toRaw; FromKey = $fromKey; ToKey = $toKey; Steps = $Steps; Label = $(if ($label) { "$label ($bounds)" } else { $bounds }); Read = $null }
+}
+
+function Read-StatsBuildFocusProfile($Connection, $Target, $Column, $Focus, [int]$TimeoutSeconds) {
+    # Every row of the focus range, counted per value: through the column's index when there is one, else a scan.
+    $ix = Get-StatsBuildIndex $Connection $Target.ObjectId $Target.Column
+    $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds
+    $where = @()
+    if ($null -ne $Focus.From) { $where += "$($Target.ColumnSql) >= $(Add-StatsBuildKey $cmd '@f' $Column $Focus.From)" }
+    if ($null -ne $Focus.To) { $where += "$($Target.ColumnSql) <= $(Add-StatsBuildKey $cmd '@t' $Column $Focus.To)" }
+    $hint = $(if ($ix) { " WITH (INDEX([$(([string]$ix.name).Replace(']', ']]'))]))" } else { '' })
+    $cmd.CommandText = "SELECT $($Target.ColumnSql), COUNT_BIG(*) FROM $($Target.Table)$hint WHERE $($where -join ' AND ') GROUP BY $($Target.ColumnSql) ORDER BY $($Target.ColumnSql) OPTION (KEEPFIXED PLAN, MAXDOP 1);"
+    $session = $Connection.CreateCommand()
+    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;'
+    $null = $session.ExecuteNonQuery()
+    $p = New-StatsBuildProfile $Target $null $null
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $r = $cmd.ExecuteReader()
+        try { $p.Read($r) } finally { $r.Close() }
+    } finally {
+        $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT -1;'
+        try { $null = $session.ExecuteNonQuery() } catch { }
+    }
+    [pscustomobject]@{ Profile = $p; Rows = $p.ReadRows; Seconds = $sw.Elapsed.TotalSeconds; Path = $(if ($ix) { "index [$($ix.name)]" } else { 'a table scan (no index on the column)' }) }
+}
+
 function Invoke-StatsBuildRefine($Connection, $Target, $Column, $Steps, [string]$IndexName, [int]$TimeoutSeconds) {
     # Two-phase: each step key's EQ_ROWS counted exactly with one seek on the column's index.
     $n = 0
     foreach ($s in $Steps) {
         $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds
-        $keyText = Format-SqlValue $s.Raw $Column.SystemTypeId $Column.Scale
-        $fake = [pscustomobject]@{ RangeHiKey = $(if ($Column.SystemTypeId -in 60, 122, 106, 108) { $keyText } else { $s.Raw }); Record = [pscustomobject]@{ KeyBytes = $null } }
-        if ($Column.SystemTypeId -eq 61) { $fake.Record.KeyBytes = ConvertTo-SqlDateTimeBytes ([datetime]$s.Raw) }
-        $expr = Add-DataCheckKey $cmd '@k' $Column $fake
+        $expr = Add-StatsBuildKey $cmd '@k' $Column $s.Raw
         $cmd.CommandText = "SELECT COUNT_BIG(*) FROM $($Target.Table) WITH (INDEX([$($IndexName.Replace(']', ']]'))]), FORCESEEK) WHERE $($Target.ColumnSql) = $expr OPTION (KEEPFIXED PLAN, MAXDOP 1);"
         $s.Eq = [double]$cmd.ExecuteScalar(); $n++
     }
@@ -4333,9 +4593,10 @@ function Invoke-StatsBuildColumn {
     <#
       The histogram of one statistics object from a profile already read: candidates from every algorithm, the current
       statistics scored on the same data, the best one by equality estimates, the adaptive sampler's exact EQ_ROWS, and
-      the stream.
+      the stream. With a focus range (Resolve-StatsBuildFocus), the range is counted exactly, gets most of the steps, and
+      the best candidate is the one most accurate inside it.
     #>
-    param($Connection, $Target, $Template, $Profile, $Plan, [double]$TableRows, [string[]]$Algorithms, [int]$Seed, [int]$TimeoutSeconds)
+    param($Connection, $Target, $Template, $Profile, $Plan, [double]$TableRows, [string[]]$Algorithms, [int]$Seed, [int]$TimeoutSeconds, $Focus)
     $p = $Profile
     if ($p.Entries.Count -eq 0) { throw "No values read from [$($Target.Column)]: the table is empty or the column is all NULL." }
     $scale = $(if ($Plan.Full -or $p.ReadRows -le 0) { 1.0 } else { $TableRows / $p.ReadRows })
@@ -4372,11 +4633,24 @@ function Invoke-StatsBuildColumn {
             $p.InsertExact($v, $st.Key, $st.Eq / $scale)
         }
     }
-    $objective = 'equality'
+    $objective = 'equality'; $zone = $null
+    if ($Focus) {
+        # the range counted exactly (a full read already has every row), the rest rescaled to add up to the table
+        if (-not $Plan.Full) {
+            $Focus.Read = Read-StatsBuildFocusProfile $Connection $Target $col $Focus $TimeoutSeconds
+            $p.ReplaceRange($Focus.FromKey, $Focus.ToKey, $Focus.Read.Profile, $scale, $TableRows)
+        }
+        $a = $(if ($null -eq $Focus.FromKey) { 0 } else { $p.IndexBelow($Focus.FromKey, $false) + 1 })
+        $b = $(if ($null -eq $Focus.ToKey) { $p.Entries.Count - 1 } else { $p.IndexBelow($Focus.ToKey, $true) })
+        if ($b -lt $a) { throw "No rows in the focus range ($($Focus.Label))." }
+        $zone = @($a, $b); $objective = 'focus'
+    }
     $candidates = New-Object 'System.Collections.Generic.List[object]'
     # every algorithm at once, in parallel (C#)
-    foreach ($x in [SQLStatsXRay.Builder.Histogram]::BuildAll($p, [string[]]@($Algorithms), 200, $scale, $p.NullRows * $scale, 1000, $Seed)) {
-        $candidates.Add([pscustomobject]@{ Name = $x.Name; Steps = $x.Steps; NullEq = $p.NullRows * $scale; Score = $x.Score; Seconds = $x.Seconds; Current = $false })
+    $made = $(if ($zone) { [SQLStatsXRay.Builder.Histogram]::BuildAllFocus($p, [string[]]@($Algorithms), 200, $zone[0], $zone[1], $Focus.Steps, $scale, $p.NullRows * $scale, 1000, $Seed) }
+        else { [SQLStatsXRay.Builder.Histogram]::BuildAll($p, [string[]]@($Algorithms), 200, $scale, $p.NullRows * $scale, 1000, $Seed) })
+    foreach ($x in $made) {
+        $candidates.Add([pscustomobject]@{ Name = $x.Name; Steps = $x.Steps; NullEq = $p.NullRows * $scale; Score = $x.Score; Inside = $x.Inside; Outside = $x.Outside; Seconds = $x.Seconds; Current = $false })
     }
     $current = $null
     if ($currentKeys.Count -gt 0) {
@@ -4388,27 +4662,34 @@ function Invoke-StatsBuildColumn {
         }
         $nullEq = [double]$Template.Blob.NullStepEqRows
         $score = [SQLStatsXRay.Builder.Histogram]::Evaluate($p, $cs, $nullEq, $scale, 1000, $Seed)
-        $current = [pscustomobject]@{ Name = 'SQL Server (current)'; Steps = $cs; NullEq = $nullEq; Score = $score; Seconds = 0; Current = $true }
+        $z = $(if ($zone) { [SQLStatsXRay.Builder.Histogram]::EvaluateZones($p, $cs, $scale, 1000, $Seed, $zone[0], $zone[1]) } else { @($null, $null) })
+        $current = [pscustomobject]@{ Name = 'SQL Server (current)'; Steps = $cs; NullEq = $nullEq; Score = $score; Inside = $z[0]; Outside = $z[1]; Seconds = 0; Current = $true }
     }
-    $best = $candidates | Sort-Object { $_.Score.EqP95 }, { $_.Score.RangeGeoMean } | Select-Object -First 1
+    $best = $(if ($zone) { $candidates | Sort-Object { $_.Inside.EqP95 }, { $_.Inside.RangeGeoMean }, { $_.Score.EqP95 } | Select-Object -First 1 }
+        else { $candidates | Sort-Object { $_.Score.EqP95 }, { $_.Score.RangeGeoMean } | Select-Object -First 1 })
     if ($index) { $refined = Invoke-StatsBuildRefine $Connection $Target $col $best.Steps $index $TimeoutSeconds }
 
     $distinct = $p.DistinctValues()
-    if (-not $Plan.Full) { $distinct = [SQLStatsXRay.Builder.Histogram]::EstimateDistinct($p.SampleUnits(), $distinct, $p.ValuesSeenOnce(), $p.SampleUnits() * $scale) }
+    if (-not $Plan.Full -and $zone) {
+        # exact inside the focus range, estimated from the sample outside it
+        $in = $p.Totals($zone[0], $zone[1]); $lo = $p.Totals(0, $zone[0] - 1); $hi = $p.Totals($zone[1] + 1, $p.Entries.Count - 1)
+        $u = $lo[2] + $hi[2]
+        $distinct = $in[1] + [SQLStatsXRay.Builder.Histogram]::EstimateDistinct($u, $lo[1] + $hi[1], $lo[3] + $hi[3], $u * $scale)
+    } elseif (-not $Plan.Full) { $distinct = [SQLStatsXRay.Builder.Histogram]::EstimateDistinct($p.SampleUnits(), $distinct, $p.ValuesSeenOnce(), $p.SampleUnits() * $scale) }
     # variable-length keys (varbinary, varchar, nvarchar): their average bytes; fixed ones: the record's key size
     $keyLength = $(if ($Target.SystemTypeId -in 165, 167, 231) { $p.DataBytes() / [Math]::Max(1, $p.ReadRows) } else {
             $rec = @($Template.Histogram | Where-Object { -not $_.IsNullStep })[0].Record
             [double]($rec.FixedEnd - 16) * $p.NonNullRows / [Math]::Max(1, $p.ReadRows) })
     $now = [datetime](Invoke-Query $Connection 'SELECT GETDATE() AS d')[0].Rows[0].d
     $built = [pscustomobject]@{
-        Updated = $now; Rows = [Math]::Round($TableRows); RowsSampled = $p.ReadRows; NullRows = $p.NullRows * $scale
+        Updated = $now; Rows = [Math]::Round($TableRows); RowsSampled = $p.ReadRows + $(if ($Focus -and $Focus.Read) { $Focus.Read.Rows } else { 0 }); NullRows = $p.NullRows * $scale
         AllDensity = 1.0 / [Math]::Max(1, $distinct + $(if ($p.NullRows -gt 0) { 1 } else { 0 })); AverageLength = $keyLength
         Trie = $(if ($p.Trie) { , $p.Trie.ToBytes() } else { $null })
     }
     $stream = New-StatsBuildStream $Template $best.Steps $built
     [pscustomobject]@{
         Target = $Target; Template = $Template; Plan = $Plan; Profile = $p; Scale = $scale; TableRows = $TableRows; Distinct = $distinct
-        Candidates = $candidates.ToArray(); Current = $current; Best = $best; Objective = $objective; Refined = $refined; RefineIndex = $index; Stream = $stream
+        Candidates = $candidates.ToArray(); Current = $current; Best = $best; Objective = $objective; Refined = $refined; RefineIndex = $index; Stream = $stream; Focus = $Focus
     }
 }
 
@@ -4456,6 +4737,10 @@ function Get-StatsBuildNotes($C, [string]$StatName) {
         "[$StatName] on column [$($C.Target.Column)]: algorithm $($C.Best.Name), objective $($C.Objective)$(if ($C.Refined) { ", EQ_ROWS counted exactly for $($C.Refined) keys" })"
         "  Sample: $sample"
         (Format-Invariant '  Score: equality p95 {0:0.##}, worst {1:0.##}; ranges geometric mean {2:0.###}' $C.Best.Score.EqP95 $C.Best.Score.EqMax $C.Best.Score.RangeGeoMean)
+        if ($C.Focus) {
+            (Format-Invariant '  Focus range: {0}, {1} steps; equality p95 inside {2:0.##}, outside {3:0.##}' $C.Focus.Label $C.Focus.Steps $C.Best.Inside.EqP95 $C.Best.Outside.EqP95)
+            '  The range was fixed when this was built: rebuild it on a schedule, or newer rows fall outside it.'
+        }
     )
 }
 
@@ -4463,10 +4748,12 @@ function Invoke-StatsBuild {
     <#
       Builds a histogram for one column: reads the column's values (every row, SQL Server's sample or the adaptive
       sample), runs the histogram algorithms, scores every candidate and the current statistics against the rows read,
-      and writes the script that loads the best candidate. Nothing is changed on the server.
+      and writes the script that loads the best candidate. Nothing is changed on the server. A focus range (FocusLast, or
+      FocusFrom / FocusTo) spends most steps on the rows most queries look at.
     #>
     param($Connection, [string]$Database, [string]$TableName, [string]$StatName, [string]$ColumnName, [string]$Sample = 'Default',
-        [string]$Sampler = 'SqlServer', [string[]]$Algorithms, [string]$NewStatName, [bool]$NoRecompute, [int]$Seed = 1, [int]$TimeoutSeconds = 0, [double]$AdaptiveLimit = 4)
+        [string]$Sampler = 'SqlServer', [string[]]$Algorithms, [string]$NewStatName, [bool]$NoRecompute, [int]$Seed = 1, [int]$TimeoutSeconds = 0, [double]$AdaptiveLimit = 4,
+        [string]$FocusFrom, [string]$FocusTo, [string]$FocusLast, [int]$FocusSteps = 180)
     Initialize-StatsBuilder
     if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to build from." }
     if (-not $Algorithms) { $Algorithms = 'EqualRows', 'MaxDiff', 'FrequentFirst', 'VOptimal' }
@@ -4475,7 +4762,12 @@ function Invoke-StatsBuild {
     $plan = $(if ($Sampler -eq 'Adaptive') { Get-AdaptiveSamplePlan $Connection $target $Sample $Seed $TimeoutSeconds $AdaptiveLimit } else { $x = Get-SqlServerSamplePlan $target.Rows $target.Pages $Sample; $x.Sampler = 'SqlServer'; $x })
     $read = Read-StatsBuildProfile $Connection $target $plan $Seed $TimeoutSeconds
     $tableRows = $(if ($plan.Full) { $read.Profile.ReadRows } else { [double]$target.Rows })
-    $c = Invoke-StatsBuildColumn $Connection $target $template $read.Profile $plan $tableRows $Algorithms $Seed $TimeoutSeconds
+    $focus = $null
+    if ($FocusFrom -or $FocusTo -or $FocusLast) {
+        if ($read.Profile.Entries.Count -eq 0) { throw "No values read from [$($target.Column)]: the table is empty or the column is all NULL." }
+        $focus = Resolve-StatsBuildFocus $Connection $target $template.Columns[0] $read.Profile $FocusFrom $FocusTo $FocusLast $FocusSteps
+    }
+    $c = Invoke-StatsBuildColumn $Connection $target $template $read.Profile $plan $tableRows $Algorithms $Seed $TimeoutSeconds $focus
     $isNew = -not $target.Stat
     $statName = $(if ($isNew) { $(if ($NewStatName) { $NewStatName } else { "xray_$($target.Column)" }) } else { $target.StatName })
     $item = [pscustomobject]@{ Target = $target; Bytes = $c.Stream.Bytes; StatName = $statName; IsNew = $isNew; Original = $(if ($c.Current) { [byte[]]$template.Raw }); Notes = (Get-StatsBuildNotes $c $statName) }
@@ -4604,6 +4896,7 @@ function Format-StatsBuildCandidates($C) {
             'Eq p95 by rows' = Format-Invariant '{0:0.##}' $s.EqP95ByRows; 'Values >10x' = Format-Invariant '{0:N0}' $s.ValuesOver10
             'Range p95' = Format-Invariant '{0:0.##}' $s.RangeP95; 'Range geo mean' = Format-Invariant '{0:0.###}' $s.RangeGeoMean
         }
+        if ($C.Focus) { $o['Focus eq p95'] = Format-Invariant '{0:0.##}' $x.Inside.EqP95; $o['Focus range p95'] = Format-Invariant '{0:0.##}' $x.Inside.RangeP95; $o['Outside eq p95'] = Format-Invariant '{0:0.##}' $x.Outside.EqP95 }
         [pscustomobject]$o
     }
     $cols = @($rows[0].PSObject.Properties.Name)
@@ -4616,6 +4909,7 @@ function Get-StatsBuildVerdict($C) {
       Better, Same (within 5%), Worse, or New (nothing to compare with). Any other measure that gets more than 25%
       worse is named, so a win on equality cannot hide a loss on ranges.
     #>
+    if ($C.Objective -eq 'focus') { return Get-StatsBuildFocusVerdict $C }
     $measures = [ordered]@{ equality = @('EqP95', 'equality estimates'); ranges = @('RangeP95', 'range estimates') }
     $m = $measures[$C.Objective]
     $built = $C.Best.Score.($m[0])
@@ -4639,15 +4933,50 @@ function Get-StatsBuildVerdict($C) {
     [pscustomobject]@{ Level = $level; Short = $level + $(if ($worse -and $level -ne 'Worse') { ' (but worse on some)' } else { '' }); Text = $text }
 }
 
+function Get-StatsBuildFocusVerdict($C) {
+    <#
+      With a focus range the built histogram is judged inside the range (the rows it was built for); what happens outside
+      it is said too, as the price of the steps it moved.
+    #>
+    $in = $C.Best.Inside; $out = $C.Best.Outside
+    $outText = $(if ($out.Values -gt 0) {
+            if ($C.Current) { Format-Invariant ' Outside it, values go from {0:0.##}x to {1:0.##}x and ranges from {2:0.##}x to {3:0.##}x.' $C.Current.Outside.EqP95 $out.EqP95 $C.Current.Outside.RangeP95 $out.RangeP95 }
+            else { Format-Invariant ' Outside it, 95% of values are within {0:0.##}x and of ranges within {1:0.##}x.' $out.EqP95 $out.RangeP95 }
+        } else { '' })
+    $sample = $(if (-not $C.Plan.Full) { ' Measured against the sample outside the range.' } else { '' })
+    if (-not $C.Current) {
+        return [pscustomobject]@{ Level = 'New'; Short = 'New'; Text = (Format-Invariant 'New statistics. Inside the focus range ({0}), 95% of values are within {1:0.##}x of the real count and 95% of ranges within {2:0.##}x.' $C.Focus.Label $in.EqP95 $in.RangeP95) + $outText + $sample }
+    }
+    $now = $C.Current.Inside
+    $level = $(if ($in.EqP95 -le $now.EqP95 / 1.05) { 'Better' } elseif ($in.EqP95 -le $now.EqP95 * 1.05) { 'Same' } else { 'Worse' })
+    $head = switch ($level) {
+        'Better' { 'Better than the current statistics inside the focus range' }
+        'Same' { 'About as good as the current statistics inside the focus range' }
+        default { 'Not better than the current statistics inside the focus range' }
+    }
+    $text = (Format-Invariant '{0} ({1}): 95% of values go from {2:0.##}x off to {3:0.##}x, ranges from {4:0.##}x to {5:0.##}x.' $head $C.Focus.Label $now.EqP95 $in.EqP95 $now.RangeP95 $in.RangeP95) + $outText
+    if ($level -eq 'Worse') { $text += ' Loading it is not recommended.' }
+    [pscustomobject]@{ Level = $level; Short = "$level (focus)"; Text = $text + $sample }
+}
+
 function Format-StatsBuildComparison($C) {
     # The chosen histogram next to SQL Server's current statistics, in words.
     $rows = New-Object 'System.Collections.Generic.List[object]'
     $add = {
-        param([string]$Label, [string]$Property, [string]$Format)
+        param([string]$Label, [string]$Property, [string]$Format, [string]$Part = 'Score')
         $o = [ordered]@{ Measure = $Label }
-        if ($C.Current) { $o['Now (SQL Server)'] = Format-Invariant $Format $C.Current.Score.$Property }
-        $o["Built ($($C.Best.Name))"] = Format-Invariant $Format $C.Best.Score.$Property
+        if ($C.Current) { $o['Now (SQL Server)'] = Format-Invariant $Format $C.Current.$Part.$Property }
+        $o["Built ($($C.Best.Name))"] = Format-Invariant $Format $C.Best.$Part.$Property
         $rows.Add([pscustomobject]$o)
+    }
+    if ($C.Focus) {
+        & $add 'Focus range: 95% of values within' EqP95 '{0:0.##}x' Inside
+        & $add 'Focus range: worst value' EqMax '{0:0.##}x' Inside
+        & $add 'Focus range: 95% of ranges within' RangeP95 '{0:0.##}x' Inside
+        if ($C.Best.Outside.Values -gt 0) {
+            & $add 'Outside: 95% of values within' EqP95 '{0:0.##}x' Outside
+            & $add 'Outside: 95% of ranges within' RangeP95 '{0:0.##}x' Outside
+        }
     }
     & $add 'Equality: 95% of values within' EqP95 '{0:0.##}x'
     & $add 'Equality: worst value' EqMax '{0:0.##}x'
@@ -4675,6 +5004,10 @@ function Format-StatsBuildReport($B, [switch]$ShowCandidates) {
         'Distinct values' = Format-Invariant '{0:N0}{1}' $B.Distinct $(if ($B.Plan.Full) { '' } else { ' (estimated from the sample)' })
         'Histogram'       = "$($B.Best.Name) ($(if ($script:BuildAlgorithms.Contains($B.Best.Name)) { $script:BuildAlgorithms[$B.Best.Name].Short })), the best of $(@($B.Candidates).Count) algorithm(s) on equality estimates per distinct value"
     }
+    if ($B.Focus) {
+        $info['Focus range'] = "$($B.Focus.Label): $($B.Focus.Steps) of the 200 steps" + $(if ($B.Focus.Read) { Format-Invariant '; {0:N0} rows counted exactly through {1} ({2:0.0} s)' $B.Focus.Read.Rows $B.Focus.Read.Path $B.Focus.Read.Seconds } else { '; counted exactly by the full read' })
+        $info['Histogram'] = "$($B.Best.Name) ($(if ($script:BuildAlgorithms.Contains($B.Best.Name)) { $script:BuildAlgorithms[$B.Best.Name].Short })), the best of $(@($B.Candidates).Count) algorithm(s) on equality estimates inside the focus range"
+    }
     if ($B.Refined) { $info['Exact counts'] = "EQ_ROWS of the $($B.Refined) step keys counted with seeks on [$($B.RefineIndex)]; true minimum and maximum added" }
     if ($B.Profile.Compacted) { $info['Memory'] = 'light values merged to bound memory: scores inside merged runs are approximate' }
     $out += Format-KeyValueTable $info
@@ -4696,6 +5029,7 @@ function Format-StatsBuildReport($B, [switch]$ShowCandidates) {
     }
     foreach ($w in $B.Stream.Warnings) { $out += "Note: $w" }
     $out += "The script $(if ($B.IsNew) { 'creates' } else { 'updates' }) [$($B.StatName)] with the $($B.Best.Name) histogram. Nothing was changed on the server; NORECOMPUTE is recommended (see the script)."
+    if ($B.Focus) { $out += 'The focus range was worked out when this ran: rebuild the statistic on a schedule, with the same focus, so newer rows stay inside it.' }
     return , $out
 }
 
@@ -6145,7 +6479,7 @@ function Complete-GuiDecode {
 function Show-GuiBuildDialog {
     <#
       The statistics builder's options: what to build (the statistics object shown, a new one on a column, or every
-      statistics object of the table from one read), the sampler and sample, the algorithms
+      statistics object of the table from one read), the sampler and sample, the algorithms, an optional focus range
       and NORECOMPUTE (recommended, not checked). The build runs in the background; the app only writes the script.
     #>
     $g = $script:App
@@ -6157,6 +6491,9 @@ function Show-GuiBuildDialog {
     $types = ($script:BuildKeyTypes | ForEach-Object { [string]$_ }) -join ', '
     try { $columns = Get-GuiServerList $g.Conn $database "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(@t) AND c.system_type_id IN ($types) ORDER BY c.column_id" @{ '@t' = $table } }
     catch { Show-GuiMessage "Could not read the table's columns: $($_.Exception.Message)" 'Error'; return }
+    # which columns take the time presets, and which take no focus range (character columns)
+    $byType = { param([int[]]$Ids) Get-GuiServerList $g.Conn $database "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(@t) AND c.system_type_id IN ($($Ids -join ', '))" @{ '@t' = $table } }
+    [string[]]$dateCols = & $byType $script:FocusDateTypes; [string[]]$textCols = & $byType $script:BuildTextTypes
     $current = Get-GuiCurrentResult
     $stat = $(if ($current -and $current.PSObject.Properties['Target'] -and $current.Target.Table -eq $table -and $current.Target.Database -eq $database) { [string]$current.Target.Statistics })
     $sc = Get-GuiScale
@@ -6207,6 +6544,21 @@ function Show-GuiBuildDialog {
     Add-GuiRow $d.Layout '' (& $note ((@($script:BuildAlgorithms.Keys | ForEach-Object { "${_}: $($script:BuildAlgorithms[$_].Short)." }) -join ' ') +
             ' Hover an algorithm for how it works. Every candidate is scored by q-error against the rows read, and the best one on equality is written.'))
 
+    Add-GuiRow $d.Layout '' (New-GuiHeading 'Focus range')
+    # one row for the preset and its steps, one for a custom range's ends
+    $row = { param([object[]]$Items) $f = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0) }; $f.Controls.AddRange($Items); $f }
+    $inline = { param([string]$Text) New-GuiControl Label @{ Text = $Text; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 10, 6, 4, 0) } }
+    $focus = New-GuiControl ComboBox @{ DropDownStyle = 'DropDownList'; Width = [int](260 * $sc) }
+    $fSteps = New-GuiControl NumericUpDown @{ Minimum = 10; Maximum = 196; Value = 180; Width = [int](70 * $sc) }
+    Add-GuiRow $d.Layout 'Focus on' (& $row @($focus, (& $inline 'Steps'), $fSteps))
+    $fFrom = New-GuiControl TextBox @{ Width = [int](200 * $sc) }
+    $fTo = New-GuiControl TextBox @{ Width = [int](200 * $sc) }
+    Add-GuiRow $d.Layout 'From' (& $row @($fFrom, (& $inline 'to'), $fTo))
+    $focusNote = & $note ''
+    Add-GuiRow $d.Layout '' $focusNote
+    $statColumn = $(if ($stat -and $current.Columns) { [string]@($current.Columns)[0].Name })
+    $ascending = $stat -and $current.LeadingColumnType -eq 'Ascending'
+
     Add-GuiRow $d.Layout '' (New-GuiHeading 'Script')
     $norecompute = New-GuiControl CheckBox @{ Text = 'NORECOMPUTE (recommended)'; AutoSize = $true; Checked = $false }
     Add-GuiRow $d.Layout '' $norecompute
@@ -6214,12 +6566,40 @@ function Show-GuiBuildDialog {
             'themselves: rebuild them when the data changes, and keep them out of maintenance jobs. Nothing is changed on the server: the app writes the script.'))
     $buttons = Add-GuiDialogButtons $d 'Build'
     $buttons.Ok.DialogResult = 'OK'
-    $g.Dlg = @{ Column = $column; Name = $name; Sampler = $sampler; Limit = $limit; ByColumn = $rColumn }
+    $g.Dlg = @{ Column = $column; Name = $name; Sampler = $sampler; Limit = $limit; ByColumn = $rColumn; All = $rAll
+        Focus = $focus; From = $fFrom; To = $fTo; Steps = $fSteps; FocusNote = $focusNote; DateCols = $dateCols; TextCols = $textCols; StatColumn = $statColumn; Ascending = $ascending; Busy = $false }
     $column.Add_SelectedIndexChanged({ $x = $script:App.Dlg; $x.Name.Text = "xray_$($x.Column.SelectedItem)" })
-    # the column and the name only apply to a new statistics object; the limit only to the adaptive sampler
-    $toggle = { $x = $script:App.Dlg; $x.Column.Enabled = $x.ByColumn.Checked; $x.Name.Enabled = $x.ByColumn.Checked; $x.Limit.Enabled = $x.Sampler.SelectedIndex -eq 1 }
+    # the column and the name only apply to a new statistics object; the limit only to the adaptive sampler; the focus
+    # presets follow the column's type (time spans for dates and times, none for character columns or a whole table)
+    $toggle = {
+        $x = $script:App.Dlg
+        if ($x.Busy) { return }
+        $x.Busy = $true
+        try {
+            $x.Column.Enabled = $x.ByColumn.Checked; $x.Name.Enabled = $x.ByColumn.Checked; $x.Limit.Enabled = $x.Sampler.SelectedIndex -eq 1
+            $col = $(if ($x.ByColumn.Checked) { [string]$x.Column.SelectedItem } elseif ($x.All.Checked) { $null } else { $x.StatColumn })
+            $items = @('None')
+            if ($col -and $col -notin $x.TextCols) {
+                if ($col -in $x.DateCols) { $items += @($script:FocusPresets | Where-Object { $_ -like 'Last*' }) }
+                $items += @($script:FocusPresets | Where-Object { $_ -like 'Newest*' }) + 'Custom range'
+            }
+            $keep = [string]$x.Focus.SelectedItem
+            $x.Focus.Items.Clear(); $null = $x.Focus.Items.AddRange([object[]]$items)
+            $x.Focus.SelectedIndex = [Math]::Max(0, $items.IndexOf($keep))
+            $on = $x.Focus.SelectedIndex -gt 0
+            $x.From.Enabled = $x.To.Enabled = [string]$x.Focus.SelectedItem -eq 'Custom range'; $x.Steps.Enabled = $on
+            $text = 'The range is counted exactly and gets most of the steps; the rest of the table keeps a few coarse steps with correct counts. ' +
+            'A custom range takes values or T-SQL expressions, such as DATEADD(MONTH, -6, GETDATE()), and may leave one end open. Rebuild on a schedule: the range is fixed when it is built.'
+            if ($x.All.Checked) { $text = 'A focus range applies to one statistics object at a time.' }
+            elseif ($col -and $col -in $x.TextCols) { $text = 'A focus range is not available for character columns yet.' }
+            elseif ($x.Ascending -and -not $x.ByColumn.Checked) { $text = 'This statistic is ascending (its update history shows new rows landing past the last step): its newest rows are usually the ones queries look at. ' + $text }
+            $x.FocusNote.Text = $text
+        } finally { $x.Busy = $false }
+    }
     foreach ($r in $rStat, $rColumn, $rAll) { $r.Add_CheckedChanged($toggle) }
     $sampler.Add_SelectedIndexChanged($toggle)
+    $column.Add_SelectedIndexChanged($toggle)
+    $focus.Add_SelectedIndexChanged($toggle)
     & $toggle
     try { $result = $d.Form.ShowDialog($g.Form) }
     finally { $g.Dlg = $null; $tips.Dispose(); $d.Form.Dispose() }
@@ -6231,6 +6611,15 @@ function Show-GuiBuildDialog {
         GuiRun = $true; ServerInstance = $g.Conn.Server; Database = $database; Table = $table; Build = $true; Sample = $sample.Text.Trim()
         Sampler = $(if ($sampler.SelectedIndex -eq 1) { 'Adaptive' } else { 'SqlServer' }); AdaptiveLimit = [double]$limit.Value; Algorithm = [string[]]$algorithms
         NoRecompute = $norecompute.Checked; TrustServerCertificate = [bool]$g.Conn.Trust
+    }
+    $fsel = [string]$focus.SelectedItem
+    if ($fsel -and $fsel -ne 'None' -and -not $rAll.Checked) {
+        if ($fsel -eq 'Custom range') {
+            if (-not $fFrom.Text.Trim() -and -not $fTo.Text.Trim()) { Show-GuiMessage 'Give the focus range a From, a To, or both.' 'Warning'; return }
+            if ($fFrom.Text.Trim()) { $p.FocusFrom = $fFrom.Text.Trim() }
+            if ($fTo.Text.Trim()) { $p.FocusTo = $fTo.Text.Trim() }
+        } else { $p.FocusLast = $fsel }
+        $p.FocusSteps = [int]$fSteps.Value
     }
     if ($rStat.Checked) { $p.Statistics = [string[]]@($stat); $what = "[$stat]" }
     elseif ($rColumn.Checked) {
@@ -8493,7 +8882,16 @@ function New-GuiDialog([string]$Title) {
     $null = $layout.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'AutoSize'))
     $null = $layout.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'AutoSize'))
     $dlg.Controls.Add($layout)
-    $dlg.Add_Load({ param($s, $e) Set-GuiControlTheme $s })
+    $dlg.Add_Load({
+            param($s, $e)
+            Set-GuiControlTheme $s
+            # taller than the screen: a fixed height that scrolls
+            $wa = [Windows.Forms.Screen]::FromControl($s).WorkingArea
+            if ($s.Height -gt $wa.Height) {
+                $w = $s.Width + [Windows.Forms.SystemInformation]::VerticalScrollBarWidth
+                $s.AutoSize = $false; $s.AutoScroll = $true; $s.Size = New-Object Drawing.Size $w, $wa.Height; $s.Top = $wa.Top
+            }
+        })
     return @{ Form = $dlg; Layout = $layout }
 }
 
@@ -9423,12 +9821,15 @@ if ($PSCmdlet.ParameterSetName -in 'Hex', 'File') {
         if ($Build) {
             if (-not $Table) { throw '-Build needs -Table.' }
             if (@($Statistics).Count -gt 1) { throw '-Build takes one statistics object (or -AllStatistics).' }
+            if ($AllStatistics -and ($FocusLast -or $FocusFrom -or $FocusTo)) { throw 'A focus range applies to one statistics object: use it with -Statistics or -Column, not -AllStatistics.' }
+            if ($FocusLast -and ($FocusFrom -or $FocusTo)) { throw 'Give -FocusLast, or -FocusFrom / -FocusTo, not both.' }
             if ($AllStatistics) {
                 $b = Invoke-StatsBuildTable -Connection $cn -Database $Database -TableName $Table -Sample $Sample -Sampler $Sampler -Algorithms $Algorithm `
                     -NoRecompute ([bool]$NoRecompute) -Seed $Seed -TimeoutSeconds 0 -AdaptiveLimit $AdaptiveLimit
             } else {
                 $b = Invoke-StatsBuild -Connection $cn -Database $Database -TableName $Table -StatName $(if ($Statistics) { $Statistics[0] }) -ColumnName $Column -Sample $Sample `
-                    -Sampler $Sampler -Algorithms $Algorithm -NewStatName $NewStatisticsName -NoRecompute ([bool]$NoRecompute) -Seed $Seed -TimeoutSeconds 0 -AdaptiveLimit $AdaptiveLimit
+                    -Sampler $Sampler -Algorithms $Algorithm -NewStatName $NewStatisticsName -NoRecompute ([bool]$NoRecompute) -Seed $Seed -TimeoutSeconds 0 -AdaptiveLimit $AdaptiveLimit `
+                    -FocusFrom $FocusFrom -FocusTo $FocusTo -FocusLast $FocusLast -FocusSteps $FocusSteps
             }
             $objects += $b
             if ($OutputScript) {
