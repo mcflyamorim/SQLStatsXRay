@@ -313,5 +313,37 @@ On columnstore index statistics, bit 6 is the only bit set (`InitPointers` rejec
 - **Lengths.** The stream length (offset 24) and blob length (offset 32) are rewritten.
 - **The string index (trie) is not rebuilt by key edits.** It still describes the original keys, which only affects LIKE estimates. SQL Server accepts the stream anyway. The statistics builder replaces it with one built from the rows it read (section 4.2). When the source stream has none, as with an empty statistic (`SAMPLE 0 ROWS`), it inserts item bit 1 in bit order and sets the bit in the presence mask.
 - **Import behavior.** The import keeps the stream's Updated date. It clears NORECOMPUTE unless `NORECOMPUTE` is part of the same statement. `ROWCOUNT` / `PAGECOUNT` cannot be combined with a column statistic ("is not a statistics collection").
+- **Histogram rules on import.** A stream with 201 or more key steps is rejected as corrupt; 199 and 200 are accepted. The first step must be the column's smallest value with RANGE_ROWS 0: with a higher first key (and the values below it counted in its RANGE_ROWS), `k = <first key>` was estimated at EQ_ROWS + RANGE_ROWS.
+- **Estimates follow the histogram exactly.** An equality on a step key estimates EQ_ROWS and on a value inside a step AVG_RANGE_ROWS, so a histogram can be scored offline against the data. A range starting and ending on step keys was estimated exactly.
+- **After the import.** The modification counter is reset to 0, and `last_updated` shows the stream's Updated value, not the time of the import. Without NORECOMPUTE, the first automatic update after enough modifications replaces the imported histogram; with it, the histogram stays and the counter keeps growing. Maintenance jobs that run `UPDATE STATISTICS` replace it either way.
+- **New statistics.** `CREATE STATISTICS s ON t (c) WITH STATS_STREAM = 0x...` is accepted. `CREATE STATISTICS ... WITH SAMPLE 0 ROWS` creates an empty statistic (a 64-byte stream with no variable items) that `UPDATE STATISTICS ... WITH STATS_STREAM` can fill. For a column with no statistic to copy a layout from, a one-row statistic on a `#temp` table with the same type and collation gives the step record layout.
+- **Nonclustered index statistics carry the clustering key** (two columns in the stream; the average key length covers both). Loading a one-column stream there fails with state 32.
+- **Check the trie before importing it.** `UPDATE STATISTICS` accepted tries whose 0x80 / 0x40 flags did not match the node count. In one lab run, the SQL Server 2025 instance logged page-allocation failures about a minute later and had to be restarted. The cause isn't proven (the machine was short on paging file at the time), but the builder now walks the flags of every trie before writing it.
 - **Read-back differences.** After an import, `DBCC SHOW_STATISTICS ... WITH STATS_STREAM` returns the same stream, except the uninitialized bytes of the column definitions (offsets +2 and +20 of each, see section 2) and therefore the checksum.
 - **Editable key types.** RANGE_HI_KEY can be edited for all types the decoder reads except sql_variant, hierarchyid and other CLR types. For those types the other step values can still be edited.
+
+## 6. How SQL Server samples
+
+From `CStatMan::ComputeSample(rows, pages, flags, requested, ...)` in the SQL Server 2025 engine. `rows` and `pages` are the base table's (the heap or clustered index), even for an index's own statistics.
+
+| Case | Pages sampled |
+|---|---|
+| Fewer than 1,024 pages (8 MB), no rows, or FULLSCAN | All of them. |
+| `SAMPLE p PERCENT` | `trunc(pages × p / 100)`, at least 1,024, at most `pages`. |
+| `SAMPLE n ROWS` | `trunc(pages × n / rows)`, at least 1,024, at most `pages`. |
+| Default | `trunc(pages × 15 × trunc(rows ^ 0.55) / rows) + 1024`, at most `pages`. |
+
+The result is passed on as a percent (pages sampled / pages × 100). A second mode, selected by flag `0x10000`, uses `trunc(rows ^ 0.5)` with a multiplier of 1; what sets that flag is still unknown. A Fabric-only branch uses a configured percent instead.
+
+Checked against SQL Server's own statistics on clustered tables and heaps from 2,000 to 3,000,000 rows (default sample, `SAMPLE 5 PERCENT` and index statistics): the predicted pages matched the pages recorded in the stream (variable item bit 7) in all 36 cases, exactly or one page short. A 1,000,000-row clustered table (27,028 pages) gets 1,832 pages (6.8%) by default, and an XE trace of the update showed `@samplePercent = 6.778156`. Tables under 8 MB are always read in full, even with `SAMPLE 5 PERCENT`, and the 1,024-page floor makes `SAMPLE 1 PERCENT` read far more than 1% of a mid-sized table.
+
+**One read per statistics object.** The same trace showed one `StatMan` query per statistics object of the table, each sampling the table again (three of them reading the same 1,834 pages).
+
+**What this means for a builder** (learned building the statistics builder):
+
+- **Sample the base table.** `TABLESAMPLE` through an index on the column samples pages of sorted keys: on a 2,000,000-row lab table it saw 51,746 distinct values instead of 188,048. Sampling the leaf of the column's own index read half the pages but left key ranges unseen between sampled pages.
+- **Count distinct values by page.** Values repeat within pages, so a distinct-value estimate (Haas-Stokes Duj1) on rows sees few values "once" and stops near the sample's own count. Counting each value's pages (`%%physloc%%`) gave 252,814 distinct values on that table (true 298,208; SQL Server 226,523).
+- **All density** is 1 / (distinct non-NULL values + 1 when the column has NULLs). A column's average length is its storage bytes × the share of non-NULL rows (actual bytes for variable-length types). The header Density (pre-2008) does not follow 1 / distinct.
+- **`GROUPING SETS` does not share the read:** each set scans again. Reading every column of a table once means streaming the rows and aggregating on the client.
+- **Scores against a sample mislead.** They favour histograms that underestimate distinct values: against the sample, SQL Server's statistic looked better than a built one (95th percentile 2.98x against 4.75x), and against the whole table it was worse (5.32x against 3.52x). Score against a full scan for a verdict.
+- **SQL Server often leaves steps unused** (24 or 52 of 200 on lab tables); a step costs a few bytes.
