@@ -120,8 +120,17 @@
     step key's EQ_ROWS and the true minimum and maximum exactly.
 
 .PARAMETER Algorithm
-    -Build: histogram algorithms to try (default all): EqualRows, MaxDiff, FrequentFirst, VOptimal,
-    and Workload (steps where the Query Store workload filters; only when it has values).
+    -Build: histogram algorithms to try (default all four). They differ in where they put the 200 keys:
+      EqualRows      the same number of rows in every step. Good for ranges on evenly spread data; a
+                     frequent value inside a step is averaged away.
+      MaxDiff        keys where the row count jumps most against the neighbours (close to SQL Server's
+                     own). Good for spikes; spends steps on noise.
+      FrequentFirst  every value bigger than an average step gets its own key, the rest by equal rows.
+                     Good for a few very frequent values; like EqualRows when there are none.
+      VOptimal       merges neighbours of similar size, so the values in a step are close to
+                     AVG_RANGE_ROWS. Often the best for equality; the slowest on many distinct values.
+    All four use every step and are scored the same way; the best on equality is written.
+    -ShowCandidates prints each one's scores and how it works.
 
 .PARAMETER AllStatistics
     -Build: builds every statistics object of the table the builder supports, from ONE read of the
@@ -130,9 +139,6 @@
 .PARAMETER ShowCandidates
     -Build: also lists every algorithm tried with all its scores. By default the report shows a
     verdict and only the chosen histogram next to SQL Server's current statistics.
-
-.PARAMETER NoWorkload
-    -Build: does not read the Query Store workload.
 
 .PARAMETER AdaptiveLimit
     -Build -Sampler Adaptive: the most pages the adaptive sampler reads, as a multiple of SQL Server's
@@ -150,6 +156,51 @@
 
 .PARAMETER Seed
     -Build: seed of the sample (TABLESAMPLE REPEATABLE) and of the random ranges used to score.
+
+.PARAMETER AdviseSample
+    Sample size advisor for one statistics object (-Statistics): reads the table once (every
+    row, or -PageBudget pages), replays page samples of growing size from memory, and shows how the
+    histogram (scored against the full read) and the distinct value estimate change. Recommends the
+    smallest rate within 10% of a full scan, with an UPDATE STATISTICS ... PERSIST_SAMPLE_PERCENT
+    script. Nothing is changed on the server.
+
+.PARAMETER PageBudget
+    -AdviseSample: the most pages read (default 100000, 0 = no limit).
+
+.PARAMETER UpdateCost
+    How long UPDATE STATISTICS takes for every statistics object of the table (or, without
+    -Table, of every user table): the next update's sample (default or persisted) and FULLSCAN, from
+    a model of the reads and the sort calibrated by a short probe of the server (-NoProbe skips it).
+
+.PARAMETER MaintenancePlan
+    Picks the statistics to update within -TimeBudgetMinutes for the most benefit (how far each
+    is toward SQL Server's auto-update threshold) and writes a
+    script that stops when the budget runs out. Table or whole database, like -UpdateCost.
+
+.PARAMETER TimeBudgetMinutes
+    -MaintenancePlan: the time budget (default 30).
+
+.PARAMETER IncludeNoRecompute
+    -MaintenancePlan: also plans NORECOMPUTE statistics (left out by default: they may be built ones).
+
+.PARAMETER NoProbe
+    -UpdateCost, -MaintenancePlan: no probe query; the lab's constants are used.
+
+.PARAMETER AdviseFiltered
+    Filtered statistics advisor for a column (-Statistics or -Column): finds segments (values
+    of other columns, such as a tenant or status) where estimates for the column are off because
+    the columns are correlated, and writes CREATE STATISTICS ... WHERE for the ones a filtered
+    statistic fixes. Reads one page sample into tempdb.
+
+.PARAMETER SegmentColumn
+    -AdviseFiltered: the columns to try as segments (default: every column of a type a filter can use).
+
+.PARAMETER MinSegmentRows
+    -AdviseFiltered: the smallest segment considered, in table rows (default 1000).
+
+.PARAMETER ForecastDate
+    The date the update history forecast and the health check's age use (default now): rows past
+    the last step by then, at the past rate, and when the next automatic update is due.
 
 .PARAMETER StatsStream
     Offline mode: the STATS_STREAM as a hex string (with or without 0x).
@@ -227,8 +278,8 @@ param(
     [Parameter(ParameterSetName = 'ConnStr', Mandatory = $true)]
     [string]$Database,
 
-    [Parameter(ParameterSetName = 'Server', Mandatory = $true)]
-    [Parameter(ParameterSetName = 'ConnStr', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
     [string]$Table,
 
     [Parameter(ParameterSetName = 'Server')]
@@ -286,7 +337,7 @@ param(
 
     [Parameter(ParameterSetName = 'Server')]
     [Parameter(ParameterSetName = 'ConnStr')]
-    [ValidateSet('EqualRows', 'MaxDiff', 'FrequentFirst', 'VOptimal', 'Workload')]
+    [ValidateSet('EqualRows', 'MaxDiff', 'FrequentFirst', 'VOptimal')]
     [string[]]$Algorithm,
 
     [Parameter(ParameterSetName = 'Server')]
@@ -296,10 +347,6 @@ param(
     [Parameter(ParameterSetName = 'Server')]
     [Parameter(ParameterSetName = 'ConnStr')]
     [switch]$ShowCandidates,
-
-    [Parameter(ParameterSetName = 'Server')]
-    [Parameter(ParameterSetName = 'ConnStr')]
-    [switch]$NoWorkload,
 
     [Parameter(ParameterSetName = 'Server')]
     [Parameter(ParameterSetName = 'ConnStr')]
@@ -320,6 +367,48 @@ param(
     [Parameter(ParameterSetName = 'Server')]
     [Parameter(ParameterSetName = 'ConnStr')]
     [int]$Seed = 1,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$AdviseSample,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [long]$PageBudget = 100000,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$UpdateCost,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$MaintenancePlan,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [double]$TimeBudgetMinutes = 30,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$IncludeNoRecompute,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$NoProbe,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$AdviseFiltered,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [string[]]$SegmentColumn,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [long]$MinSegmentRows = 1000,
+
+    [object]$ForecastDate,
 
     [Parameter(ParameterSetName = 'Hex', Mandatory = $true)]
     [string]$StatsStream,
@@ -1202,6 +1291,102 @@ function Resolve-PendingValues($Decoded, $Connection) {
     }
 }
 
+function Get-StatsByteRegions($D, [int]$MaxNodes = 5000) {
+    <#
+      Every described byte range of the stream, for the byte map: the decoder's layout (header, column definitions,
+      fixed blob fields, one range per variable item), broken down further inside the items: the histogram's step offsets,
+      each step record and its fields, the string index header, character buffer and nodes (up to MaxNodes), and the
+      update history records. Ranges nest; the map shows the innermost one at each byte.
+    #>
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    $add = { param([long]$Off, [long]$Len, [string]$Group, [string]$Field, [string]$Value) if ($Len -gt 0) { $out.Add([pscustomobject]@{ Offset = $Off; Length = $Len; Group = $Group; Field = $Field; Value = $Value }) } }
+    $itemGroup = @{ 0 = 'Histogram'; 1 = 'String index'; 3 = 'Update history' }
+    foreach ($x in $D.Layout) {
+        $group = switch -Regex ($x.Field) {
+            '^Header:' { 'Header' }
+            '^Column ' { 'Columns' }
+            '^Variable item bit (\d+)' { $(if ($itemGroup.ContainsKey([int]$Matches[1])) { $itemGroup[[int]$Matches[1]] } else { 'Other items' }) }
+            '^Blob: data after' { 'Other items' }
+            default { 'Blob' }
+        }
+        & $add $x.Offset $x.Length $group $x.Field ([string]$x.Value)
+    }
+    $item = @{}
+    foreach ($v in $D.VariableItems) { $item[[int]$v.Bit] = $v }
+    $f = { param([single]$v) $v.ToString('R', $script:Inv) }
+
+    # histogram: the step offset array, then each record ([status A][status B][fixed end] EQ RANGE AVG [key] [columns][NULL bitmap][variable part])
+    $steps = @($D.Histogram | Where-Object { -not $_.IsNullStep -and $null -ne $_.RecordOffset })
+    if ($item.ContainsKey(0) -and $steps.Count) {
+        & $add $item[0].StreamOffset (8 * $steps.Count) 'Histogram' 'Histogram: step record offsets (int64 per step, from the item start)' "$($steps.Count) steps"
+        foreach ($st in $steps) {
+            $o = [long]$st.RecordOffset; $r = $st.Record
+            $key = $(if ($null -eq $st.RangeHiKey) { 'NULL' } else { [string]$st.RangeHiKey })
+            if ($key.Length -gt 80) { $key = $key.Substring(0, 77) + '...' }
+            & $add $o $st.RecordLength 'Histogram' "Step $($st.Step) record" $key
+            & $add $o 1 'Histogram' "Step $($st.Step): status A" ('0x{0:X2}' -f $r.StatusA)
+            & $add ($o + 1) 1 'Histogram' "Step $($st.Step): status B" ('0x{0:X2}' -f $r.StatusB)
+            & $add ($o + 2) 2 'Histogram' "Step $($st.Step): fixed-data end" ([string]$r.FixedEnd)
+            & $add ($o + 4) 4 'Histogram' "Step $($st.Step): EQ_ROWS (real)" (& $f $r.EqRows)
+            & $add ($o + 8) 4 'Histogram' "Step $($st.Step): RANGE_ROWS (real)" (& $f $r.RangeRows)
+            & $add ($o + 12) 4 'Histogram' "Step $($st.Step): AVG_RANGE_ROWS (real)" (& $f $r.AvgRangeRows)
+            if ($r.FixedEnd -gt 16) { & $add ($o + 16) ($r.FixedEnd - 16) 'Histogram' "Step $($st.Step): RANGE_HI_KEY (fixed part)" $key }
+            $nb = [int][Math]::Ceiling($r.ColumnCount / 8.0)
+            & $add ($o + $r.FixedEnd) 2 'Histogram' "Step $($st.Step): column count" ([string]$r.ColumnCount)
+            & $add ($o + $r.FixedEnd + 2) $nb 'Histogram' "Step $($st.Step): NULL bitmap" ('0x{0:X2}' -f $r.NullBitmap)
+            if ($r.VarColumnCount -gt 0) {
+                $p = $o + $r.FixedEnd + 2 + $nb
+                & $add $p 2 'Histogram' "Step $($st.Step): variable column count" ([string]$r.VarColumnCount)
+                & $add ($p + 2) (2 * $r.VarColumnCount) 'Histogram' "Step $($st.Step): variable column end offsets" ''
+                & $add ($p + 2 + 2 * $r.VarColumnCount) $r.KeyBytes.Length 'Histogram' "Step $($st.Step): RANGE_HI_KEY (variable part)" $key
+            }
+        }
+    }
+
+    # string index: header fields, character buffer, node count, nodes
+    $si = $D.StringIndex
+    if ($item.ContainsKey(1) -and $si) {
+        $b = [long]$item[1].StreamOffset
+        $cs = $(if (@($D.Columns)[0].SystemTypeId -in 231, 239, 99) { 2 } else { 1 })
+        foreach ($h in @(@(0, 1, 'marker (0xFF)', '0xFF'), @(1, 4, 'version', $si.Version), @(5, 4, 'NULLs in the sample', $si.NullsInSample), @(9, 4, 'strings sampled', $si.StringsSampled),
+                @(13, 4, 'distinct strings', $si.DistinctStrings), @(17, 4, 'full prefix length', $si.FullPrefix), @(21, 4, 'full suffix length', $si.FullSuffix),
+                @(25, 8, 'unused', $si.Unused25), @(33, 4, 'character buffer length (characters)', $si.CompressedLength))) {
+            & $add ($b + $h[0]) $h[1] 'String index' "String index: $($h[2])" ([string]$h[3])
+        }
+        $text = [string]$si.CompressedString
+        & $add ($b + 37) ($si.CompressedLength * $cs) 'String index' 'String index: character buffer' $(if ($text.Length -gt 80) { $text.Substring(0, 77) + '...' } else { $text })
+        & $add ($b + 37 + $si.CompressedLength * $cs) 4 'String index' 'String index: node count' ([string]$si.NodeCount)
+        $nodes = @($si.Nodes)
+        for ($i = 0; $i -lt [Math]::Min($nodes.Count, $MaxNodes); $i++) {
+            $n = $nodes[$i]
+            & $add ($b + $n.RecordOffset) $n.RecordLength 'String index' "String index node $i" ("'{0}'  ends here: {1}, info 0x{2:X2}, segment {3}+{4}" -f $n.Text, $n.Count, $n.Flags, $n.SegmentOffset, $n.SegmentLength)
+        }
+        if ($nodes.Count -gt $MaxNodes) {
+            $from = $b + $nodes[$MaxNodes].RecordOffset; $last = $nodes[$nodes.Count - 1]
+            & $add $from ($b + $last.RecordOffset + $last.RecordLength - $from) 'String index' "String index nodes $MaxNodes to $($nodes.Count - 1)" 'not listed one by one'
+        }
+    }
+
+    # update history: record count, then 76-byte records, newest first
+    $hist = @($D.UpdateHistory)
+    if ($item.ContainsKey(3) -and $hist.Count) {
+        $b = [long]$item[3].StreamOffset
+        & $add $b 4 'Update history' 'Update history: record count' ([string]$hist.Count)
+        $fields = @(@(0, 8, 'updated (datetime)', 'Updated'), @(8, 8, 'table cardinality (float)', 'TableCardinality'), @(16, 8, 'snapshot counter', 'SnapshotCtr'), @(24, 4, 'steps', 'Steps'),
+            @(28, 8, 'density (float)', 'Density'), @(36, 8, 'next: rows above (float)', 'RowsAbove'), @(44, 8, 'next: rows below (float)', 'RowsBelow'),
+            @(52, 8, 'next: inserts (float)', 'InsertsSinceLastUpdate'), @(60, 8, 'next: deletes (float)', 'DeletesSinceLastUpdate'), @(68, 8, 'next: squared variance error (float)', 'SquaredVarianceError'))
+        foreach ($h in $hist) {
+            $o = $b + 4 + $h.Index * $h.RecordSize
+            & $add $o $h.RecordSize 'Update history' "History record $($h.Index)" (Format-SqlValue $h.Updated 61)
+            foreach ($x in $fields) {
+                $v = $h.($x[3])
+                & $add ($o + $x[0]) $x[1] 'Update history' "History record $($h.Index): $($x[2])" $(if ($v -is [datetime]) { Format-SqlValue $v 61 } elseif ($v -is [double]) { $v.ToString('R', $script:Inv) } else { [string]$v })
+            }
+        }
+    }
+    return , $out.ToArray()
+}
+
 #endregion
 
 #region ---------------------------------------------------------------- encoder (edited statistics -> STATS_STREAM)
@@ -1730,6 +1915,299 @@ function Format-TraceFlag2388Section($D) {
             $out += 'Row 1 Snapshot Ctr is NOT stored in the stream (it lives in sys.sysobjvalues.value): the row count is shown as an estimate. Use -UseDac for the exact value.'
         }
     }
+    $findings = [string[]](Get-StatsHistoryFindings $D)
+    if ($findings) {
+        $out += ''
+        $out += 'Update history, in words:'
+        $out += @($findings | ForEach-Object { "  - $_" })
+    }
+    return , $out
+}
+
+function Get-StatsHistoryFindings($D, $At) {
+    <#
+      What the update history says, oldest update to newest: how the table and the histogram changed, how much changed
+      before each update, where the new rows landed (above or below the previous histogram) and the leading column type.
+      The stream keeps the current update and up to three before it.
+    #>
+    $rows = @($D.TraceFlag2388 | Where-Object { $null -ne $_.Updated })
+    if ($rows.Count -lt 2) { return @() }
+    [array]::Reverse($rows)   # oldest first
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $fmt = { param([double]$v) Format-Invariant '{0:N0}' $v }
+    $first = $rows[0]; $last = $rows[$rows.Count - 1]
+    $span = ([datetime]$last.Updated - [datetime]$first.Updated)
+    $spanText = $(if ($span.TotalDays -ge 2) { Format-Invariant '{0:0.#} days' $span.TotalDays } elseif ($span.TotalHours -ge 2) { Format-Invariant '{0:0.#} hours' $span.TotalHours } elseif ($span.TotalMinutes -ge 2) { Format-Invariant '{0:0} minutes' $span.TotalMinutes } else { 'less than 2 minutes' })
+    $out.Add("$($rows.Count) updates over $spanText (the stream keeps the current one and up to three before it).")
+    $r0 = [double]$first.'Table Cardinality'; $r1 = [double]$last.'Table Cardinality'
+    if ($r0 -gt 0 -and [Math]::Abs($r1 - $r0) / $r0 -ge 0.01) { $out.Add((Format-Invariant 'Rows went from {0} to {1} ({2:+0;-0}%).' (& $fmt $r0) (& $fmt $r1) (100 * ($r1 - $r0) / $r0))) }
+    else { $out.Add("Rows stayed about the same ($(& $fmt $r1)).") }
+    $steps = @($rows | ForEach-Object { [int]$_.Steps })
+    if (@($steps | Select-Object -Unique).Count -gt 1) { $out.Add("Histogram steps: $($steps -join ' -> ').") }
+    $dist = @($rows | ForEach-Object { if ([double]$_.Density -gt 0) { 1 / [double]$_.Density } else { 0 } })
+    if ($dist[0] -gt 0 -and $dist[$dist.Count - 1] -gt 0 -and [Math]::Abs($dist[$dist.Count - 1] - $dist[0]) / $dist[0] -ge 0.05) {
+        $out.Add((Format-Invariant 'Distinct values of the leading column (1 / density): {0} -> {1}.' (& $fmt $dist[0]) (& $fmt $dist[$dist.Count - 1])))
+    }
+    # changes before each update: the TF 2388 row of an update carries what changed since the update before it
+    for ($i = 1; $i -lt $rows.Count; $i++) {
+        $r = $rows[$i]
+        if ($null -eq $r.'Inserts Since Last Update') { continue }
+        $ins = [double]$r.'Inserts Since Last Update'; $del = [double]$r.'Deletes Since Last Update'
+        $prev = [double]$rows[$i - 1].'Table Cardinality'
+        $what = $(if ($i -eq $rows.Count - 1) { 'the current update' } else { "update $($i + 1) of $($rows.Count)" })
+        $share = $(if ($prev -gt 0) { Format-Invariant ' ({0:0.#}% of the {1} rows before)' (100 * ($ins + $del) / $prev) (& $fmt $prev) } else { '' })
+        $where = ''
+        if ($ins -gt 0) {
+            $above = [double]$r.'Rows Above'; $below = [double]$r.'Rows Below'
+            $where = Format-Invariant '; of the new rows, {0:0}% landed above the previous histogram and {1:0}% below it' ([Math]::Min(100, 100 * $above / $ins)) ([Math]::Min(100, 100 * $below / $ins))
+        }
+        $out.Add("Before $($what): $(& $fmt $ins) inserted, $(& $fmt $del) deleted$share$where.")
+    }
+    switch ($D.LeadingColumnType) {
+        'Ascending' { $out.Add('Leading column type Ascending: new rows keep landing above the last step. Queries on the newest values estimate from beyond the histogram; the new cardinality estimator (compatibility level 120+) assumes rows there, the legacy one needs trace flags 2389/2390, and frequent updates help both.') }
+        'Descending' { $out.Add('Leading column type Descending: new rows keep landing below the first step, so queries on them estimate from outside the histogram.') }
+        'Stationary' { $out.Add('Leading column type Stationary: new rows land inside the histogram, not past its ends.') }
+        default { $out.Add('Leading column type Unknown: it takes three updates with inserts, most of them past the same end of the histogram, to brand a column.') }
+    }
+    foreach ($l in [string[]](Get-StatsHistoryRhythm $rows $At)) { if ($l) { $out.Add($l) } }
+    return , $out.ToArray()
+}
+
+function Get-StatsUpdateThreshold([double]$Rows) {
+    # modifications that trigger an automatic update: 20% + 500 rows, or sqrt(1000 x rows) when lower (SQL Server 2016+)
+    if ($Rows -le 0) { return 500.0 }
+    return [Math]::Min(500 + 0.2 * $Rows, [Math]::Sqrt(1000 * $Rows))
+}
+
+function Get-StatsHistoryRhythm($Rows, $At) {
+    <#
+      How often the statistic updates and what changed before each update (11), and a forecast from the change rate (10):
+      the rows past the histogram's last step by a date (now by default) and when the next automatic update is due.
+      Rates come from the intervals between updates; the stream's dates are the server's local time.
+    #>
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    if (@($Rows).Count -lt 2) { return , $out.ToArray() }
+    if (-not $At) { $At = $(if ($script:ForecastAt) { $script:ForecastAt } else { Get-Date }) }
+    $fmt = { param([double]$v) Format-Invariant '{0:N0}' $v }
+    $span = { param([TimeSpan]$t) if ($t.TotalDays -ge 2) { Format-Invariant '{0:0.#} days' $t.TotalDays } elseif ($t.TotalHours -ge 2) { Format-Invariant '{0:0.#} hours' $t.TotalHours } elseif ($t.TotalMinutes -ge 2) { Format-Invariant '{0:0} minutes' $t.TotalMinutes } else { Format-Invariant '{0:0} seconds' $t.TotalSeconds } }
+    # each interval: time, changes (inserts + deletes), inserts above the previous histogram, the share of rows changed and the threshold
+    $ivals = @()
+    for ($i = 1; $i -lt $Rows.Count; $i++) {
+        $r = $Rows[$i]
+        if ($null -eq $r.'Inserts Since Last Update') { continue }
+        $prev = [double]$Rows[$i - 1].'Table Cardinality'
+        $chg = [double]$r.'Inserts Since Last Update' + [double]$r.'Deletes Since Last Update'
+        $ivals += [pscustomobject]@{ Time = ([datetime]$r.Updated - [datetime]$Rows[$i - 1].Updated); Changes = $chg; Above = [double]$r.'Rows Above'; Inserts = [double]$r.'Inserts Since Last Update'; Threshold = Get-StatsUpdateThreshold $prev; Rows = $prev }
+    }
+    if (-not $ivals) { return , $out.ToArray() }
+    $times = @($ivals | ForEach-Object { $_.Time.TotalSeconds })
+    $avg = ($times | Measure-Object -Average).Average
+    $out.Add((Format-Invariant 'Update rhythm: every {0} on average (from {1} to {2}).' (& $span ([TimeSpan]::FromSeconds($avg))) (& $span ([TimeSpan]::FromSeconds(($times | Measure-Object -Minimum).Minimum))) (& $span ([TimeSpan]::FromSeconds(($times | Measure-Object -Maximum).Maximum)))))
+    $vs = @($ivals | ForEach-Object { Format-Invariant '{0:0.#}x' ($_.Changes / [Math]::Max(1, $_.Threshold)) })
+    $out.Add("Changes before each update, against the automatic update threshold (20% + 500 rows, or sqrt(1000 x rows)): $($vs -join ', '). Around 1x means automatic updates; well below 1x, updates by a job; well above, statistics left stale for a while or updated rarely.")
+    # rates from the intervals of a minute or more: insert rate, and the rows that landed above the last step
+    $timed = @($ivals | Where-Object { $_.Time.TotalSeconds -ge 60 })
+    $last = $Rows[$Rows.Count - 1]
+    if (-not $timed) { $out.Add('Forecast: the updates are too close together (under a minute apart) to measure a change rate.'); return , $out.ToArray() }
+    $secs = ($timed | ForEach-Object { $_.Time.TotalSeconds } | Measure-Object -Sum).Sum
+    $changeRate = ($timed | ForEach-Object { $_.Changes } | Measure-Object -Sum).Sum / $secs
+    $aboveRate = ($timed | ForEach-Object { $_.Above } | Measure-Object -Sum).Sum / $secs
+    $since = ([datetime]$At - [datetime]$last.Updated).TotalSeconds
+    $when = ([datetime]$At).ToString('yyyy-MM-dd HH:mm', $script:Inv)
+    if ($since -lt 0) { $out.Add("Forecast: $when is before the current update."); return , $out.ToArray() }
+    if ($aboveRate -gt 0) {
+        $out.Add((Format-Invariant 'Forecast for {0}: if rows kept arriving at the past rate ({1} a day above the histogram), about {2} rows are past the last step by then, which the histogram does not describe.' $when (& $fmt ($aboveRate * 86400)) (& $fmt ($aboveRate * $since))))
+    }
+    if ($changeRate -gt 0) {
+        $threshold = Get-StatsUpdateThreshold ([double]$last.'Table Cardinality')
+        $wait = $threshold / $changeRate
+        # a very slow change rate puts the next update past any date (and past what DateTime can hold)
+        if ($wait -gt 100 * 365.25 * 86400) {
+            $rate = $(if ($changeRate * 86400 -lt 1) { 'under one change a day' } else { (& $fmt ($changeRate * 86400)) + ' changes a day' })
+            $out.Add((Format-Invariant 'At {0}, the next automatic update ({1} modifications, the threshold for {2} rows) is more than a century away.' $rate (& $fmt $threshold) (& $fmt ([double]$last.'Table Cardinality'))))
+            return , $out.ToArray()
+        }
+        $due = ([datetime]$last.Updated).AddSeconds($wait)
+        $whenDue = $(if ($due -le [datetime]$At) { "was due around $($due.ToString('yyyy-MM-dd HH:mm', $script:Inv)): the next query that uses the statistic updates it" } else { "is due around $($due.ToString('yyyy-MM-dd HH:mm', $script:Inv)), at the first query that uses the statistic after that" })
+        $rate = $(if ($changeRate * 86400 -lt 1) { 'under one change a day' } else { (& $fmt ($changeRate * 86400)) + ' changes a day' })
+        $out.Add((Format-Invariant 'At {0}, the next automatic update {1} ({2} modifications, the threshold for {3} rows).' $rate $whenDue (& $fmt $threshold) (& $fmt ([double]$last.'Table Cardinality'))))
+    }
+    return , $out.ToArray()
+}
+
+function Get-StatsSampleFraction($D) {
+    # rows sampled / rows: 1 for a full scan
+    if (-not $D.Blob -or [double]$D.Blob.Rows -le 0) { return 1.0 }
+    return [Math]::Min(1.0, [Math]::Max(1e-9, [double]$D.Blob.RowsSampled / [double]$D.Blob.Rows))
+}
+
+function Get-StatsCountInterval([double]$Value, [double]$Fraction) {
+    # 95% interval half-width of a count scaled up from a sample of rows (binomial; page sampling can be wider)
+    if ($Fraction -ge 1 -or $Value -le 0) { return 0.0 }
+    return 1.96 * [Math]::Sqrt($Value * (1 - $Fraction) / $Fraction)
+}
+
+function Get-StatsEstimateAnalysis($D) {
+    <#
+      What the optimizer estimates from this statistic (3, 4). For an equality on a known value: EQ_ROWS on a step key,
+      AVG_RANGE_ROWS inside a step. For an unknown value (a local variable, OPTIMIZE FOR UNKNOWN, a parameter that is not
+      sniffed): all density x rows, the same for every value. Where the two differ by 10x or more, plans built for one
+      value run badly for another (parameter sensitivity). The density vector also gives GROUP BY / DISTINCT estimates
+      for every leading column combination.
+    #>
+    $rows = $(if ($D.Blob) { [double]$D.Blob.Rows } else { 0 })
+    $v1 = @($D.DensityVector)[0]
+    $unknown = $(if ($v1 -and $null -ne $v1.AllDensity) { [double]$v1.AllDensity * $rows } else { $null })
+    $steps = @()
+    foreach ($st in @($D.Histogram)) {
+        if ($st.IsNullStep) { continue }
+        $eq = [double]$st.EqRows; $avg = [double]$st.AvgRangeRows
+        $q = { param([double]$a, [double]$b) $x = [Math]::Max($a, 1); $y = [Math]::Max($b, 1); [Math]::Max($x / $y, $y / $x) }
+        $steps += [pscustomobject]@{
+            Step = $st.Step; Key = $(if ($null -eq $st.RangeHiKey) { 'NULL' } else { [string]$st.RangeHiKey }); EqRows = $eq; AvgRangeRows = $avg; RangeRows = [double]$st.RangeRows
+            KeyRatio = $(if ($null -ne $unknown) { & $q $eq $unknown } else { 1 }); InsideRatio = $(if ($null -ne $unknown -and [double]$st.RangeRows -gt 0) { & $q $avg $unknown } else { 1 })
+            Over = $(if ($null -ne $unknown) { $eq -gt $unknown } else { $false })
+        }
+    }
+    $vectors = @(foreach ($v in @($D.DensityVector)) {
+            if ($null -eq $v.AllDensity -or [double]$v.AllDensity -le 0) { continue }
+            $distinct = 1 / [double]$v.AllDensity
+            [pscustomobject]@{ Vector = $v.Vector; Columns = $v.Columns; AllDensity = [double]$v.AllDensity; Distinct = [Math]::Min($rows, $distinct); UnknownEquality = [double]$v.AllDensity * $rows; AverageLength = $v.AverageLength }
+        })
+    # distinct values of the leading column as the histogram counts them (keys + DISTINCT_RANGE_ROWS + the NULL step)
+    $histDistinct = ($steps | Measure-Object -Property Step).Count + (@($D.Histogram) | Where-Object { -not $_.IsNullStep } | ForEach-Object { [double]$_.DistinctRangeRows } | Measure-Object -Sum).Sum + $(if (@($D.Histogram | Where-Object IsNullStep).Count) { 1 } else { 0 })
+    $flagged = @($steps | Where-Object { $_.KeyRatio -ge 10 -or $_.InsideRatio -ge 10 })
+    [pscustomobject]@{ Rows = $rows; Unknown = $unknown; Steps = $steps; Vectors = $vectors; HistogramDistinct = $histDistinct; Flagged = $flagged }
+}
+
+function Format-StatsEstimatesSection($D) {
+    $a = Get-StatsEstimateAnalysis $D
+    $out = @()
+    $out += New-Section 'ESTIMATES: PARAMETER SENSITIVITY AND DENSITY'
+    if ($null -eq $a.Unknown -or -not $a.Steps) { $out += 'No histogram or density to estimate from.'; return , $out }
+    $out += Format-Invariant 'An equality on an unknown value (local variable, OPTIMIZE FOR UNKNOWN) estimates {0:N1} rows for every value (all density {1:G4} x {2:N0} rows).' $a.Unknown $a.Vectors[0].AllDensity $a.Rows
+    $n = @($a.Steps).Count; $f = @($a.Flagged).Count
+    if ($f) {
+        $out += Format-Invariant '{0} of {1} steps estimate 10x or more away from it: a plan compiled for one value can run badly for another. Candidates for OPTION (RECOMPILE), OPTIMIZE FOR, or (SQL Server 2022) parameter sensitive plan optimization.' $f $n
+        $rows = foreach ($s in @($a.Flagged | Sort-Object { [Math]::Max($_.KeyRatio, $_.InsideRatio) } -Descending | Select-Object -First 15)) {
+            [pscustomobject]@{
+                Step = $s.Step; RANGE_HI_KEY = $(if ($s.Key.Length -gt 40) { $s.Key.Substring(0, 37) + '...' } else { $s.Key }); 'Key estimate (EQ_ROWS)' = Format-Invariant '{0:N1}' $s.EqRows
+                'Inside (AVG_RANGE_ROWS)' = Format-Invariant '{0:N1}' $s.AvgRangeRows; 'vs unknown' = Format-Invariant '{0:0.#}x {1}' ([Math]::Max($s.KeyRatio, $s.InsideRatio)) $(if ($s.Over) { 'more' } else { 'less' })
+            }
+        }
+        $out += Format-AsciiTable -Rows $rows -Columns Step, RANGE_HI_KEY, 'Key estimate (EQ_ROWS)', 'Inside (AVG_RANGE_ROWS)', 'vs unknown' -RightAlign Step, 'Key estimate (EQ_ROWS)', 'Inside (AVG_RANGE_ROWS)', 'vs unknown'
+    } else { $out += "Every step estimates within 10x of it: one plan suits every value of the leading column." }
+    $out += ''
+    $out += 'GROUP BY / DISTINCT and unknown-value estimates from the density vector:'
+    $rows = foreach ($v in $a.Vectors) {
+        [pscustomobject]@{ Columns = $v.Columns; 'All density' = Format-Invariant '{0:G6}' $v.AllDensity; 'GROUP BY / DISTINCT rows' = Format-Invariant '{0:N0}' $v.Distinct; 'Equality on unknown values' = Format-Invariant '{0:N1}' $v.UnknownEquality }
+    }
+    $out += Format-AsciiTable -Rows $rows -Columns Columns, 'All density', 'GROUP BY / DISTINCT rows', 'Equality on unknown values' -RightAlign 'All density', 'GROUP BY / DISTINCT rows', 'Equality on unknown values'
+    $hd = $a.HistogramDistinct; $dd = $a.Vectors[0].Distinct
+    if ($hd -gt 0 -and $dd -gt 0 -and [Math]::Max($hd / $dd, $dd / $hd) -ge 1.5) {
+        $out += Format-Invariant 'The histogram counts {0:N0} distinct values of the leading column, the density {1:N0}: they come from different estimates of a sample, and GROUP BY estimates use the density.' $hd $dd
+    }
+    return , $out
+}
+
+function Get-StatsHealthFindings($D, $At) {
+    <#
+      Problems visible in the statistic itself (7), worst first. Result is Poor, Fair or Good (the data check's ratings) or
+      INFO. Confidence intervals (8) come from the rows sampled: a count scaled up from a fraction f of the rows has a 95%
+      interval of about +/- 1.96 x sqrt(count x (1 - f) / f).
+    #>
+    if (-not $At) { $At = $(if ($script:ForecastAt) { $script:ForecastAt } else { Get-Date }) }
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    $add = { param([string]$R, [string]$Finding, [string]$Detail) $out.Add([pscustomobject]@{ Result = $R; Finding = $Finding; Detail = $Detail }) }
+    $m = $D.Blob
+    if (-not $m) { return , $out.ToArray() }
+    $rows = [double]$m.Rows; $sampled = [double]$m.RowsSampled
+    $f = Get-StatsSampleFraction $D
+    $steps = @($D.Histogram | Where-Object { -not $_.IsNullStep })
+    $nullStep = @($D.Histogram | Where-Object IsNullStep)[0]
+    $v1 = @($D.DensityVector)[0]
+    $distinct = $(if ($v1 -and [double]$v1.AllDensity -gt 0) { 1 / [double]$v1.AllDensity } else { 0 })
+    $fmt = { param([double]$v) Format-Invariant '{0:N0}' $v }
+    if ($rows -le 0 -or -not $steps) { & $add 'INFO' 'Empty statistic' 'No rows were read: every estimate is a guess until the statistic is updated with data.'; return , $out.ToArray() }
+
+    # sampling: a small sample of a column with many values cannot see most of them
+    if ($f -lt 1) {
+        $pct = 100 * $f
+        if ($distinct -ge 0.5 * $sampled) { & $add 'Poor' (Format-Invariant 'Sample of {0:0.##}% on a column with ~{1} distinct values' $pct (& $fmt $distinct)) 'Distinct values are close to the rows sampled: the density and DISTINCT_RANGE_ROWS are extrapolated, and values the sample missed estimate as averages. A larger sample (PERSIST_SAMPLE_PERCENT) or FULLSCAN fixes it.' }
+        elseif ($pct -lt 5) { & $add 'Fair' (Format-Invariant 'Small sample: {0:0.##}% of the rows' $pct) 'Fine for evenly spread values; skewed or page-clustered values need a larger one (the sample size advisor measures it).' }
+        else { & $add 'Good' (Format-Invariant 'Sampled {0:0.##}% of the rows' $pct) '' }
+    } else { & $add 'Good' 'Full scan' 'Every row was read: the counts are exact as of the update.' }
+
+    # confidence of the step counts (sampled only)
+    if ($f -lt 1) {
+        $wide = @($steps | Where-Object { [double]$_.EqRows -gt 0 -and (Get-StatsCountInterval ([double]$_.EqRows) $f) / [double]$_.EqRows -gt 0.5 })
+        $typical = @($steps | ForEach-Object { [double]$_.EqRows } | Sort-Object)[[int][Math]::Floor($steps.Count / 2)]
+        $pm = $(if ($typical -gt 0) { 100 * (Get-StatsCountInterval $typical $f) / $typical } else { 0 })
+        if ($wide) { & $add 'Fair' "$($wide.Count) of $($steps.Count) steps have EQ_ROWS uncertain by more than +/-50%" (Format-Invariant 'With {0:0.##}% of the rows sampled, a typical key ({1} rows) is worth +/-{2:0}% (95% interval). The Histogram chart can draw these intervals.' (100 * $f) (& $fmt $typical) $pm) }
+        elseif ($pm -gt 0) { & $add 'Good' (Format-Invariant 'Step counts within +/-{0:0}% (95% interval) for a typical key' $pm) 'From the rows sampled; page sampling of clustered values can be wider.' }
+    }
+
+    # evenly spread values (every key and every value inside a step about as frequent): few steps and wide steps estimate well
+    $per = @($steps | ForEach-Object { [double]$_.EqRows } ) + @($steps | Where-Object { [double]$_.RangeRows -gt 0 } | ForEach-Object { [double]$_.AvgRangeRows })
+    $lo = ($per | Measure-Object -Minimum).Minimum; $hi = ($per | Measure-Object -Maximum).Maximum
+    $uniform = $lo -gt 0 -and $hi / $lo -le 3
+
+    # few steps for many values
+    if (-not $uniform -and $distinct -gt 4 * $steps.Count -and $steps.Count -lt 0.8 * 200) {
+        & $add 'Fair' "$($steps.Count) of 200 steps used for ~$(& $fmt $distinct) distinct values" 'SQL Server stops when its merges leave no large differences; more steps would place keys on more of the frequent values. The statistics builder fills all 200.'
+    }
+
+    # frequent values hidden inside steps: the values inside average far more rows than the keys on both sides
+    $hidden = @()
+    for ($i = 1; $i -lt $steps.Count; $i++) {
+        $s = $steps[$i]; $avg = [double]$s.AvgRangeRows
+        if ([double]$s.RangeRows -gt 0 -and $avg -ge 100 -and $avg -ge 10 * [Math]::Max(1, [double]$s.EqRows) -and $avg -ge 10 * [Math]::Max(1, [double]$steps[$i - 1].EqRows)) { $hidden += $s }
+    }
+    if ($hidden) {
+        $top = @($hidden | Sort-Object { [double]$_.AvgRangeRows } -Descending | Select-Object -First 5 | ForEach-Object { Format-Invariant 'step {0} ({1} rows per value)' $_.Step (& $fmt $_.AvgRangeRows) }) -join ', '
+        & $add 'Fair' "$($hidden.Count) step(s) whose values average 10x the keys around them" "Values inside a step all estimate as AVG_RANGE_ROWS; an average far above both keys suggests a frequent value inside without its own step: $top."
+    }
+
+    # one step holding a large share of the table (uneven values only: an even range interpolates well)
+    if (-not $uniform) {
+        foreach ($b in @($steps | Where-Object { [double]$_.RangeRows -ge 0.25 * $rows })) { & $add 'Fair' (Format-Invariant 'Step {0} covers {1:0}% of the rows between two keys' $b.Step (100 * [double]$b.RangeRows / $rows)) 'Ranges inside it are estimated by interpolation over a quarter of the table or more; a step key inside it would split the estimate.' }
+    }
+
+    # the NULL step
+    if ($nullStep -and [double]$nullStep.EqRows -ge 0.5 * $rows) { & $add 'INFO' (Format-Invariant '{0:0}% of the rows are NULL' (100 * [double]$nullStep.EqRows / $rows)) 'A filtered statistic or index WHERE column IS NOT NULL describes the other rows with all 200 steps.' }
+
+    # histogram rows against the table rows (sampled scaling)
+    $sum = ($D.Histogram | ForEach-Object { [double]$_.RangeRows + [double]$_.EqRows } | Measure-Object -Sum).Sum
+    if ([Math]::Abs($sum - $rows) / $rows -gt 0.02) { & $add 'INFO' (Format-Invariant 'The histogram adds up to {0} rows, the header says {1}' (& $fmt $sum) (& $fmt $rows)) 'The two differ after sampling (each step is scaled on its own) or after the statistic was edited or loaded with STATS_STREAM.' }
+
+    # stored averages below 1 (sampling)
+    $low = @($steps | Where-Object { $null -ne $_.StoredAvgRangeRows -and [double]$_.StoredAvgRangeRows -gt 0 -and [double]$_.StoredAvgRangeRows -lt 1 })
+    if ($low) { & $add 'INFO' "$($low.Count) step(s) store AVG_RANGE_ROWS below 1" 'Sampling estimated more distinct values than rows in those ranges; DBCC shows 1. Estimates inside them are 1 row per value.' }
+
+    # filtered statistics
+    if ($null -ne $D.UnfilteredRows -and [double]$D.UnfilteredRows -gt 0 -and [double]$D.UnfilteredRows -ne $rows) {
+        & $add 'INFO' (Format-Invariant 'Filtered: {0:0.##}% of the table' (100 * $rows / [double]$D.UnfilteredRows)) 'Automatic updates follow the whole table''s modifications, so a filtered statistic goes stale sooner than its rows suggest: update it in maintenance.'
+    }
+
+    # age and the ascending key
+    $age = ([datetime]$At - [datetime]$m.Updated)
+    if ($age.TotalDays -ge 30) { & $add 'Fair' (Format-Invariant 'Updated {0:0} days ago' $age.TotalDays) 'Fine for static data; on a changing table check the modifications (sys.dm_db_stats_properties).' }
+    if ($D.LeadingColumnType -eq 'Ascending') { & $add 'Fair' 'Ascending leading column' 'New rows keep landing past the last step (see Update history): estimates for the newest values come from beyond the histogram.' }
+    if ($null -ne $D.PersistedSamplePercent -and [double]$D.PersistedSamplePercent -gt 0) { & $add 'INFO' (Format-Invariant 'Persisted sample: {0:0.##}%' ([double]$D.PersistedSamplePercent)) 'Later updates, automatic ones included, keep this rate.' }
+
+    # parameter sensitivity, from the estimates analysis
+    $ea = Get-StatsEstimateAnalysis $D
+    if (@($ea.Flagged).Count) { & $add 'Fair' "$(@($ea.Flagged).Count) step(s) estimate 10x away from an unknown value" (Format-Invariant 'Unknown values estimate {0:N1} rows; plans compiled for these keys suit other values poorly (see Estimates).' $ea.Unknown) }
+    $order = @{ Poor = 0; Fair = 1; INFO = 2; Good = 3 }
+    return , @($out | Sort-Object { $order[$_.Result] })
+}
+
+function Format-StatsHealthSection($D) {
+    $h = Get-StatsHealthFindings $D
+    $out = @()
+    $out += New-Section 'HEALTH CHECK (from the statistic alone)'
+    if (-not $h) { $out += 'Nothing to check.'; return , $out }
+    $out += Format-AsciiTable -Rows $h -Columns Result, Finding, Detail
     return , $out
 }
 
@@ -1883,6 +2361,8 @@ function Format-StatsReport($D, $Info) {
     }
 
     $L.AddRange([string[]](Format-TraceFlag2388Section $D))
+    $L.AddRange([string[]](Format-StatsHealthSection $D))
+    $L.AddRange([string[]](Format-StatsEstimatesSection $D))
 
     if ($D.StringIndex) {
         $si = $D.StringIndex
@@ -1962,10 +2442,10 @@ function Format-StatsReport($D, $Info) {
 
 #region ---------------------------------------------------------------- server access
 
-function Invoke-Query($Connection, [string]$Sql, [hashtable]$Parameters = @{}) {
+function Invoke-Query($Connection, [string]$Sql, [hashtable]$Parameters = @{}, [int]$TimeoutSeconds = 120) {
     $cmd = $Connection.CreateCommand()
     $cmd.CommandText = $Sql
-    $cmd.CommandTimeout = 120
+    $cmd.CommandTimeout = $TimeoutSeconds
     foreach ($k in $Parameters.Keys) { $null = $cmd.Parameters.AddWithValue($k, $Parameters[$k]) }
     $da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
     $ds = New-Object System.Data.DataSet
@@ -2340,6 +2820,20 @@ function Format-Invariant([string]$Format) {
     return [string]::Format($script:Inv, $Format, [object[]]$args)
 }
 
+function Test-StatsCloneDatabase($Connection) {
+    # a statistics-only copy (DBCC CLONEDATABASE): statistics and row counts without the rows. Cached per database.
+    if (-not $script:CloneDatabases) { $script:CloneDatabases = @{} }
+    $key = "$($Connection.DataSource)|$($Connection.Database)"
+    if (-not $script:CloneDatabases.ContainsKey($key)) {
+        $v = $false
+        try { $v = [int](Invoke-Query $Connection "SELECT ISNULL(CAST(DATABASEPROPERTYEX(DB_NAME(), 'IsClone') AS int), 0) AS c")[0].Rows[0].c -eq 1 } catch { }
+        $script:CloneDatabases[$key] = $v
+    }
+    return $script:CloneDatabases[$key]
+}
+
+$script:CloneMessage = 'This database is a statistics-only clone (DBCC CLONEDATABASE): its tables hold no rows'
+
 function New-DataCheckResult([string]$Reason) {
     $r = [pscustomobject]@{ Result = 'Skipped'; Summary = [ordered]@{}; Findings = New-Object 'System.Collections.Generic.List[string]'; Steps = New-Object 'System.Collections.Generic.List[object]' }
     if ($Reason) { $r.Summary['Result'] = 'Skipped'; $r.Summary['Reason'] = $Reason; $r.Findings.Add("Not checked: $Reason") }
@@ -2360,6 +2854,7 @@ function Test-StatsAgainstData {
     $real = @($D.Histogram | Where-Object { -not $_.IsNullStep })
     $nullStep = @($D.Histogram | Where-Object { $_.IsNullStep }) | Select-Object -First 1
     $reason = $null
+    if (Test-StatsCloneDatabase $Connection) { return New-DataCheckResult "$($script:CloneMessage.Substring(0, 1).ToLower())$($script:CloneMessage.Substring(1)), so there is nothing to check the statistics against." }
     if ($Stat.has_filter) { $reason = 'filtered statistics are not checked yet.' }
     elseif ($Stat.Table.Columns.Contains('is_incremental') -and $Stat.is_incremental -eq $true) { $reason = 'incremental statistics are not checked yet.' }
     elseif (-not $D.Blob -or ($real.Count -eq 0 -and -not $nullStep)) { $reason = 'the statistics have no histogram.' }
@@ -2543,7 +3038,11 @@ ORDER BY SUM(au.data_pages), i.index_id;
     if ($checked.Count -gt 0) {
         if ($expectExact) {
             if ($differ -eq 0) { $findings.Add('FULLSCAN statistics with no modifications since the update: every range read matches the table exactly.') }
-            else {
+            elseif ($notChecked + $failed + $partial -eq 0 -and [Math]::Abs($tableTotal - [double]$D.Blob.Rows) -gt 0.1 * [Math]::Max(1.0, [double]$D.Blob.Rows)) {
+                # every range read, and the table's size itself is different: emptied or reloaded without counting modifications
+                $findings.Add((Format-Invariant ('The table holds {0:N0} rows now and the statistics {1:N0}, with no modifications counted since the update: it was emptied or reloaded in a way the ' +
+                            'modification counter does not see (TRUNCATE TABLE, a partition SWITCH, a reload after a truncate). The statistics describe the old rows; update them.') $tableTotal ([double]$D.Blob.Rows)))
+            } else {
                 $text = "These are FULLSCAN statistics with no modifications since the update, so every range should match the table exactly, but $differ range(s) do not. " +
                 'The statistics were probably loaded with UPDATE STATISTICS ... WITH STATS_STREAM, or rows changed while the check ran (it reads under READ UNCOMMITTED).'
                 if ($Stat.no_recompute -eq $true) { $text += ' NORECOMPUTE is on, as it often is for statistics loaded from an edited stream.' }
@@ -2620,19 +3119,6 @@ namespace SQLStatsXRay.Builder {
 
  public sealed class Score {
   public double EqMax, EqP95, EqGeoMean, EqP95ByRows, RangeMax, RangeP95, RangeGeoMean, ValuesOver10, ValuesAbove, Values;
-  public double WorkloadP95 = double.NaN, WorkloadGeoMean = double.NaN, WorkloadMax = double.NaN;
- }
-
- // Predicates on the column, read from Query Store plans: equality values and ranges (null = open end), with weights.
- public sealed class Workload {
-  public List<object> EqValues = new List<object>();
-  public List<double> EqWeights = new List<double>();
-  public List<object> Lo = new List<object>(), Hi = new List<object>();
-  public List<bool> LoInclusive = new List<bool>(), HiInclusive = new List<bool>();
-  public List<double> RangeWeights = new List<double>();
-  public void AddEquality(object v, double w) { EqValues.Add(v); EqWeights.Add(w); }
-  public void AddRange(object lo, bool loIncl, object hi, bool hiIncl, double w) { Lo.Add(lo); LoInclusive.Add(loIncl); Hi.Add(hi); HiInclusive.Add(hiIncl); RangeWeights.Add(w); }
-  public int Count { get { return EqValues.Count + Lo.Count; } }
  }
 
  // What a pilot sample says about the table: rows per page and how much the column's values cluster by page
@@ -2686,9 +3172,12 @@ namespace SQLStatsXRay.Builder {
    }
   }
 
-  public void Add(object raw, double n, double units) {
+  public void Add(object raw, double n, double units) { AddKeyed(TextKeys ? (object)(seq++) : Sortable(raw), raw, n, units); }
+
+  // A value with its key given (in key order): profiles that share one key space, like the sample advisor's.
+  public void AddKeyed(object key, object raw, double n, double units) {
    var e = new Entry();
-   e.Key = TextKeys ? (object)(seq++) : Sortable(raw); e.Raw = raw; e.Rows = n; e.LastRows = n; e.Distinct = 1; e.SumSq = n * n; e.Units = units; e.Ones = units == 1 ? 1 : 0;
+   e.Key = key; e.Raw = raw; e.Rows = n; e.LastRows = n; e.Distinct = 1; e.SumSq = n * n; e.Units = units; e.Ones = units == 1 ? 1 : 0;
    byte[] b = raw as byte[]; string s = raw as string;
    e.Bytes = b != null ? b.Length * n : (s != null && TextEncoding != null ? TextEncoding.GetByteCount(s) * n : 0);
    Entries.Add(e);
@@ -2736,7 +3225,7 @@ namespace SQLStatsXRay.Builder {
   }
   public int IndexOf(object key) { int i = IndexBelow(key, true); return i >= 0 && Compare(Entries[i].Key, key) == 0 ? i : -1; }
 
-  // An exactly counted value at its place in the order (the true minimum or maximum, a workload value): inserted when
+  // An exactly counted value at its place in the order (the true minimum or maximum): inserted when
   // the sample missed it, its count corrected when the sample saw it. Rows are in sample units (exact / scale).
   public void InsertExact(object raw, double rows) { InsertExact(raw, Sortable(raw), rows); }
   public void InsertExact(object raw, object key, double rows) {
@@ -3007,9 +3496,140 @@ namespace SQLStatsXRay.Builder {
   public string Name; public List<int> Keys; public List<Step> Steps; public Score Score; public double Seconds;
  }
 
+ // The sample advisor's one read: (value, page, rows) in key order, kept in flat lists so any page sample of the
+ // table can be replayed from memory. A page is in a sample of fraction f when its hash (with the seed) is below f,
+ // as TABLESAMPLE SYSTEM keeps or drops whole pages.
+ public sealed class SampleCache {
+  public List<object> Raw = new List<object>(), Key = new List<object>();
+  public List<int> Value = new List<int>(); public List<long> Page = new List<long>(); public List<double> Rows = new List<double>();
+  public double TotalRows; public long MaxRows = 30000000; public bool Truncated;
+
+  // columns: value, its DENSE_RANK in the column's order (equal values under the collation share one), page, rows
+  public void Read(IDataReader r, bool textKeys) {
+   long lastRank = long.MinValue; int vi = -1;
+   while (r.Read()) {
+    double n = Convert.ToDouble(r.GetValue(3));
+    long page = Pilot.PageOf(r.GetValue(2));
+    TotalRows += n;
+    if (r.IsDBNull(0)) { Value.Add(-1); Page.Add(page); Rows.Add(n); continue; }
+    long rank = Convert.ToInt64(r.GetValue(1));
+    if (rank != lastRank) {
+     object raw;
+     try { raw = r.GetValue(0); } catch (OverflowException) { raw = r.GetType().GetMethod("GetSqlValue", new[] { typeof(int) }).Invoke(r, new object[] { 0 }); }
+     Raw.Add(raw); Key.Add(textKeys ? (object)(double)rank : Profile.Sortable(raw)); vi = Raw.Count - 1; lastRank = rank;
+    }
+    Value.Add(vi); Page.Add(page); Rows.Add(n);
+    if (Value.Count >= MaxRows) { Truncated = true; break; }
+   }
+  }
+
+  public static double U(long page, int seed) {
+   ulong h = (ulong)page * 0x9E3779B97F4A7C15UL ^ (ulong)(seed + 1) * 0xC2B2AE3D27D4EB4FUL;
+   h ^= h >> 33; h *= 0xFF51AFD7ED558CCDUL; h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53UL; h ^= h >> 33;
+   return (h >> 11) * (1.0 / 9007199254740992.0);
+  }
+
+  // The profile of a page sample (fraction 1 = every row). Units are pages; OnesByRows counts values seen in one row,
+  // as a row-based distinct estimate (SQL Server's kind) needs.
+  public Profile Sample(double fraction, int seed, out double pages, out double onesByRows) {
+   var p = new Profile();
+   var seen = new HashSet<long>();
+   pages = 0; onesByRows = 0;
+   int i = 0, n = Value.Count;
+   while (i < n) {
+    int v = Value[i]; double rows = 0, units = 0; int j = i;
+    while (j < n && Value[j] == v) {
+     if (fraction >= 1 || U(Page[j], seed) < fraction) { rows += Rows[j]; units++; if (seen.Add(Page[j])) pages++; }
+     j++;
+    }
+    if (rows > 0) {
+     p.ReadRows += rows;
+     if (v < 0) p.NullRows += rows; else { p.AddKeyed(Key[v], Raw[v], rows, units); if (rows == 1) onesByRows++; }
+    }
+    i = j;
+   }
+   return p;
+  }
+ }
+
+ // One segment (a value of another column) against the target column: what the optimizer estimates for
+ // "segment = s AND target = x" from the two columns' own statistics, and what a filtered statistic on the segment gives.
+ public sealed class SegmentResult {
+  public object Raw; public bool IsNull; public double Rows, Values;
+  public double LegacyEqP95, NewEqP95, NewRangeP95, FilteredEqP95, FilteredRangeP95, NewEqGeoMean;
+ }
+
+ public static class Segments {
+  // rows: segment rank, segment value, target rank (null = NULL target), rows; any order. Ranks follow each column's order.
+  public static List<SegmentResult> Analyze(IDataReader r, double scale, double minRows, int ranges, int seed) {
+   var bySeg = new Dictionary<long, List<double[]>>(); var segRaw = new Dictionary<long, object>(); var segNull = new Dictionary<long, bool>();
+   var targetRows = new Dictionary<long, double>();
+   double total = 0;
+   while (r.Read()) {
+    double n = Convert.ToDouble(r.GetValue(3));
+    total += n;
+    long sk = Convert.ToInt64(r.GetValue(0));
+    if (!segRaw.ContainsKey(sk)) { segRaw[sk] = r.IsDBNull(1) ? null : r.GetValue(1); segNull[sk] = r.IsDBNull(1); bySeg[sk] = new List<double[]>(); }
+    double tk = r.IsDBNull(2) ? -1 : Convert.ToDouble(r.GetValue(2));
+    bySeg[sk].Add(new double[] { tk, n });
+    if (tk >= 0) { double t; targetRows.TryGetValue((long)tk, out t); targetRows[(long)tk] = t + n; }
+   }
+   var result = new List<SegmentResult>();
+   if (total <= 0) return result;
+   // the target's whole-column distribution in key order, for range selectivities
+   var keys = new List<long>(targetRows.Keys); keys.Sort();
+   var cum = new double[keys.Count + 1]; var pos = new Dictionary<long, int>();
+   for (int i = 0; i < keys.Count; i++) { cum[i + 1] = cum[i] + targetRows[keys[i]]; pos[keys[i]] = i; }
+   foreach (var kv in bySeg) {
+    double segRows = 0; foreach (var x in kv.Value) segRows += x[1];
+    if (segRows * scale < minRows) continue;
+    var res = new SegmentResult(); res.Raw = segRaw[kv.Key]; res.IsNull = segNull[kv.Key]; res.Rows = segRows * scale;
+    double ps = segRows / total;
+    // the segment's own rows per target value, in key order
+    var own = new SortedDictionary<long, double>();
+    foreach (var x in kv.Value) if (x[0] >= 0) { double t; own.TryGetValue((long)x[0], out t); own[(long)x[0]] = t + x[1]; }
+    res.Values = own.Count;
+    if (own.Count == 0) continue;
+    var qLegacy = new List<double>(); var qNew = new List<double>();
+    foreach (var o in own) {
+     double px = targetRows[o.Key] / total, act = o.Value * scale;
+     qLegacy.Add(Histogram.QError(total * scale * ps * px, act));
+     double lo = Math.Min(ps, px), hi = Math.Max(ps, px);
+     qNew.Add(Histogram.QError(total * scale * lo * Math.Sqrt(hi), act));   // exponential backoff (CE 120+)
+    }
+    res.LegacyEqP95 = P95(qLegacy); res.NewEqP95 = P95(qNew);
+    double lg = 0; foreach (var q in qNew) lg += Math.Log(q); res.NewEqGeoMean = Math.Exp(lg / qNew.Count);
+    // ranges of the target inside the segment: random ranges between two of the segment's own values (what a query on
+    // this segment asks for), estimated from the whole column's distribution between them
+    var ownCum = new double[keys.Count + 1];
+    for (int i = 0; i < keys.Count; i++) { double t; own.TryGetValue(keys[i], out t); ownCum[i + 1] = ownCum[i] + t; }
+    var ownAt = new List<int>(); foreach (var o in own) ownAt.Add(pos[o.Key]);
+    var rnd = new Random(seed); var qr = new List<double>();
+    for (int k = 0; k < ranges && ownAt.Count > 1; k++) {
+     int a = ownAt[rnd.Next(ownAt.Count)], b = ownAt[rnd.Next(ownAt.Count)]; if (a > b) { int t = a; a = b; b = t; }
+     double pr = (cum[b + 1] - cum[a]) / total, act = (ownCum[b + 1] - ownCum[a]) * scale;
+     double lo = Math.Min(ps, pr), hi = Math.Max(ps, pr);
+     qr.Add(Histogram.QError(total * scale * lo * Math.Sqrt(hi), act));
+    }
+    res.NewRangeP95 = P95(qr);
+    // a filtered statistic: a 200-step histogram of the segment's own rows, scored against them
+    var p = new Profile();
+    foreach (var o in own) p.AddKeyed((double)o.Key, null, o.Value, o.Value);
+    p.ReadRows = segRows;
+    var steps = Histogram.FromPositions(p, Histogram.MaxDiff(p, 200), scale);
+    var sc = Histogram.Evaluate(p, steps, 0, scale, ranges, seed);
+    res.FilteredEqP95 = sc.EqP95; res.FilteredRangeP95 = sc.RangeP95;
+    result.Add(res);
+   }
+   return result;
+  }
+
+  static double P95(List<double> q) { if (q.Count == 0) return 1; var a = q.ToArray(); Array.Sort(a); return a[Math.Min(a.Length - 1, (int)Math.Ceiling(0.95 * a.Length) - 1)]; }
+ }
+
  public static class Histogram {
   // Every algorithm's candidate, built and scored in parallel (the profile is only read).
-  public static Candidate[] BuildAll(Profile p, string[] names, int max, Workload w, double share, double scale, double nullEq, int ranges, int seed) {
+  public static Candidate[] BuildAll(Profile p, string[] names, int max, double scale, double nullEq, int ranges, int seed) {
    var result = new Candidate[names.Length];
    System.Threading.Tasks.Parallel.For(0, names.Length, delegate (int i) {
     var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -3019,13 +3639,11 @@ namespace SQLStatsXRay.Builder {
      case "MaxDiff": keys = MaxDiff(p, max); break;
      case "FrequentFirst": keys = FrequentFirst(p, max); break;
      case "VOptimal": keys = VOptimal(p, max); break;
-     case "Workload": keys = Workload(p, max, w, share); break;
      default: throw new ArgumentException("Unknown algorithm " + names[i]);
     }
     var c = new Candidate();
     c.Name = names[i]; c.Keys = keys; c.Steps = FromPositions(p, keys, scale);
     c.Score = Evaluate(p, c.Steps, nullEq, scale, ranges, seed);
-    EvaluateWorkload(p, c.Steps, scale, w, c.Score);
     c.Seconds = sw.Elapsed.TotalSeconds;
     result[i] = c;
    });
@@ -3090,7 +3708,16 @@ namespace SQLStatsXRay.Builder {
   }
   static List<int> All(int n) { var k = new List<int>(n); for (int i = 0; i < n; i++) k.Add(i); return k; }
 
-  // Equal rows per step.
+  // The four algorithms only differ in where they put the keys between the first and the last profile entry (the smallest
+  // and the largest value, always keys). Each returns entry positions; Finish adds both ends, and Fill splits the step
+  // with the most rows until all Max steps are used. With Max entries or fewer every entry is a key and all four agree.
+  // BuildAll scores every candidate the same way (Evaluate: each distinct value and random ranges).
+
+  // EqualRows (equi-depth): the same number of rows in every step. Walks the entries in order and makes a key each time
+  // the running total crosses another 1/(Max-1) of the rows.
+  //  Good at: ranges on evenly spread data; steps of predictable size.
+  //  Weak at: a frequent value that falls inside a step is averaged with its neighbours (AVG_RANGE_ROWS), so an equality
+  //  on it is far off. O(n).
   public static List<int> EqualRows(Profile p, int max) {
    int n = p.Entries.Count;
    if (n <= max) return All(n);
@@ -3102,7 +3729,11 @@ namespace SQLStatsXRay.Builder {
    return Finish(p, set, max);
   }
 
-  // Keys where the rows change most against both neighbours (close to SQL Server's own approach).
+  // MaxDiff: keys where the row count jumps. Each entry scores |rows - left neighbour's| + |rows - right neighbour's|, and
+  // the Max-2 highest scores become keys (close to how SQL Server picks its own steps).
+  //  Good at: spikes; a value much bigger or smaller than its neighbours becomes a key, with exact EQ_ROWS.
+  //  Weak at: noisy data, where it spends steps on small bumps and leaves long smooth stretches in a few wide steps.
+  //  O(n log n) for the sort.
   public static List<int> MaxDiff(Profile p, int max) {
    int n = p.Entries.Count;
    if (n <= max) return All(n);
@@ -3119,7 +3750,10 @@ namespace SQLStatsXRay.Builder {
    return Finish(p, set, max);
   }
 
-  // The values heavier than an average step become keys (EQ_ROWS exact for them); the rest by equal rows.
+  // FrequentFirst: frequent values get their own step. Every value with more rows than an average step (rows / (Max-1))
+  // becomes a key, heaviest first, so its EQ_ROWS is exact; the keys left split the other rows evenly, as EqualRows does.
+  //  Good at: a few very frequent values (a status, a default, a big tenant).
+  //  Weak at: many medium values; few or none qualify and it behaves like EqualRows. O(n + h log h), h heavy values.
   public static List<int> FrequentFirst(Profile p, int max) {
    int n = p.Entries.Count;
    if (n <= max) return All(n);
@@ -3143,29 +3777,15 @@ namespace SQLStatsXRay.Builder {
    return Finish(p, set, max);
   }
 
-  // Steps where the queries filter: their equality values become keys, and the edges of their ranges become the keys
-  // just before and at the end of each range (so the range is whole steps). About Share of the steps go to the workload,
-  // heaviest first; least variance places the rest.
-  public static List<int> Workload(Profile p, int max, Workload w, double share) {
-   int n = p.Entries.Count;
-   if (n <= max) return All(n);
-   var items = new List<KeyValuePair<double, int>>();
-   for (int i = 0; i < w.EqValues.Count; i++) { int x = p.IndexOf(w.EqValues[i]); if (x > 0) items.Add(new KeyValuePair<double, int>(w.EqWeights[i], x)); }
-   for (int i = 0; i < w.Lo.Count; i++) {
-    if (w.Lo[i] != null) { int x = p.IndexBelow(w.Lo[i], !w.LoInclusive[i]); if (x > 0) items.Add(new KeyValuePair<double, int>(w.RangeWeights[i], x)); }
-    if (w.Hi[i] != null) { int x = p.IndexBelow(w.Hi[i], w.HiInclusive[i]); if (x > 0) items.Add(new KeyValuePair<double, int>(w.RangeWeights[i], x)); }
-   }
-   items.Sort(delegate (KeyValuePair<double, int> a, KeyValuePair<double, int> b) { return b.Key.CompareTo(a.Key); });
-   var required = new bool[n]; int budget = (int)((max - 2) * share), used = 0;
-   foreach (var it in items) { if (used >= budget) break; if (it.Value < n - 1 && !required[it.Value]) { required[it.Value] = true; used++; } }
-   return VOptimal(p, max, required);
-  }
-
   public static List<int> VOptimal(Profile p, int max) { return VOptimal(p, max, null); }
 
-  // Least variance inside the steps (greedy v-optimal): start with one step per entry and merge the neighbouring pair
-  // whose merge adds the least squared error between each value's rows and the step's AVG_RANGE_ROWS. Required keys
-  // are never merged away.
+  // VOptimal (greedy v-optimal): values of similar size share a step. Start with one step per entry and keep merging the
+  // neighbouring pair whose merge adds the least squared error between each value's rows and the step's AVG_RANGE_ROWS,
+  // until Max steps are left. Required keys are never merged away.
+  //  Good at: equality estimates in general; the values inside a step really are close to AVG_RANGE_ROWS, so it is
+  //  often the best overall.
+  //  Weak at: speed on columns with many distinct values (a heap of every neighbouring pair, O(n log n) with the
+  //  largest constant of the four); ranges are not what it optimizes.
   public static List<int> VOptimal(Profile p, int max, bool[] required) {
    int n = p.Entries.Count;
    if (n <= max) return All(n);
@@ -3222,13 +3842,6 @@ namespace SQLStatsXRay.Builder {
   // Scores a histogram against the profile with the optimizer's equality rule (measured on SQL Server 2025): EQ_ROWS for
   // a value that is a step key, AVG_RANGE_ROWS for a value inside a step. Values above the last step are counted apart and
   // estimated at 1 row. Ranges: random ranges of profile entries, summed from the per-value estimates.
-  // Estimate of one value: EQ_ROWS on a step key, AVG_RANGE_ROWS inside a step, 1 above the last step.
-  public static double EstimateValue(IList<Step> steps, object key) {
-   int lo = 0, hi = steps.Count - 1, s = steps.Count;
-   while (lo <= hi) { int mid = (lo + hi) / 2; if (Profile.Compare(steps[mid].Key, key) >= 0) { s = mid; hi = mid - 1; } else lo = mid + 1; }
-   if (s == steps.Count) return 1;
-   return Profile.Compare(steps[s].Key, key) == 0 ? steps[s].Eq : steps[s].Avg;
-  }
 
   // Per entry: the estimate of its last value and of each of its other values, and running sums of estimated and
   // actual rows (ranges are differences of these sums).
@@ -3282,33 +3895,6 @@ namespace SQLStatsXRay.Builder {
    score.RangeGeoMean = rq.Length > 0 ? Math.Exp(rl / rq.Length) : 1;
    score.RangeP95 = Percentile(rq, null, 0.95);
    return score;
-  }
-
-  // The workload's own predicates, weighted by executions: equality values and ranges, estimate against the profile.
-  public static void EvaluateWorkload(Profile p, IList<Step> steps, double scale, Workload w, Score score) {
-   int n = p.Entries.Count;
-   if (w == null || w.Count == 0 || n == 0) return;
-   var estLast = new double[n]; var estInner = new double[n]; var pe = new double[n + 1]; var pa = new double[n + 1];
-   Estimates(p, steps, scale, estLast, estInner, pe, pa, null);
-   var qs = new List<double>(); var ws = new List<double>();
-   for (int i = 0; i < w.EqValues.Count; i++) {
-    int x = p.IndexOf(w.EqValues[i]);
-    double est = x >= 0 ? estLast[x] : EstimateValue(steps, w.EqValues[i]);
-    double act = x >= 0 ? p.Entries[x].LastRows * scale : 0;
-    qs.Add(QError(est, act)); ws.Add(w.EqWeights[i]);
-   }
-   for (int i = 0; i < w.Lo.Count; i++) {
-    int from = w.Lo[i] == null ? 0 : p.IndexBelow(w.Lo[i], !w.LoInclusive[i]) + 1;
-    int to = w.Hi[i] == null ? n - 1 : p.IndexBelow(w.Hi[i], w.HiInclusive[i]);
-    double est = to >= from ? pe[to + 1] - pe[from] : 0, act = to >= from ? pa[to + 1] - pa[from] : 0;
-    qs.Add(QError(est, act)); ws.Add(w.RangeWeights[i]);
-   }
-   double[] q = qs.ToArray(), wv = ws.ToArray();
-   double tw = 0, lg = 0, mx = 0;
-   for (int i = 0; i < q.Length; i++) { tw += wv[i]; lg += wv[i] * Math.Log(q[i]); if (q[i] > mx) mx = q[i]; }
-   score.WorkloadGeoMean = tw > 0 ? Math.Exp(lg / tw) : 1;
-   score.WorkloadP95 = Percentile(q, wv, 0.95);
-   score.WorkloadMax = mx;
   }
 
   public static double QError(double est, double act) {
@@ -3595,7 +4181,7 @@ function New-StatsBuildProfile($Target, $Connection, $Plan) {
 
 function Get-StatsBuildRanks($Connection, $Target, $Profile, [object[]]$Values) {
     <#
-      Positions of outside values (the current histogram's keys, Query Store values, the true minimum and maximum) among a
+      Positions of outside values (the current histogram's keys, the true minimum and maximum) among a
       text profile's keys, in the column's collation: the profile key itself when equal, otherwise a fraction between the
       two keys around it (values in the same gap get distinct fractions in their own order, equal values the same one).
       One sort on the server of the profile's keys and the values together.
@@ -3651,164 +4237,6 @@ JOIN sys.allocation_units au ON au.container_id = p.partition_id AND au.type = 1
 WHERE ic.object_id = @o AND c.name = @c AND ic.key_ordinal = 1 AND i.type IN (1, 2) AND i.is_disabled = 0 AND i.is_hypothetical = 0 AND i.has_filter = 0
 GROUP BY i.index_id, i.name ORDER BY SUM(au.data_pages), i.index_id;
 '@ @{ '@o' = $ObjectId; '@c' = $ColumnName })[0].Rows)[0]
-}
-
-function Get-StatsBuildWorkload($Connection, [string]$SchemaName, [string]$TableName, $Columns, [int]$MaxPlans = 500) {
-    <#
-      Predicates on the table's columns from Query Store: the plans that reference the table (heaviest 500 by
-      executions), their seek keys and comparison predicates against constants or parameters (compiled values only),
-      weighted by the plan's executions, and the statistics each plan used. Returns one entry per column plus the
-      statistics usage. Values are converted to the column's type on the server.
-    #>
-    $result = @{ Status = ''; Plans = 0; Executions = 0; StatsUsage = @{}; Columns = @{} }
-    foreach ($c in $Columns) { $result.Columns[$c.Name] = [pscustomobject]@{ Workload = (New-Object SQLStatsXRay.Builder.Workload); Equality = 0; Ranges = 0; Unread = 0; EqWeight = 0.0; RangeWeight = 0.0; Plans = 0 } }
-    try { $state = [string](Invoke-Query $Connection 'SELECT actual_state_desc FROM sys.database_query_store_options')[0].Rows[0].actual_state_desc }
-    catch { $result.Status = "Query Store not readable: $($_.Exception.Message)"; return $result }
-    if ($state -eq 'OFF' -or -not $state) { $result.Status = 'Query Store is off in this database.'; return $result }
-    $like = { param([string]$s) $s.Replace('[', '[[]').Replace('%', '[%]').Replace('_', '[_]') }
-    $tableAttr = '[' + $TableName.Replace(']', ']]') + ']'
-    $schemaAttr = '[' + $SchemaName.Replace(']', ']]') + ']'
-    $plans = @((Invoke-Query $Connection @'
-SELECT TOP (@n) p.plan_id, p.query_plan, x.executions
-FROM (SELECT plan_id, SUM(count_executions) AS executions FROM sys.query_store_runtime_stats GROUP BY plan_id) x
-JOIN sys.query_store_plan p ON p.plan_id = x.plan_id
-WHERE p.query_plan LIKE @pattern
-ORDER BY x.executions DESC;
-'@ @{ '@n' = $MaxPlans; '@pattern' = '%Table="' + (& $like $tableAttr) + '"%' })[0].Rows)
-    $result.Plans = $plans.Count
-    $result.Status = "Query Store $($state.ToLower()): $($plans.Count) plan(s) reference the table."
-    $ns = 'http://schemas.microsoft.com/sqlserver/2004/07/showplan'
-    $flip = @{ LT = 'GT'; LE = 'GE'; GT = 'LT'; GE = 'LE'; EQ = 'EQ' }
-    $pending = New-Object 'System.Collections.Generic.List[object]'   # value texts to convert: column, kind, text(s), weight
-    $isOurs = {
-        param($ref, [string]$col)
-        # showplan writes Table="[T]" with brackets and Column="c" without
-        $ref.GetAttribute('Table') -eq $tableAttr -and $ref.GetAttribute('Column') -eq $col -and (-not $ref.GetAttribute('Schema') -or $ref.GetAttribute('Schema') -eq $schemaAttr)
-    }
-    foreach ($row in $plans) {
-        $w = [double]$row.executions
-        $result.Executions += $w
-        try { $x = [xml][string]$row.query_plan } catch { continue }
-        $m = New-Object Xml.XmlNamespaceManager $x.NameTable; $m.AddNamespace('p', $ns)
-        $params = @{}
-        foreach ($pr in $x.SelectNodes('//p:ParameterList/p:ColumnReference', $m)) { $params[$pr.GetAttribute('Column')] = $pr.GetAttribute('ParameterCompiledValue') }
-        # a value from a scalar operator: a constant, or a parameter with its compiled value
-        $valueOf = {
-            param($op)
-            $const = $op.SelectSingleNode('.//p:Const', $m)
-            if ($const) { return $const.GetAttribute('ConstValue') }
-            foreach ($ref in $op.SelectNodes('.//p:Identifier/p:ColumnReference', $m)) {
-                $n = $ref.GetAttribute('Column')
-                if ($n.StartsWith('@') -and $params.ContainsKey($n) -and $params[$n]) { return $params[$n] }
-            }
-            return $null
-        }
-        foreach ($st in $x.SelectNodes('//p:OptimizerStatsUsage/p:StatisticsInfo', $m)) {
-            if ($st.GetAttribute('Table') -eq $tableAttr -and (-not $st.GetAttribute('Schema') -or $st.GetAttribute('Schema') -eq $schemaAttr)) {
-                $sn = $st.GetAttribute('Statistics').Trim('[', ']')
-                $result.StatsUsage[$sn] = [double]$result.StatsUsage[$sn] + $w
-            }
-        }
-        foreach ($c in $Columns) {
-            $info = $result.Columns[$c.Name]; $seen = $false
-            # seeks: Prefix EQ, StartRange / EndRange of the same SeekKeys
-            foreach ($sk in $x.SelectNodes('//p:SeekKeys', $m)) {
-                $lo = $null; $hi = $null; $loIncl = $true; $hiIncl = $true; $hasRange = $false
-                foreach ($part in $sk.ChildNodes) {
-                    $refs = @($part.SelectNodes('p:RangeColumns/p:ColumnReference', $m))
-                    for ($i = 0; $i -lt $refs.Count; $i++) {
-                        if (-not (& $isOurs $refs[$i] $c.Name)) { continue }
-                        $seen = $true
-                        $op = @($part.SelectNodes('p:RangeExpressions/p:ScalarOperator', $m))[$i]
-                        $v = $(if ($op) { & $valueOf $op } else { $null })
-                        $scan = $part.GetAttribute('ScanType')
-                        if ($part.LocalName -eq 'Prefix' -and $scan -eq 'EQ') {
-                            $info.EqWeight += $w
-                            if ($null -ne $v) { $pending.Add(@($c.Name, 'eq', $v, $w)) } else { $info.Unread++ }
-                        } elseif ($part.LocalName -eq 'StartRange') { $hasRange = $true; $lo = $v; $loIncl = $scan -eq 'GE'; if ($null -eq $v) { $info.Unread++ } }
-                        elseif ($part.LocalName -eq 'EndRange') { $hasRange = $true; $hi = $v; $hiIncl = $scan -eq 'LE'; if ($null -eq $v) { $info.Unread++ } }
-                    }
-                }
-                if ($hasRange) {
-                    $info.RangeWeight += $w
-                    if ($null -ne $lo -or $null -ne $hi) { $pending.Add(@($c.Name, 'range', @($lo, $loIncl, $hi, $hiIncl), $w)) }
-                }
-            }
-            # residual and filter predicates: column <op> constant or parameter
-            foreach ($cmp in $x.SelectNodes('//p:Compare', $m)) {
-                $op = $cmp.GetAttribute('CompareOp')
-                if (-not $flip.ContainsKey($op)) { continue }
-                $sides = @($cmp.SelectNodes('p:ScalarOperator', $m))
-                if ($sides.Count -ne 2) { continue }
-                $mine = { param($s) foreach ($r in $s.SelectNodes('.//p:Identifier/p:ColumnReference', $m)) { if (& $isOurs $r $c.Name) { return $true } }; return $false }
-                if (& $mine $sides[0]) { $other = $sides[1] } elseif (& $mine $sides[1]) { $other = $sides[0]; $op = $flip[$op] } else { continue }
-                if ($other.SelectSingleNode('.//p:Identifier/p:ColumnReference[not(starts-with(@Column, "@"))]', $m)) { continue }   # column against column (a join)
-                $seen = $true
-                $v = & $valueOf $other
-                if ($op -eq 'EQ') { $info.EqWeight += $w } else { $info.RangeWeight += $w }
-                if ($null -eq $v) { $info.Unread++; continue }
-                switch ($op) {
-                    'EQ' { $pending.Add(@($c.Name, 'eq', $v, $w)) }
-                    'GT' { $pending.Add(@($c.Name, 'range', @($v, $false, $null, $true), $w)) }
-                    'GE' { $pending.Add(@($c.Name, 'range', @($v, $true, $null, $true), $w)) }
-                    'LT' { $pending.Add(@($c.Name, 'range', @($null, $true, $v, $false), $w)) }
-                    'LE' { $pending.Add(@($c.Name, 'range', @($null, $true, $v, $true), $w)) }
-                }
-            }
-            if ($seen) { $info.Plans++ }
-        }
-    }
-    if ($pending.Count -eq 0) { return $result }
-    # values as text from the plans ((42), N'x', '2025-01-01', {guid'...'}) converted to the column's type on the server
-    $clean = {
-        param([string]$s)
-        if ($null -eq $s) { return $null }
-        $t = $s.Trim()
-        while ($t.StartsWith('(') -and $t.EndsWith(')')) { $t = $t.Substring(1, $t.Length - 2).Trim() }
-        if ($t -match "^\{guid'(.*)'\}$") { return $Matches[1] }
-        if ($t -match "^N?'(.*)'$") { return $Matches[1].Replace("''", "'") }
-        return $t
-    }
-    $texts = New-Object 'System.Collections.Generic.List[object]'   # column, text
-    foreach ($p in $pending) {
-        if ($p[1] -eq 'eq') { $texts.Add(@($p[0], (& $clean $p[2]))) }
-        else { foreach ($v in @($p[2][0], $p[2][2])) { if ($null -ne $v) { $texts.Add(@($p[0], (& $clean $v))) } } }
-    }
-    $typed = @{}
-    $byColumn = $texts | Group-Object { $_[0] }
-    foreach ($g in $byColumn) {
-        $col = $Columns | Where-Object { $_.Name -eq $g.Name } | Select-Object -First 1
-        $style = $(if ($col.SystemTypeId -in 173, 165) { ', 1' } else { '' })
-        $distinctTexts = @($g.Group | ForEach-Object { $_[1] } | Select-Object -Unique)
-        for ($i = 0; $i -lt $distinctTexts.Count; $i += 500) {
-            $chunk = @($distinctTexts[$i..([Math]::Min($i + 499, $distinctTexts.Count - 1))])
-            $values = ($chunk | ForEach-Object -Begin { $k = 0 } -Process { "($k, N'" + ([string]$_).Replace("'", "''") + "')"; $k++ }) -join ', '
-            $cmd = $Connection.CreateCommand()
-            $cmd.CommandText = "SELECT v.i, TRY_CONVERT($($col.ColumnType), v.s$style) FROM (VALUES $values) v(i, s);"
-            $r = $cmd.ExecuteReader()
-            try {
-                while ($r.Read()) {
-                    if ($r.IsDBNull(1)) { continue }
-                    $raw = $(try { $r.GetValue(1) } catch { $r.GetSqlValue(1) })
-                    # text values stay strings: the server ranks them against the profile in the column's collation later
-                    $typed["$($g.Name)|$($chunk[[int]$r.GetValue(0)])"] = $(if ($col.IsText) { [string]$raw } else { [SQLStatsXRay.Builder.Profile]::Sortable($raw) })
-                }
-            } finally { $r.Close() }
-        }
-    }
-    $get = { param([string]$col, $text) if ($null -eq $text) { return $null }; $typed["$col|$(& $clean $text)"] }
-    foreach ($p in $pending) {
-        $info = $result.Columns[$p[0]]
-        if ($p[1] -eq 'eq') {
-            $v = & $get $p[0] $p[2]
-            if ($null -eq $v) { $info.Unread++ } else { $info.Workload.AddEquality($v, $p[3]); $info.Equality++ }
-        } else {
-            $lo = & $get $p[0] $p[2][0]; $hi = & $get $p[0] $p[2][2]
-            if (($null -ne $p[2][0] -and $null -eq $lo) -or ($null -ne $p[2][2] -and $null -eq $hi)) { $info.Unread++; continue }
-            $info.Workload.AddRange($lo, [bool]$p[2][1], $hi, [bool]$p[2][3], $p[3]); $info.Ranges++
-        }
-    }
-    return $result
 }
 
 function Get-AdaptiveSamplePlan($Connection, $Target, [string]$Sample, [int]$Seed, [int]$TimeoutSeconds, [double]$Limit = 4, [switch]$TableOnly) {
@@ -3903,17 +4331,16 @@ function Invoke-StatsBuildRefine($Connection, $Target, $Column, $Steps, [string]
 
 function Invoke-StatsBuildColumn {
     <#
-      The histogram of one statistics object from a profile already read: candidates from every algorithm (Workload when
-      the workload has values), the current statistics scored on the same data, the best one by the objective (the
-      workload when it has values, ranges when the workload filters mostly by range, equality otherwise), the adaptive
-      sampler's exact EQ_ROWS, and the stream.
+      The histogram of one statistics object from a profile already read: candidates from every algorithm, the current
+      statistics scored on the same data, the best one by equality estimates, the adaptive sampler's exact EQ_ROWS, and
+      the stream.
     #>
-    param($Connection, $Target, $Template, $Profile, $Plan, [double]$TableRows, [string[]]$Algorithms, $WorkloadInfo, [int]$Seed, [int]$TimeoutSeconds)
+    param($Connection, $Target, $Template, $Profile, $Plan, [double]$TableRows, [string[]]$Algorithms, [int]$Seed, [int]$TimeoutSeconds)
     $p = $Profile
     if ($p.Entries.Count -eq 0) { throw "No values read from [$($Target.Column)]: the table is empty or the column is all NULL." }
     $scale = $(if ($Plan.Full -or $p.ReadRows -le 0) { 1.0 } else { $TableRows / $p.ReadRows })
     $col = $Template.Columns[0]
-    $refined = 0; $index = $null; $refinedWorkload = 0; $isText = [bool]$Target.IsText
+    $refined = 0; $index = $null; $isText = [bool]$Target.IsText
     $mmValues = @()
     if ($Plan.Sampler -eq 'Adaptive' -and -not $Plan.Full) {
         # the true minimum and maximum, with exact counts, when an index makes them cheap (the first step must be the minimum)
@@ -3924,7 +4351,6 @@ function Invoke-StatsBuildColumn {
             $mmValues = @(@($mm.lo, $mm.hi) | Where-Object { $_ -isnot [DBNull] -and $null -ne $_ })
         }
     }
-    $wq = $(if ($WorkloadInfo -and $WorkloadInfo.Workload.Count -gt 0) { $WorkloadInfo.Workload } else { $null })
     $currentKeys = @()
     if ($Target.Stat -and $Template.Label -ne 'template') { $currentKeys = @($Template.Histogram | Where-Object { -not $_.IsNullStep } | ForEach-Object { $_.RangeHiKey }) }
     # sort keys of outside values: the value itself, or for text its position among the profile's keys in the column's
@@ -3932,7 +4358,7 @@ function Invoke-StatsBuildColumn {
     $rank = New-Object 'System.Collections.Generic.Dictionary[string,double]' ([StringComparer]::Ordinal)
     if ($isText) {
         $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-        $outside = @($mmValues) + @($currentKeys) + $(if ($wq) { @($wq.EqValues) + @($wq.Lo) + @($wq.Hi) } else { @() })
+        $outside = @($mmValues) + @($currentKeys)
         $texts = @($outside | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ } | Where-Object { $seen.Add($_) })
         $ranks = Get-StatsBuildRanks $Connection $Target $p $texts
         for ($i = 0; $i -lt $texts.Count; $i++) { $rank[$texts[$i]] = $ranks[$i] }
@@ -3945,30 +4371,11 @@ function Invoke-StatsBuildColumn {
             $null = Invoke-StatsBuildRefine $Connection $Target $col $one $index $TimeoutSeconds
             $p.InsertExact($v, $st.Key, $st.Eq / $scale)
         }
-        # the workload's equality values, heaviest first (up to 200 seeks): a sample rarely holds light values
-        if ($wq -and $wq.EqValues.Count -gt 0) {
-            $order = @(0..($wq.EqValues.Count - 1) | Sort-Object { $wq.EqWeights[$_] } -Descending | Select-Object -First 200)
-            $one = New-Object 'System.Collections.Generic.List[SQLStatsXRay.Builder.Step]'
-            # workload values are kept sortable (SqlGuid, SqlBinary, SqlDecimal); back to plain values for the seeks and keys
-            $values = @($order | ForEach-Object { $v = $wq.EqValues[$_]; if ($v -is [Data.SqlTypes.SqlGuid] -or $v -is [Data.SqlTypes.SqlBinary]) { $v.Value } else { $v } })
-            foreach ($v in $values) { $st = New-Object SQLStatsXRay.Builder.Step; $st.Raw = $v; $st.Key = & $keyOf $wq.EqValues[$order[$one.Count]]; $one.Add($st) }
-            $null = Invoke-StatsBuildRefine $Connection $Target $col $one $index $TimeoutSeconds
-            foreach ($st in $one) { if ($st.Eq -gt 0) { $p.InsertExact($st.Raw, $st.Key, $st.Eq / $scale) } }
-            $refinedWorkload = $one.Count
-        }
     }
-    $workload = $wq
-    if ($wq -and $isText) {
-        # the same predicates, with ranked keys
-        $workload = New-Object SQLStatsXRay.Builder.Workload
-        for ($i = 0; $i -lt $wq.EqValues.Count; $i++) { $workload.AddEquality((& $keyOf $wq.EqValues[$i]), $wq.EqWeights[$i]) }
-        for ($i = 0; $i -lt $wq.Lo.Count; $i++) { $workload.AddRange((& $keyOf $wq.Lo[$i]), $wq.LoInclusive[$i], (& $keyOf $wq.Hi[$i]), $wq.HiInclusive[$i], $wq.RangeWeights[$i]) }
-    }
-    $objective = $(if ($workload) { 'workload' } elseif ($WorkloadInfo -and $WorkloadInfo.RangeWeight -gt $WorkloadInfo.EqWeight) { 'ranges' } else { 'equality' })
-    $names = @($Algorithms | Where-Object { $_ -ne 'Workload' -or $workload })
+    $objective = 'equality'
     $candidates = New-Object 'System.Collections.Generic.List[object]'
     # every algorithm at once, in parallel (C#)
-    foreach ($x in [SQLStatsXRay.Builder.Histogram]::BuildAll($p, [string[]]$names, 200, $workload, 0.5, $scale, $p.NullRows * $scale, 1000, $Seed)) {
+    foreach ($x in [SQLStatsXRay.Builder.Histogram]::BuildAll($p, [string[]]@($Algorithms), 200, $scale, $p.NullRows * $scale, 1000, $Seed)) {
         $candidates.Add([pscustomobject]@{ Name = $x.Name; Steps = $x.Steps; NullEq = $p.NullRows * $scale; Score = $x.Score; Seconds = $x.Seconds; Current = $false })
     }
     $current = $null
@@ -3981,14 +4388,9 @@ function Invoke-StatsBuildColumn {
         }
         $nullEq = [double]$Template.Blob.NullStepEqRows
         $score = [SQLStatsXRay.Builder.Histogram]::Evaluate($p, $cs, $nullEq, $scale, 1000, $Seed)
-        [SQLStatsXRay.Builder.Histogram]::EvaluateWorkload($p, $cs, $scale, $workload, $score)
         $current = [pscustomobject]@{ Name = 'SQL Server (current)'; Steps = $cs; NullEq = $nullEq; Score = $score; Seconds = 0; Current = $true }
     }
-    $best = switch ($objective) {
-        'workload' { $candidates | Sort-Object { $_.Score.WorkloadP95 }, { $_.Score.WorkloadGeoMean }, { $_.Score.EqP95 } | Select-Object -First 1 }
-        'ranges' { $candidates | Sort-Object { $_.Score.RangeP95 }, { $_.Score.RangeGeoMean }, { $_.Score.EqP95 } | Select-Object -First 1 }
-        default { $candidates | Sort-Object { $_.Score.EqP95 }, { $_.Score.RangeGeoMean } | Select-Object -First 1 }
-    }
+    $best = $candidates | Sort-Object { $_.Score.EqP95 }, { $_.Score.RangeGeoMean } | Select-Object -First 1
     if ($index) { $refined = Invoke-StatsBuildRefine $Connection $Target $col $best.Steps $index $TimeoutSeconds }
 
     $distinct = $p.DistinctValues()
@@ -4006,7 +4408,7 @@ function Invoke-StatsBuildColumn {
     $stream = New-StatsBuildStream $Template $best.Steps $built
     [pscustomobject]@{
         Target = $Target; Template = $Template; Plan = $Plan; Profile = $p; Scale = $scale; TableRows = $TableRows; Distinct = $distinct
-        Candidates = $candidates.ToArray(); Current = $current; Best = $best; Objective = $objective; Workload = $WorkloadInfo; Refined = $refined; RefinedWorkload = $refinedWorkload; RefineIndex = $index; Stream = $stream
+        Candidates = $candidates.ToArray(); Current = $current; Best = $best; Objective = $objective; Refined = $refined; RefineIndex = $index; Stream = $stream
     }
 }
 
@@ -4053,37 +4455,31 @@ function Get-StatsBuildNotes($C, [string]$StatName) {
     @(
         "[$StatName] on column [$($C.Target.Column)]: algorithm $($C.Best.Name), objective $($C.Objective)$(if ($C.Refined) { ", EQ_ROWS counted exactly for $($C.Refined) keys" })"
         "  Sample: $sample"
-        (Format-Invariant '  Score: equality p95 {0:0.##}, worst {1:0.##}; ranges geometric mean {2:0.###}{3}' $C.Best.Score.EqP95 $C.Best.Score.EqMax $C.Best.Score.RangeGeoMean $(if (-not [double]::IsNaN($C.Best.Score.WorkloadP95)) { Format-Invariant '; workload p95 {0:0.##}' $C.Best.Score.WorkloadP95 } else { '' }))
+        (Format-Invariant '  Score: equality p95 {0:0.##}, worst {1:0.##}; ranges geometric mean {2:0.###}' $C.Best.Score.EqP95 $C.Best.Score.EqMax $C.Best.Score.RangeGeoMean)
     )
 }
 
 function Invoke-StatsBuild {
     <#
       Builds a histogram for one column: reads the column's values (every row, SQL Server's sample or the adaptive
-      sample), reads the Query Store workload on the column, runs the histogram algorithms, scores every candidate and
-      the current statistics against the rows read, and writes the script that loads the best candidate. Nothing is
-      changed on the server.
+      sample), runs the histogram algorithms, scores every candidate and the current statistics against the rows read,
+      and writes the script that loads the best candidate. Nothing is changed on the server.
     #>
     param($Connection, [string]$Database, [string]$TableName, [string]$StatName, [string]$ColumnName, [string]$Sample = 'Default',
-        [string]$Sampler = 'SqlServer', [string[]]$Algorithms, [string]$NewStatName, [bool]$NoRecompute, [int]$Seed = 1, [int]$TimeoutSeconds = 0, [bool]$UseWorkload = $true, [double]$AdaptiveLimit = 4)
+        [string]$Sampler = 'SqlServer', [string[]]$Algorithms, [string]$NewStatName, [bool]$NoRecompute, [int]$Seed = 1, [int]$TimeoutSeconds = 0, [double]$AdaptiveLimit = 4)
     Initialize-StatsBuilder
-    if (-not $Algorithms) { $Algorithms = 'EqualRows', 'MaxDiff', 'FrequentFirst', 'VOptimal', 'Workload' }
+    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to build from." }
+    if (-not $Algorithms) { $Algorithms = 'EqualRows', 'MaxDiff', 'FrequentFirst', 'VOptimal' }
     $target = Get-StatsBuildTarget $Connection $TableName $StatName $ColumnName
     $template = Get-StatsBuildTemplate $Connection $target
     $plan = $(if ($Sampler -eq 'Adaptive') { Get-AdaptiveSamplePlan $Connection $target $Sample $Seed $TimeoutSeconds $AdaptiveLimit } else { $x = Get-SqlServerSamplePlan $target.Rows $target.Pages $Sample; $x.Sampler = 'SqlServer'; $x })
     $read = Read-StatsBuildProfile $Connection $target $plan $Seed $TimeoutSeconds
     $tableRows = $(if ($plan.Full) { $read.Profile.ReadRows } else { [double]$target.Rows })
-    $wl = $null; $wlStatus = 'not read'
-    if ($UseWorkload) {
-        $w = Get-StatsBuildWorkload $Connection $target.SchemaName $target.TableName @([pscustomobject]@{ Name = $target.Column; ColumnType = $target.ColumnType; SystemTypeId = $target.SystemTypeId; IsText = $target.IsText })
-        $wl = $w.Columns[$target.Column]; $wlStatus = $w.Status
-    }
-    $c = Invoke-StatsBuildColumn $Connection $target $template $read.Profile $plan $tableRows $Algorithms $wl $Seed $TimeoutSeconds
+    $c = Invoke-StatsBuildColumn $Connection $target $template $read.Profile $plan $tableRows $Algorithms $Seed $TimeoutSeconds
     $isNew = -not $target.Stat
     $statName = $(if ($isNew) { $(if ($NewStatName) { $NewStatName } else { "xray_$($target.Column)" }) } else { $target.StatName })
     $item = [pscustomobject]@{ Target = $target; Bytes = $c.Stream.Bytes; StatName = $statName; IsNew = $isNew; Original = $(if ($c.Current) { [byte[]]$template.Raw }); Notes = (Get-StatsBuildNotes $c $statName) }
     $c | Add-Member ReadSeconds $read.Seconds
-    $c | Add-Member WorkloadStatus $wlStatus
     $c | Add-Member StatName $statName
     $c | Add-Member IsNew $isNew
     $c | Add-Member Script (New-StatsBuildScript $Database @($item) $NoRecompute)
@@ -4097,17 +4493,18 @@ function Invoke-StatsBuildTable {
       statistics object on that column.
     #>
     param($Connection, [string]$Database, [string]$TableName, [string]$Sample = 'Default', [string]$Sampler = 'SqlServer', [string[]]$Algorithms,
-        [bool]$NoRecompute, [int]$Seed = 1, [int]$TimeoutSeconds = 0, [bool]$UseWorkload = $true, [double]$AdaptiveLimit = 4)
+        [bool]$NoRecompute, [int]$Seed = 1, [int]$TimeoutSeconds = 0, [double]$AdaptiveLimit = 4)
     Initialize-StatsBuilder
-    if (-not $Algorithms) { $Algorithms = 'EqualRows', 'MaxDiff', 'FrequentFirst', 'VOptimal', 'Workload' }
+    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to build from." }
+    if (-not $Algorithms) { $Algorithms = 'EqualRows', 'MaxDiff', 'FrequentFirst', 'VOptimal' }
     $all = Get-StatsTargets $Connection $TableName $null
     $eligible = New-Object 'System.Collections.Generic.List[object]'; $skipped = New-Object 'System.Collections.Generic.List[object]'
     foreach ($st in $all.Stats) {
         $name = [string]$st.name
         try {
             $t = Get-StatsBuildTarget $Connection $TableName $name $null 3>$null
+            # an empty statistic gets its record layout from a temporary one-row statistic, as a single build does
             $tpl = Get-StatsBuildTemplate $Connection $t
-            if ($tpl.Label -eq 'template') { throw 'the statistics are empty (no histogram to replace).' }
             $eligible.Add([pscustomobject]@{ Name = $name; Target = $t; Template = $tpl })
         } catch { $skipped.Add([pscustomobject]@{ Name = $name; Reason = $_.Exception.Message }) }
     }
@@ -4123,23 +4520,72 @@ function Invoke-StatsBuildTable {
     $read = Read-StatsBuildShared $Connection $first $columns $plan $Seed $TimeoutSeconds
     $anyProfile = @($read.Profiles.Values)[0]
     $tableRows = $(if ($plan.Full) { $anyProfile.ReadRows } else { [double]$first.Rows })
-    $w = $null
-    if ($UseWorkload) { $w = Get-StatsBuildWorkload $Connection $first.SchemaName $first.TableName @($columns | ForEach-Object { [pscustomobject]@{ Name = $_.Column; ColumnType = $_.ColumnType; SystemTypeId = $_.SystemTypeId; IsText = $_.IsText } }) }
     $results = New-Object 'System.Collections.Generic.List[object]'; $items = New-Object 'System.Collections.Generic.List[object]'
     foreach ($e in $eligible) {
         try {
-            $c = Invoke-StatsBuildColumn $Connection $e.Target $e.Template $read.Profiles[$e.Target.Column] $plan $tableRows $Algorithms $(if ($w) { $w.Columns[$e.Target.Column] }) $Seed $TimeoutSeconds
+            $c = Invoke-StatsBuildColumn $Connection $e.Target $e.Template $read.Profiles[$e.Target.Column] $plan $tableRows $Algorithms $Seed $TimeoutSeconds
             $c | Add-Member StatName $e.Name
-            $c | Add-Member Usage $(if ($w -and $w.StatsUsage.ContainsKey($e.Name)) { $w.StatsUsage[$e.Name] } else { 0 })
             $results.Add($c)
             $items.Add([pscustomobject]@{ Target = $e.Target; Bytes = $c.Stream.Bytes; StatName = $e.Name; IsNew = $false; Original = [byte[]]$e.Template.Raw; Notes = (Get-StatsBuildNotes $c $e.Name) })
         } catch { $skipped.Add([pscustomobject]@{ Name = $e.Name; Reason = $_.Exception.Message }) }
     }
     [pscustomobject]@{
         Table = $first.Table; Target = $first; Plan = $plan; ReadSeconds = $read.Seconds; TableRows = $tableRows; RowsRead = $anyProfile.ReadRows; Columns = $columns.Count
-        Results = $results.ToArray(); Skipped = $skipped.ToArray(); WorkloadStatus = $(if ($w) { $w.Status } else { 'not read' })
+        Results = $results.ToArray(); Skipped = $skipped.ToArray()
         Script = $(if ($items.Count) { New-StatsBuildScript $Database $items.ToArray() $NoRecompute } else { '' })
     }
+}
+
+# The histogram algorithms in words: the reports, the app's Build dialog and its All algorithms tab read this table, so they
+# say the same thing (the README and the C# comments follow the same wording).
+$script:BuildAlgorithms = [ordered]@{
+    EqualRows     = [pscustomobject]@{
+        Short = 'the same number of rows in every step'
+        How   = 'Walks the values in order and closes a step each time it has gathered another 1/199 of the rows (equi-depth).'
+        Good  = 'Ranges on evenly spread data; steps of predictable size'
+        Weak  = 'A frequent value that falls inside a step is averaged with its neighbours (AVG_RANGE_ROWS), so an equality on it is far off'
+    }
+    MaxDiff       = [pscustomobject]@{
+        Short = 'keys where the row count jumps'
+        How   = 'Scores each value by how much its row count differs from the values on either side and makes the highest scores keys. Close to how SQL Server picks its own steps.'
+        Good  = 'Spikes: a value much bigger or smaller than its neighbours becomes a key, with exact EQ_ROWS'
+        Weak  = 'On noisy data it spends steps on small bumps and leaves long smooth stretches in a few wide steps'
+    }
+    FrequentFirst = [pscustomobject]@{
+        Short = 'frequent values get their own step'
+        How   = 'Every value with more rows than an average step (rows / 199) becomes a key, heaviest first; the steps left split the other rows evenly, as EqualRows does.'
+        Good  = 'A few very frequent values (a status, a default, a big tenant): equalities on them are exact'
+        Weak  = 'With many medium values few or none qualify, and it behaves like EqualRows'
+    }
+    VOptimal      = [pscustomobject]@{
+        Short = 'values of similar size share a step'
+        How   = 'Starts with one step per value and keeps merging the two neighbouring steps whose merge adds the least variance between each value''s rows and the step''s average (greedy v-optimal).'
+        Good  = 'Equality estimates in general: the values inside a step really are close to AVG_RANGE_ROWS; often the best overall'
+        Weak  = 'The slowest of the four on columns with many distinct values; ranges are not what it optimizes'
+    }
+}
+$script:BuildAlgorithmsCommon = 'All four: the first key is the smallest value and the last key the largest; steps left over are filled by splitting the step with the most rows in half, so all 200 are used. With 200 distinct values or fewer every value is a key and the four histograms are the same. Each candidate is scored on every distinct value and 1,000 random ranges; the best on equality is written.'
+
+function ConvertTo-StatsWrapped([string]$Text, [int]$Width = 130, [string]$Indent = '') {
+    # words wrapped at Width characters; lines after the first start with Indent
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $line = [regex]::Match($Text, '^ *').Value
+    foreach ($word in ($Text.TrimStart() -split ' ')) {
+        if ($line.Trim() -and $line.Length + 1 + $word.Length -gt $Width) { $lines.Add($line); $line = $Indent + $word } else { $line = $(if ($line.Trim()) { $line + ' ' + $word } else { $line + $word }) }
+    }
+    if ($line.Trim()) { $lines.Add($line) }
+    return , [string[]]$lines.ToArray()
+}
+
+function Format-StatsBuildAlgorithms([string[]]$Names) {
+    # what each algorithm tried does, and how they differ
+    $out = @('How the algorithms place the steps:')
+    foreach ($n in @($script:BuildAlgorithms.Keys | Where-Object { $Names -contains $_ })) {
+        $a = $script:BuildAlgorithms[$n]
+        $out += ConvertTo-StatsWrapped "  ${n}: $($a.Short). $($a.How) Best for: $($a.Good). Watch out: $($a.Weak)." 130 '    '
+    }
+    $out += ConvertTo-StatsWrapped "  $($script:BuildAlgorithmsCommon)" 130 '  '
+    return , [string[]]$out
 }
 
 function Format-StatsBuildSample($Plan, $Target) {
@@ -4150,7 +4596,6 @@ function Format-StatsBuildSample($Plan, $Target) {
 }
 
 function Format-StatsBuildCandidates($C) {
-    $hasWorkload = @(@($C.Current) + @($C.Candidates) | Where-Object { $_ -and -not [double]::IsNaN($_.Score.WorkloadP95) }).Count -gt 0
     $rows = foreach ($x in @($C.Current) + @($C.Candidates) | Where-Object { $_ }) {
         $s = $x.Score
         $o = [ordered]@{
@@ -4159,7 +4604,6 @@ function Format-StatsBuildCandidates($C) {
             'Eq p95 by rows' = Format-Invariant '{0:0.##}' $s.EqP95ByRows; 'Values >10x' = Format-Invariant '{0:N0}' $s.ValuesOver10
             'Range p95' = Format-Invariant '{0:0.##}' $s.RangeP95; 'Range geo mean' = Format-Invariant '{0:0.###}' $s.RangeGeoMean
         }
-        if ($hasWorkload) { $o['Workload p95'] = Format-Invariant '{0:0.##}' $s.WorkloadP95; $o['Workload geo mean'] = Format-Invariant '{0:0.###}' $s.WorkloadGeoMean }
         [pscustomobject]$o
     }
     $cols = @($rows[0].PSObject.Properties.Name)
@@ -4172,7 +4616,7 @@ function Get-StatsBuildVerdict($C) {
       Better, Same (within 5%), Worse, or New (nothing to compare with). Any other measure that gets more than 25%
       worse is named, so a win on equality cannot hide a loss on ranges.
     #>
-    $measures = [ordered]@{ equality = @('EqP95', 'equality estimates'); ranges = @('RangeP95', 'range estimates'); workload = @('WorkloadP95', 'the workload''s estimates') }
+    $measures = [ordered]@{ equality = @('EqP95', 'equality estimates'); ranges = @('RangeP95', 'range estimates') }
     $m = $measures[$C.Objective]
     $built = $C.Best.Score.($m[0])
     if (-not $C.Current) {
@@ -4197,7 +4641,6 @@ function Get-StatsBuildVerdict($C) {
 
 function Format-StatsBuildComparison($C) {
     # The chosen histogram next to SQL Server's current statistics, in words.
-    $hasWorkload = @(@($C.Current) + @($C.Best) | Where-Object { $_ -and -not [double]::IsNaN($_.Score.WorkloadP95) }).Count -gt 0
     $rows = New-Object 'System.Collections.Generic.List[object]'
     $add = {
         param([string]$Label, [string]$Property, [string]$Format)
@@ -4210,18 +4653,11 @@ function Format-StatsBuildComparison($C) {
     & $add 'Equality: worst value' EqMax '{0:0.##}x'
     & $add 'Equality: values off by more than 10x' ValuesOver10 '{0:N0}'
     & $add 'Ranges: 95% of ranges within' RangeP95 '{0:0.##}x'
-    if ($hasWorkload) { & $add 'Workload: 95% of executions within' WorkloadP95 '{0:0.##}x' }
     $o = [ordered]@{ Measure = 'Histogram steps' }
     foreach ($x in @($C.Current) + @($C.Best) | Where-Object { $_ }) { $o[$(if ($x.Current) { 'Now (SQL Server)' } else { "Built ($($C.Best.Name))" })] = Format-Invariant '{0:N0}' (@($x.Steps).Count + $(if ($x.NullEq -gt 0) { 1 } else { 0 })) }
     $rows.Add([pscustomobject]$o)
     $cols = @($rows[0].PSObject.Properties.Name)
     return , (Format-AsciiTable -Rows $rows -Columns $cols -RightAlign ($cols | Select-Object -Skip 1))
-}
-
-function Format-StatsBuildWorkload($W, [string]$Status) {
-    if (-not $W) { return "Query Store: $Status" }
-    Format-Invariant 'Query Store: {0} {1} plan(s) filter on the column; {2:N0} equality value(s) and {3:N0} range(s) read, {4:N0} predicate(s) without a usable value (variables, expressions). Equality weight {5:N0}, range weight {6:N0} (executions).' `
-        $Status $W.Plans $W.Equality $W.Ranges $W.Unread $W.EqWeight $W.RangeWeight
 }
 
 function Format-StatsBuildReport($B, [switch]$ShowCandidates) {
@@ -4230,23 +4666,18 @@ function Format-StatsBuildReport($B, [switch]$ShowCandidates) {
     $out = @()
     $out += New-Section "STATISTICS BUILDER (BETA): $($t.Table).$('[' + $t.Column + ']') ($($t.ColumnType))"
     # the verdict, wrapped at 130 characters
-    $line = ''
-    foreach ($word in ((Get-StatsBuildVerdict $B).Text -split ' ')) {
-        if ($line -and $line.Length + 1 + $word.Length -gt 130) { $out += $line; $line = $word } else { $line = ($line + ' ' + $word).TrimStart() }
-    }
-    $out += $line
+    $out += ConvertTo-StatsWrapped (Get-StatsBuildVerdict $B).Text
     $out += ''
     $info = [ordered]@{
         'Target'          = $(if ($B.IsNew) { "new statistics [$($B.StatName)]" } else { "existing statistics [$($B.StatName)]" })
         'Sample'          = Format-StatsBuildSample $B.Plan $t
         'Rows read'       = Format-Invariant '{0:N0} of {1:N0}, {2:N0} NULL ({3:0.0} s)' $B.Profile.ReadRows $B.TableRows $B.Profile.NullRows $B.ReadSeconds
         'Distinct values' = Format-Invariant '{0:N0}{1}' $B.Distinct $(if ($B.Plan.Full) { '' } else { ' (estimated from the sample)' })
-        'Histogram'       = "$($B.Best.Name), the best of $(@($B.Candidates).Count) algorithm(s) on $(switch ($B.Objective) { 'workload' { 'the Query Store workload''s estimates' } 'ranges' { 'range estimates (the workload filters mostly by range)' } default { 'equality estimates per distinct value' } })"
+        'Histogram'       = "$($B.Best.Name) ($(if ($script:BuildAlgorithms.Contains($B.Best.Name)) { $script:BuildAlgorithms[$B.Best.Name].Short })), the best of $(@($B.Candidates).Count) algorithm(s) on equality estimates per distinct value"
     }
-    if ($B.Refined) { $info['Exact counts'] = "EQ_ROWS of the $($B.Refined) step keys counted with seeks on [$($B.RefineIndex)]; true minimum and maximum added$(if ($B.RefinedWorkload) { "; $($B.RefinedWorkload) workload values counted before choosing the steps" })" }
+    if ($B.Refined) { $info['Exact counts'] = "EQ_ROWS of the $($B.Refined) step keys counted with seeks on [$($B.RefineIndex)]; true minimum and maximum added" }
     if ($B.Profile.Compacted) { $info['Memory'] = 'light values merged to bound memory: scores inside merged runs are approximate' }
     $out += Format-KeyValueTable $info
-    $out += Format-StatsBuildWorkload $B.Workload $B.WorkloadStatus
     $out += ''
     $out += 'Estimate accuracy against the rows read: how many times an estimate is off from the real count (1x = exact).'
     $out += Format-StatsBuildComparison $B
@@ -4257,8 +4688,9 @@ function Format-StatsBuildReport($B, [switch]$ShowCandidates) {
     }
     if ($ShowCandidates) {
         $out += ''
-        $out += 'Every algorithm tried, scored by q-error (1 = exact); equality per distinct value, ranges over 1,000 random ranges, workload by executions:'
+        $out += 'Every algorithm tried, scored by q-error (1 = exact); equality per distinct value, ranges over 1,000 random ranges:'
         $out += Format-StatsBuildCandidates $B
+        $out += Format-StatsBuildAlgorithms @($B.Candidates | ForEach-Object Name)
     } elseif (@($B.Candidates).Count -gt 1) {
         $out += "Also tried: $((@($B.Candidates | Where-Object { $_ -ne $B.Best } | ForEach-Object Name)) -join ', ') (-ShowCandidates lists their scores)."
     }
@@ -4282,20 +4714,18 @@ function Format-StatsBuildTableReport($T, [switch]$ShowCandidates) {
             'Rows read'  = Format-Invariant '{0:N0} of {1:N0}, {2} column(s), one read ({3:0.0} s); SQL Server reads the table once per statistics object' $T.RowsRead $T.TableRows $T.Columns $T.ReadSeconds
             'Built'      = "$(@($T.Results).Count) statistics object(s)"
             'Skipped'    = "$(@($T.Skipped).Count)"
-            'Workload'   = $T.WorkloadStatus
         })
     if (@($T.Results).Count) {
         $rows = foreach ($c in $T.Results) {
             [pscustomobject]@{
-                Statistics = $c.StatName; Column = $c.Target.Column; Verdict = $verdicts[$c.StatName].Short; Algorithm = $c.Best.Name; 'Chosen on' = $c.Objective
+                Statistics = $c.StatName; Column = $c.Target.Column; Verdict = $verdicts[$c.StatName].Short; Algorithm = $c.Best.Name
                 'Equality now' = $(if ($c.Current) { Format-Invariant '{0:0.##}x' $c.Current.Score.EqP95 } else { '' }); 'Equality built' = Format-Invariant '{0:0.##}x' $c.Best.Score.EqP95
                 'Ranges now' = $(if ($c.Current) { Format-Invariant '{0:0.##}x' $c.Current.Score.RangeP95 } else { '' }); 'Ranges built' = Format-Invariant '{0:0.##}x' $c.Best.Score.RangeP95
-                'Used by (executions)' = Format-Invariant '{0:N0}' $c.Usage
             }
         }
         $out += ''
         $out += 'Estimate accuracy against the rows read: 95% of values (equality) or of random ranges are within this many times the real count (1x = exact).'
-        $out += Format-AsciiTable -Rows $rows -Columns Statistics, Column, Verdict, Algorithm, 'Chosen on', 'Equality now', 'Equality built', 'Ranges now', 'Ranges built', 'Used by (executions)' -RightAlign 'Equality now', 'Equality built', 'Ranges now', 'Ranges built', 'Used by (executions)'
+        $out += Format-AsciiTable -Rows $rows -Columns Statistics, Column, Verdict, Algorithm, 'Equality now', 'Equality built', 'Ranges now', 'Ranges built' -RightAlign 'Equality now', 'Equality built', 'Ranges now', 'Ranges built'
         if (-not $T.Plan.Full) { $out += 'Measured against the sample, not the table: for a verdict, score the loaded statistics with -Sample FULLSCAN.' }
         foreach ($c in @($T.Results)) {
             if ($verdicts[$c.StatName].Level -ne 'New') { $out += "  [$($c.StatName)]: $($verdicts[$c.StatName].Text)" }
@@ -4306,6 +4736,8 @@ function Format-StatsBuildTableReport($T, [switch]$ShowCandidates) {
                 $out += "[$($c.StatName)]: every algorithm tried, scored by q-error (1 = exact):"
                 $out += Format-StatsBuildCandidates $c
             }
+            $out += ''
+            $out += Format-StatsBuildAlgorithms @($T.Results | ForEach-Object { $_.Candidates } | ForEach-Object Name | Select-Object -Unique)
         } else { $out += 'Every algorithm''s scores: -ShowCandidates.' }
     }
     if (@($T.Skipped).Count) {
@@ -4314,6 +4746,619 @@ function Format-StatsBuildTableReport($T, [switch]$ShowCandidates) {
         $out += @($T.Skipped | ForEach-Object { "  $($_.Name): $($_.Reason)" })
     }
     $out += 'Nothing was changed on the server; the script updates the statistics built (NORECOMPUTE is recommended, see the script).'
+    return , $out
+}
+
+#endregion
+
+#region ---------------------------------------------------------------- advisors (sample size, update cost, maintenance plan, filtered statistics)
+
+function Set-StatsReadSession($Connection, [switch]$Off) {
+    # the advisors read like the builder: dirty reads, short lock waits
+    $c = $Connection.CreateCommand()
+    $c.CommandText = $(if ($Off) { 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT -1;' } else { 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;' })
+    try { $null = $c.ExecuteNonQuery() } catch { if (-not $Off) { throw } }
+}
+
+function Get-StatsLeadingTarget($Connection, [string]$TableName, [string]$StatName) {
+    # A statistics object's leading column as a builder target: its histogram is on that column, whatever the column count.
+    $t = Get-StatsTargets $Connection $TableName @($StatName)
+    $stat = @($t.Stats)[0]
+    if (-not $stat) { throw "Statistics '$StatName' not found on $TableName." }
+    $lead = [string](Invoke-Query $Connection @'
+SELECT TOP (1) c.name FROM sys.stats_columns sc
+JOIN sys.columns c ON c.object_id = sc.object_id AND c.column_id = sc.column_id
+LEFT JOIN sys.indexes i ON i.object_id = sc.object_id AND i.index_id = sc.stats_id
+LEFT JOIN sys.index_columns ic ON ic.object_id = sc.object_id AND ic.index_id = i.index_id AND ic.column_id = sc.column_id
+WHERE sc.object_id = @o AND sc.stats_id = @s ORDER BY COALESCE(NULLIF(ic.key_ordinal, 0), sc.stats_column_id)
+'@ @{ '@o' = $t.ObjectId; '@s' = [int]$stat.stats_id })[0].Rows[0].name
+    $target = Get-StatsBuildTarget $Connection $TableName $null $lead
+    $target | Add-Member Stat $stat -Force
+    $target | Add-Member StatName ([string]$stat.name) -Force
+    return $target
+}
+
+# ---- 6. sample size advisor
+
+function Invoke-SampleAdvisor {
+    <#
+      How the histogram and the distinct value estimate change with the sample size. The table is read once (every row,
+      or within the page budget the largest page sample), as (value, page, rows); each candidate rate is then replayed from
+      memory as a page sample, as TABLESAMPLE keeps whole pages, two seeds each. Each sample gets a MaxDiff histogram
+      (the algorithm closest to SQL Server's own) scored against the full read, and a row-based distinct value estimate
+      (SQL Server's kind). The recommendation is the smallest rate whose scores are within 10% of the full read's.
+    #>
+    param($Connection, [string]$TableName, [string]$StatName, [long]$PageBudget = 100000, [int]$Seeds = 2, [int]$TimeoutSeconds = 0)
+    Initialize-StatsBuilder
+    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to sample." }
+    $target = Get-StatsLeadingTarget $Connection $TableName $StatName
+    $rows = [double]$target.Rows; $pages = [double]$target.Pages
+    if ($rows -le 0 -or $pages -le 0) { throw "The table is empty: there is nothing to sample." }
+    $default = Get-SqlServerSamplePlan ([int64]$rows) ([int64]$pages) 'Default'
+    $refFraction = $(if ($PageBudget -le 0 -or $pages -le $PageBudget) { 1.0 } else { $PageBudget / $pages })
+    $c = $target.ColumnSql
+    $from = $(if ($refFraction -lt 1) { "$($target.Table) TABLESAMPLE SYSTEM ($((100 * $refFraction).ToString('0.######', $script:Inv)) PERCENT) REPEATABLE (1) WITH (INDEX(0))" } else { "$($target.Table) WITH (INDEX(0))" })
+    $sql = @"
+SELECT g.v, DENSE_RANK() OVER (ORDER BY g.v) AS rk, g.pg, g.n
+FROM (SELECT $c AS v, SUBSTRING(%%physloc%%, 1, 6) AS pg, COUNT_BIG(*) AS n FROM $from GROUP BY $c, SUBSTRING(%%physloc%%, 1, 6)) g
+ORDER BY rk OPTION (MAXDOP 1, KEEPFIXED PLAN);
+"@
+    $cache = New-Object SQLStatsXRay.Builder.SampleCache
+    Set-StatsReadSession $Connection
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds; $cmd.CommandText = $sql
+        $r = $cmd.ExecuteReader()
+        try { $cache.Read($r, [bool]$target.IsText) } finally { $r.Close() }
+    } finally { Set-StatsReadSession $Connection -Off }
+    $readSeconds = $sw.Elapsed.TotalSeconds
+    if ($cache.Truncated) { throw "The column has more than $($cache.MaxRows) (value, page) pairs: lower -PageBudget." }
+    if ($cache.TotalRows -le 0) { throw 'The table is empty: there is nothing to sample.' }
+
+    # the reference: every row read (scale 1 for a full read)
+    $pagesRef = 0.0; $onesRef = 0.0
+    $ref = $cache.Sample(1.0, 0, [ref]$pagesRef, [ref]$onesRef)
+    $refScale = $rows / [Math]::Max(1.0, $ref.ReadRows)
+    $refHist = [SQLStatsXRay.Builder.Histogram]::FromPositions($ref, [SQLStatsXRay.Builder.Histogram]::MaxDiff($ref, 200), $refScale)
+    $refScore = [SQLStatsXRay.Builder.Histogram]::Evaluate($ref, $refHist, $ref.NullRows * $refScale, $refScale, 1000, 7)
+    $refDistinct = $(if ($refFraction -ge 1) { $ref.DistinctValues() } else { [SQLStatsXRay.Builder.Histogram]::EstimateDistinct($ref.SampleUnits(), $ref.DistinctValues(), $ref.ValuesSeenOnce(), $ref.SampleUnits() * $refScale) })
+
+    # candidate rates: the default, then round percents above it (SQL Server reads at least 1,024 pages for any percent)
+    $fractions = New-Object 'System.Collections.Generic.List[object]'
+    $fractions.Add(@{ Percent = $default.Percent; Label = $(if ($default.Full) { 'Default (whole table)' } else { Format-Invariant 'Default ({0:0.##}%)' $default.Percent }); IsDefault = $true })
+    foreach ($p in 1, 2, 5, 10, 20, 30, 50, 75) {
+        $eff = [Math]::Max($p, 100.0 * 1024 / $pages)
+        if ($eff -le $default.Percent * 1.2 -or $eff -ge 100) { continue }
+        if (@($fractions | Where-Object { [Math]::Abs($_.Percent - $eff) -lt 0.01 }).Count) { continue }
+        $fractions.Add(@{ Percent = $eff; Label = "$p PERCENT"; IsDefault = $false })
+    }
+    $fractions.Add(@{ Percent = 100.0; Label = 'FULLSCAN'; IsDefault = $false })
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($f in $fractions) {
+        $within = [Math]::Min(1.0, ($f.Percent / 100) / $refFraction)
+        $runs = @()
+        for ($s = 1; $s -le $(if ($within -ge 1) { 1 } else { $Seeds }); $s++) {
+            $pg = 0.0; $ones = 0.0
+            $p = $(if ($within -ge 1) { $ref; $pg = $pagesRef; $ones = $onesRef } else { $cache.Sample($within, $s, [ref]$pg, [ref]$ones) })
+            if ($p.ReadRows -le 0) { continue }
+            $scale = $rows / $p.ReadRows
+            $steps = [SQLStatsXRay.Builder.Histogram]::FromPositions($p, [SQLStatsXRay.Builder.Histogram]::MaxDiff($p, 200), $scale)
+            $score = [SQLStatsXRay.Builder.Histogram]::Evaluate($ref, $steps, $p.NullRows * $scale, $refScale, 1000, 7)
+            $nonNull = [Math]::Max(1.0, $p.NonNullRows)
+            $dSql = [SQLStatsXRay.Builder.Histogram]::EstimateDistinct($nonNull, $p.DistinctValues(), $ones, $nonNull * $scale)
+            $runs += [pscustomobject]@{ Rows = $p.ReadRows; Score = $score; DistinctSql = $dSql }
+        }
+        if (-not $runs) { continue }
+        # the worse of the seeds: a recommendation should hold for an unlucky sample too
+        $eq = ($runs | ForEach-Object { $_.Score.EqP95 } | Measure-Object -Maximum).Maximum
+        $rg = ($runs | ForEach-Object { $_.Score.RangeP95 } | Measure-Object -Maximum).Maximum
+        $over = ($runs | ForEach-Object { $_.Score.ValuesOver10 } | Measure-Object -Maximum).Maximum
+        $dist = ($runs | ForEach-Object { $_.DistinctSql } | Measure-Object -Average).Average
+        $derr = $(if ($refDistinct -gt 0) { ($dist - $refDistinct) / $refDistinct } else { 0 })
+        $pagesRead = [Math]::Min($pages, [Math]::Max(1024, $pages * $f.Percent / 100))
+        $results.Add([pscustomobject]@{
+                Label = $f.Label; Percent = $f.Percent; IsDefault = $f.IsDefault; Pages = $pagesRead; Rows = $rows * $f.Percent / 100
+                EqP95 = $eq; RangeP95 = $rg; ValuesOver10 = $over; Distinct = $dist; DistinctError = $derr
+                Seconds = $readSeconds * ($pagesRead / [Math]::Max(1.0, $pages * $refFraction))
+            })
+    }
+    $full = $results[$results.Count - 1]
+    $ok = { param($x) $x.EqP95 -le [Math]::Max(1.1 * $full.EqP95, $full.EqP95 + 0.1) -and $x.RangeP95 -le [Math]::Max(1.1 * $full.RangeP95, $full.RangeP95 + 0.1) -and [Math]::Abs($x.DistinctError) -le 0.2 }
+    foreach ($x in $results) { $x | Add-Member Acceptable ([bool](& $ok $x)) }
+    $best = @($results | Where-Object Acceptable | Sort-Object Percent | Select-Object -First 1)[0]
+    if (-not $best) { $best = $full }
+    $current = $(if ($target.Stat.sp_rows -isnot [DBNull] -and [double]$target.Stat.sp_rows -gt 0 -and $target.Stat.sp_rows_sampled -isnot [DBNull]) { 100.0 * [double]$target.Stat.sp_rows_sampled / [double]$target.Stat.sp_rows })
+    [pscustomobject]@{
+        Kind = 'SampleAdvisor'; Target = $target; StatName = $target.StatName; Rows = $rows; Pages = $pages; Default = $default; ReferenceFraction = $refFraction; ReadSeconds = $readSeconds
+        Reference = [pscustomobject]@{ EqP95 = $refScore.EqP95; RangeP95 = $refScore.RangeP95; Distinct = $refDistinct }
+        Results = $results.ToArray(); Recommended = $best; CurrentPercent = $current
+        Script = New-SampleAdvisorScript $target $best
+    }
+}
+
+function New-SampleAdvisorScript($Target, $Best) {
+    $stat = '[' + $Target.StatName.Replace(']', ']]') + ']'
+    $lines = @("-- SQLStatsXRay sample size advisor for $($Target.Table).$stat, generated $((Get-Date).ToString('yyyy-MM-dd HH:mm', $script:Inv)).")
+    if ($Best.IsDefault) {
+        $lines += '-- The default sample is enough for this column: nothing to change.'
+        $lines += "-- UPDATE STATISTICS $($Target.Table) ($stat);"
+    } else {
+        $with = $(if ($Best.Percent -ge 100) { 'FULLSCAN' } else { 'SAMPLE ' + [Math]::Ceiling($Best.Percent).ToString($script:Inv) + ' PERCENT' })
+        $lines += "-- PERSIST_SAMPLE_PERCENT keeps this rate for later updates, automatic ones included (SQL Server 2016 SP1 CU4, 2017 CU1 and later)."
+        $lines += "UPDATE STATISTICS $($Target.Table) ($stat) WITH $with, PERSIST_SAMPLE_PERCENT = ON;"
+    }
+    return ($lines -join "`r`n") + "`r`n"
+}
+
+function Format-SampleAdvisorReport($A) {
+    $t = $A.Target
+    $out = @()
+    $out += New-Section "SAMPLE SIZE ADVISOR: $($t.Table).[$($A.StatName)], leading column [$($t.Column)] ($($t.ColumnType))"
+    $b = $A.Recommended
+    $out += $(if ($b.IsDefault) { Format-Invariant "The default sample ({0:0.##}% of the pages) is enough: larger samples do not estimate this column noticeably better." $A.Default.Percent }
+        elseif ($b.Percent -ge 100) { 'Only a full scan estimates this column as well as the whole table does: every smaller sample is noticeably worse.' }
+        else { Format-Invariant "Recommended: {0}. It estimates within 10% of a full scan; the default sample ({1:0.##}%) does not." $b.Label $A.Default.Percent })
+    $out += ''
+    $out += Format-KeyValueTable ([ordered]@{
+            'Table'            = Format-Invariant '{0:N0} rows, {1:N0} pages' $A.Rows $A.Pages
+            'Current sample'   = $(if ($null -ne $A.CurrentPercent) { Format-Invariant '{0:0.##}% of the rows' $A.CurrentPercent } else { 'never updated' })
+            'Read'             = $(if ($A.ReferenceFraction -ge 1) { Format-Invariant 'every row, once ({0:0.0} s); each rate is replayed from it as a page sample, 2 seeds' $A.ReadSeconds } else { Format-Invariant '{0:0.##}% of the pages (the page budget), once ({1:0.0} s): rates above it cannot be told apart' (100 * $A.ReferenceFraction) $A.ReadSeconds })
+            'Full read scores' = Format-Invariant 'equality 95% within {0:0.##}x, ranges {1:0.##}x, {2:N0} distinct values' $A.Reference.EqP95 $A.Reference.RangeP95 $A.Reference.Distinct
+        })
+    $out += ''
+    $out += 'Each rate: a page sample, a 200-step MaxDiff histogram (close to SQL Server''s own), scored against the full read (1x = exact; the worse of 2 seeds).'
+    $rows = foreach ($x in $A.Results) {
+        [pscustomobject]@{
+            Sample = $x.Label + $(if ($x.Label -eq $b.Label) { '  <- recommended' } else { '' }); 'Pages read' = Format-Invariant '{0:N0}' $x.Pages
+            'Equality 95%' = Format-Invariant '{0:0.##}x' $x.EqP95; 'Ranges 95%' = Format-Invariant '{0:0.##}x' $x.RangeP95; 'Values >10x' = Format-Invariant '{0:N0}' $x.ValuesOver10
+            'Distinct (row-based)' = Format-Invariant '{0:N0} ({1:+0;-0}%)' $x.Distinct (100 * $x.DistinctError); 'Read time' = Format-Invariant '{0:0.00} s' $x.Seconds
+            'Within 10%' = $(if ($x.Acceptable) { 'yes' } else { 'no' })
+        }
+    }
+    $cols = 'Sample', 'Pages read', 'Equality 95%', 'Ranges 95%', 'Values >10x', 'Distinct (row-based)', 'Read time', 'Within 10%'
+    $out += Format-AsciiTable -Rows $rows -Columns $cols -RightAlign ($cols | Select-Object -Skip 1)
+    $out += 'Distinct (row-based): estimated from the rows sampled as SQL Server does (in the lab it matched SQL Server''s own density within 2% at 10 to 75%), against the full read.'
+    $out += 'Read time: this read, scaled by pages. SQL Server also sorts the rows; the update cost estimate (-UpdateCost) includes that.'
+    $out += 'Simulated from one read: nothing was changed on the server.'
+    return , $out
+}
+
+# ---- 7. update cost estimate
+
+function Get-StatsServerParallelism($Connection) {
+    # CPUs, MAXDOP (the database's own when set) and whether dm_db_stats_properties has persisted_sample_percent
+    $q = (Invoke-Query $Connection @'
+SELECT (SELECT cpu_count FROM sys.dm_os_sys_info) AS cpus,
+       CAST((SELECT value_in_use FROM sys.configurations WHERE name = 'max degree of parallelism') AS int) AS server_maxdop,
+       (SELECT TOP (1) CAST(value AS int) FROM sys.database_scoped_configurations WHERE name = 'MAXDOP') AS db_maxdop,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.all_columns WHERE object_id = OBJECT_ID('sys.dm_db_stats_properties') AND name = 'persisted_sample_percent') THEN 1 ELSE 0 END AS has_persisted
+'@)[0].Rows[0]
+    $dop = $(if ($q.db_maxdop -isnot [DBNull] -and [int]$q.db_maxdop -gt 0) { [int]$q.db_maxdop } elseif ([int]$q.server_maxdop -gt 0) { [int]$q.server_maxdop } else { [Math]::Min(64, [int]$q.cpus) })
+    [pscustomobject]@{ Cpus = [int]$q.cpus; Dop = [Math]::Max(1, [Math]::Min($dop, [int]$q.cpus)); HasPersisted = [int]$q.has_persisted -eq 1 }
+}
+
+function Get-StatsUpdateCandidates($Connection, [object]$ObjectId, [bool]$HasPersisted) {
+    <#
+      Every statistics object of one table (or of every user table): its size, how the next update samples it, how much
+      changed since the last one, and the leaf pages of the smallest index led by its leading column (a full scan
+      reads that index in key order, without a sort).
+    #>
+    $persisted = $(if ($HasPersisted) { 'sp.persisted_sample_percent' } else { 'CAST(NULL AS float)' })
+    $rows = @((Invoke-Query $Connection @"
+SELECT s.object_id, OBJECT_SCHEMA_NAME(s.object_id) AS schema_name, o.name AS table_name, s.stats_id, s.name AS stats_name,
+       s.auto_created, s.user_created, s.no_recompute, s.has_filter, s.is_incremental, i.type AS index_type,
+       sp.rows AS stat_rows, sp.rows_sampled, sp.modification_counter, sp.last_updated, $persisted AS persisted_sample_percent,
+       lead.name AS lead_column, lead.system_type_id AS lead_type, lead.max_length AS lead_bytes,
+       (SELECT COUNT(*) FROM sys.stats_columns x WHERE x.object_id = s.object_id AND x.stats_id = s.stats_id) AS column_count,
+       base.pages AS base_pages, base.rows AS table_rows, ix.pages AS ordered_pages
+FROM sys.stats s
+JOIN sys.objects o ON o.object_id = s.object_id AND o.type = 'U' AND o.is_ms_shipped = 0
+LEFT JOIN sys.indexes i ON i.object_id = s.object_id AND i.index_id = s.stats_id AND i.name = s.name
+OUTER APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+OUTER APPLY (SELECT TOP (1) c.name, c.system_type_id, c.max_length, c.column_id FROM sys.stats_columns sc
+             JOIN sys.columns c ON c.object_id = sc.object_id AND c.column_id = sc.column_id
+             LEFT JOIN sys.index_columns ic ON ic.object_id = sc.object_id AND ic.index_id = i.index_id AND ic.column_id = sc.column_id
+             WHERE sc.object_id = s.object_id AND sc.stats_id = s.stats_id ORDER BY COALESCE(NULLIF(ic.key_ordinal, 0), sc.stats_column_id)) lead
+OUTER APPLY (SELECT SUM(au.data_pages) AS pages, SUM(p.rows) AS rows FROM sys.partitions p
+             JOIN sys.allocation_units au ON au.container_id = p.partition_id AND au.type = 1
+             WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)) base
+OUTER APPLY (SELECT TOP (1) q.pages FROM (SELECT x.index_id, SUM(ps.in_row_data_page_count) AS pages FROM sys.indexes x
+             JOIN sys.index_columns k ON k.object_id = x.object_id AND k.index_id = x.index_id AND k.key_ordinal = 1 AND k.column_id = lead.column_id
+             JOIN sys.dm_db_partition_stats ps ON ps.object_id = x.object_id AND ps.index_id = x.index_id
+             WHERE x.object_id = s.object_id AND x.type IN (1, 2) AND x.is_disabled = 0 AND x.has_filter = 0 GROUP BY x.index_id) q ORDER BY q.pages) ix
+WHERE (@o IS NULL OR s.object_id = @o) AND (i.type IS NULL OR i.type IN (1, 2))
+ORDER BY schema_name, table_name, s.stats_id;
+"@ @{ '@o' = $(if ($null -ne $ObjectId) { [int]$ObjectId } else { [DBNull]::Value }) })[0].Rows)
+    $nz = { param($v, $d = 0) if ($null -eq $v -or $v -is [DBNull]) { $d } else { $v } }
+    foreach ($r in $rows) {
+        $tableRows = [double](& $nz $r.table_rows)
+        [pscustomobject]@{
+            ObjectId = [int]$r.object_id; Schema = [string]$r.schema_name; TableName = [string]$r.table_name; Name = [string]$r.stats_name; StatsId = [int]$r.stats_id
+            Table = '[' + ([string]$r.schema_name).Replace(']', ']]') + '].[' + ([string]$r.table_name).Replace(']', ']]') + ']'; Sql = '[' + ([string]$r.stats_name).Replace(']', ']]') + ']'
+            IsIndex = $r.index_type -isnot [DBNull]; AutoCreated = [bool]$r.auto_created; NoRecompute = [bool]$r.no_recompute; Filtered = [bool]$r.has_filter; Incremental = [bool](& $nz $r.is_incremental $false)
+            Rows = $tableRows; StatRows = [double](& $nz $r.stat_rows); RowsSampled = [double](& $nz $r.rows_sampled); Modifications = [double](& $nz $r.modification_counter)
+            LastUpdated = $(if ($r.last_updated -is [DBNull]) { $null } else { [datetime]$r.last_updated }); PersistedPercent = [double](& $nz $r.persisted_sample_percent)
+            LeadColumn = [string](& $nz $r.lead_column ''); IsText = [int](& $nz $r.lead_type 0) -in 167, 175, 231, 239; KeyBytes = [double](& $nz $r.lead_bytes 8); Columns = [int]$r.column_count
+            Pages = [double](& $nz $r.base_pages); OrderedPages = $(if ($r.ordered_pages -is [DBNull]) { $null } else { [double]$r.ordered_pages })
+        }
+    }
+}
+
+# Lab constants (SQL Server 2025, 24 cores; checked against real UPDATE STATISTICS runs): base-table reads cost about 1 us
+# a page plus 0.03 us a row; the sort about 0.04 us a row per log2(rows), more for long strings; a full scan in key order
+# (through an index led by the column) about 2.7 times a plain read; each update about 15 ms more. A probe scales the reads
+# and the sort to the server being looked at.
+$script:CostModel = @{ PageUs = 1.0; RowUs = 0.0298; SortUs = 0.04; SortedFactor = 1.15; TextFactor = 1.6; OrderedFactor = 2.7; OverheadMs = 15.0; ParallelGain = 0.65 }
+
+function Measure-StatsCostFactors($Connection, $Candidates, [int]$ProbePages = 5000) {
+    # Two reads of a page sample of the largest table (a COUNT, then the same rows sorted), at MAXDOP 1, against what the
+    # lab constants predict for them: the read and sort speed of this server relative to the lab.
+    $m = $script:CostModel
+    # a column no index is led by: an index key (an identity above all) is stored in order and sorts unrealistically fast
+    $pick = @($Candidates | Where-Object { $_.Pages -ge 2000 -and $_.Rows -ge 50000 -and $_.LeadColumn -and $null -eq $_.OrderedPages } | Sort-Object Pages -Descending | Select-Object -First 1)[0]
+    if (-not $pick) { return [pscustomobject]@{ Read = 1.0; Sort = 1.0; Probe = 'no table of 2,000 pages or more with an unindexed column to probe: lab constants used' } }
+    $pct = [Math]::Min(100.0, 100.0 * $ProbePages / $pick.Pages)
+    $col = '[' + $pick.LeadColumn.Replace(']', ']]') + ']'
+    $ts = "TABLESAMPLE SYSTEM ($($pct.ToString('0.######', $script:Inv)) PERCENT) REPEATABLE (1) WITH (INDEX(0))"
+    $time = {
+        param([string]$Sql)
+        $c = $Connection.CreateCommand(); $c.CommandText = $Sql; $c.CommandTimeout = 120
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $v = $c.ExecuteScalar(); @{ Value = $v; Ms = $sw.Elapsed.TotalMilliseconds }
+    }
+    Set-StatsReadSession $Connection
+    try {
+        $null = & $time "SELECT COUNT_BIG(*) FROM $($pick.Table) $ts OPTION (MAXDOP 1);"   # warms the pages
+        $read = & $time "SELECT COUNT_BIG($col) FROM $($pick.Table) $ts OPTION (MAXDOP 1);"
+        $sort = & $time "SELECT MAX(x.rn) FROM (SELECT ROW_NUMBER() OVER (ORDER BY $col) AS rn FROM $($pick.Table) $ts) x OPTION (MAXDOP 1);"
+    } finally { Set-StatsReadSession $Connection -Off }
+    # too few rows (a table of allocated but mostly empty pages) measure nothing but overhead
+    if ([double]$read.Value -lt 10000) { return [pscustomobject]@{ Read = 1.0; Sort = 1.0; Probe = Format-Invariant '{0}: only {1:N0} rows in the probe sample, too few to measure: lab constants used' $pick.Table ([double]$read.Value) } }
+    $rowsRead = [Math]::Max(2.0, [double]$read.Value)
+    $pagesRead = $pick.Pages * $pct / 100
+    $readPredicted = ($m.PageUs * $pagesRead + $m.RowUs * $rowsRead) / 1000
+    $sortPredicted = $rowsRead * (Get-StatsSortUs $pick) * [Math]::Log($rowsRead, 2) / 1000
+    $clamp = { param([double]$v) [Math]::Max(0.5, [Math]::Min(10.0, $v)) }
+    [pscustomobject]@{
+        Read = & $clamp ($read.Ms / [Math]::Max(0.01, $readPredicted)); Sort = & $clamp ([Math]::Max(0.0, $sort.Ms - $read.Ms) / [Math]::Max(0.01, $sortPredicted))
+        Probe = Format-Invariant '{0}.[{1}]: {2:N0} rows read in {3:0} ms, sorted in {4:0} ms more (MAXDOP 1)' $pick.Table $pick.LeadColumn $rowsRead $read.Ms ([Math]::Max(0.0, $sort.Ms - $read.Ms))
+    }
+}
+
+function Get-StatsSortUs($Candidate) {
+    # sort cost per row and log2(rows): longer keys compare slower
+    $m = $script:CostModel
+    $bytes = $(if ($Candidate.KeyBytes -le 0) { 64 } else { [Math]::Min(900, $Candidate.KeyBytes) })
+    if ($Candidate.IsText) { return $m.SortUs * (1 + $bytes / 64) }
+    return $m.SortUs * (1 + [Math]::Max(0, $bytes - 8) / 128)
+}
+
+function Get-StatsUpdateCost($Candidate, $Factors, [int]$Dop, [string]$Sample) {
+    <#
+      Seconds for one UPDATE STATISTICS: base-table pages sampled and sorted, or (a full scan with an index led by the
+      leading column) that index read in key order. Serial, and with the server's parallelism for reads big enough to
+      get a parallel plan.
+    #>
+    $m = $script:CostModel
+    $c = $Candidate
+    if ($c.Rows -le 0 -or $c.Pages -le 0) { return [pscustomobject]@{ Rule = 'empty table'; Pages = 0; Rows = 0; Serial = $m.OverheadMs / 1000; Parallel = $m.OverheadMs / 1000; Ordered = $false; Full = $true } }
+    $rule = $Sample
+    if (-not $rule) { $rule = $(if ($c.PersistedPercent -gt 0) { "$($c.PersistedPercent.ToString('0.######', $script:Inv)) PERCENT" } else { 'Default' }) }
+    $plan = Get-SqlServerSamplePlan ([int64]$c.Rows) ([int64]$c.Pages) $rule
+    $rowsRead = $c.Rows * $plan.Pages / $c.Pages
+    $ordered = $plan.Full -and $null -ne $c.OrderedPages
+    if ($ordered) {
+        $work = $m.OrderedFactor * ($m.PageUs * $c.OrderedPages + $m.RowUs * $c.Rows) * $Factors.Read / 1e6
+        $gain = 1.1
+    } else {
+        $sort = $rowsRead * (Get-StatsSortUs $c) * [Math]::Log([Math]::Max(2.0, $rowsRead), 2) * $Factors.Sort
+        $work = $m.SortedFactor * $(if ($c.IsText) { $m.TextFactor } else { 1 }) * (($m.PageUs * $plan.Pages + $m.RowUs * $rowsRead) * $Factors.Read + $sort) / 1e6
+        $gain = 1 + $m.ParallelGain * ($Dop - 1)
+    }
+    if ($rowsRead -lt 50000) { $gain = 1 }   # too small for a parallel plan
+    $over = $m.OverheadMs / 1000
+    $label = $(if ($plan.Full) { 'FULLSCAN' } elseif ($c.PersistedPercent -gt 0 -and -not $Sample) { Format-Invariant 'persisted {0:0.##}%' $c.PersistedPercent } elseif ($rule -eq 'Default') { Format-Invariant 'default {0:0.##}%' $plan.Percent } else { Format-Invariant '{0:0.##}%' $plan.Percent })
+    [pscustomobject]@{ Rule = $label; Pages = $plan.Pages; Rows = $rowsRead; Serial = $over + $work; Parallel = $over + $work / $gain; Ordered = $ordered; Full = [bool]$plan.Full; Percent = $plan.Percent }
+}
+
+function Invoke-StatsUpdateCost {
+    # Every statistics object of the table (or database) with the cost of its next update and of a full scan.
+    param($Connection, [string]$TableName, [switch]$NoProbe)
+    $server = Get-StatsServerParallelism $Connection
+    $objectId = $null
+    if ($TableName) {
+        $id = (Invoke-Query $Connection 'SELECT OBJECT_ID(@t) AS id' @{ '@t' = $TableName })[0].Rows[0].id
+        if ($id -is [DBNull]) { throw "Table '$TableName' not found in database '$($Connection.Database)'." }
+        $objectId = [int]$id
+    }
+    $cands = @(Get-StatsUpdateCandidates $Connection $objectId $server.HasPersisted)
+    $factors = $(if ($NoProbe -or -not $cands) { [pscustomobject]@{ Read = 1.0; Sort = 1.0; Probe = 'not run (-NoProbe): lab constants used' } } else { Measure-StatsCostFactors $Connection $cands })
+    foreach ($c in $cands) {
+        $c | Add-Member Next (Get-StatsUpdateCost $c $factors $server.Dop $null)
+        $c | Add-Member FullScan (Get-StatsUpdateCost $c $factors $server.Dop 'FULLSCAN')
+    }
+    [pscustomobject]@{ Kind = 'UpdateCost'; Scope = $(if ($TableName) { $TableName } else { "every user table of [$($Connection.Database)]" }); Server = $server; Factors = $factors; Candidates = $cands; IsClone = (Test-StatsCloneDatabase $Connection) }
+}
+
+function Format-StatsSeconds([double]$Seconds) {
+    if ($Seconds -ge 3600) { return Format-Invariant '{0:0.0} h' ($Seconds / 3600) }
+    if ($Seconds -ge 90) { return Format-Invariant '{0:0.0} min' ($Seconds / 60) }
+    if ($Seconds -ge 10) { return Format-Invariant '{0:0} s' $Seconds }
+    return Format-Invariant '{0:0.00} s' $Seconds
+}
+
+function Format-StatsUpdateCostReport($U, [int]$Top = 50) {
+    $out = @()
+    $out += New-Section "UPDATE COST ESTIMATE: $($U.Scope)"
+    $c = @($U.Candidates)
+    $next = ($c | ForEach-Object { $_.Next.Parallel } | Measure-Object -Sum).Sum
+    $full = ($c | ForEach-Object { $_.FullScan.Parallel } | Measure-Object -Sum).Sum
+    $out += Format-Invariant 'Updating all {0:N0} statistics objects takes about {1} with their next sample, {2} with FULLSCAN (MAXDOP {3}).' $c.Count (Format-StatsSeconds $next) (Format-StatsSeconds $full) $U.Server.Dop
+    if ($U.IsClone) { $out += "$($script:CloneMessage): these are the costs on the source database, from the row and page counts the clone copied (lab speed constants). Do not update statistics in the clone itself." }
+    $out += ''
+    $out += Format-KeyValueTable ([ordered]@{
+            'Parallelism' = "MAXDOP $($U.Server.Dop) of $($U.Server.Cpus) CPUs (the database's MAXDOP when set, else the server's)"
+            'Calibration' = $U.Factors.Probe
+            'Speed vs lab' = Format-Invariant 'reads x{0:0.##}, sorts x{1:0.##}' $U.Factors.Read $U.Factors.Sort
+        })
+    $out += ''
+    $rows = foreach ($x in @($c | Sort-Object { $_.Next.Parallel } -Descending | Select-Object -First $Top)) {
+        [pscustomobject]@{
+            Table = $x.Table; Statistics = $x.Name; Rows = Format-Invariant '{0:N0}' $x.Rows
+            Modified = $(if ($x.Rows -gt 0) { Format-Invariant '{0:0.#}%' (100 * $x.Modifications / $x.Rows) } else { '' })
+            'Next update reads' = Format-Invariant '{0} ({1:N0} pages)' $x.Next.Rule $x.Next.Pages; 'Next update' = Format-StatsSeconds $x.Next.Parallel
+            'Serial' = Format-StatsSeconds $x.Next.Serial; 'FULLSCAN' = (Format-StatsSeconds $x.FullScan.Parallel) + $(if ($x.FullScan.Ordered) { ' (index order)' } else { '' })
+        }
+    }
+    if ($rows) {
+        $cols = 'Table', 'Statistics', 'Rows', 'Modified', 'Next update reads', 'Next update', 'Serial', 'FULLSCAN'
+        $out += Format-AsciiTable -Rows $rows -Columns $cols -RightAlign Rows, Modified, 'Next update', 'Serial', 'FULLSCAN'
+        if ($c.Count -gt $Top) { $out += "The $Top costliest of $($c.Count) shown." }
+    }
+    $out += 'Estimates from a model of the reads and the sort, scaled by a probe of this server (warm cache): expect them within about 2x, slower when the pages come from disk.'
+    return , $out
+}
+
+# ---- 8. maintenance plan within a time budget
+
+function Invoke-StatsMaintenancePlan {
+    <#
+      Which statistics to update, and how, so the job fits a time budget with the most benefit. A statistic's benefit is how
+      far it is toward SQL Server's own auto-update threshold (modifications against min(20% + 500, sqrt(1000 x rows)));
+      its cost is the update cost estimate. Statistics are taken by benefit
+      per second until the budget is spent; time left over upgrades the most useful ones to FULLSCAN where the sample is
+      small. NORECOMPUTE statistics are left out unless asked: a plain UPDATE STATISTICS turns automatic updates back on and
+      replaces a built histogram.
+    #>
+    param($Connection, [string]$TableName, [double]$BudgetMinutes = 30, [switch]$IncludeNoRecompute, [switch]$NoProbe)
+    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage): updating its statistics would replace the cloned ones with statistics of empty tables. Plan maintenance on the source database; -UpdateCost still estimates costs from the copied row and page counts." }
+    $u = Invoke-StatsUpdateCost -Connection $Connection -TableName $TableName -NoProbe:$NoProbe
+    $budget = 60 * $BudgetMinutes
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    $left = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($c in $u.Candidates) {
+        if ($c.NoRecompute -and -not $IncludeNoRecompute) { $left.Add([pscustomobject]@{ C = $c; Reason = 'NORECOMPUTE (left out: -IncludeNoRecompute)' }); continue }
+        if ($c.Rows -le 0) { continue }
+        $threshold = [Math]::Min(500 + 0.2 * $c.Rows, [Math]::Sqrt(1000 * $c.Rows)) / $c.Rows
+        $ratio = $(if (-not $c.LastUpdated) { $null } else { ($c.Modifications / $c.Rows) / $threshold })
+        $stale = $(if ($null -eq $ratio) { 1.5 } else { [Math]::Min(1.5, $ratio) })
+        if ($stale -lt 0.05) { continue }
+        $benefit = $stale
+        $upgrade = $(if (-not $c.Next.Full -and $c.Pages -ge 1024) { $benefit * 0.5 * (1 - $c.Next.Percent / 100) } else { 0 })
+        $items.Add([pscustomobject]@{ C = $c; Stale = $stale; Ratio = $ratio; Benefit = $benefit; Upgrade = $upgrade; Cost = $c.Next.Parallel; Action = $null; Seconds = 0.0 })
+    }
+    $used = 0.0
+    foreach ($it in @($items | Sort-Object { $_.Benefit / [Math]::Max(0.001, $_.Cost) } -Descending)) {
+        if ($used + $it.Cost -le $budget) { $it.Action = 'Update'; $it.Seconds = $it.Cost; $used += $it.Cost }
+    }
+    foreach ($it in @($items | Where-Object { $_.Action -and $_.Upgrade -gt 0 } | Sort-Object { $_.Upgrade / [Math]::Max(0.001, $_.C.FullScan.Parallel - $_.Cost) } -Descending)) {
+        $delta = $it.C.FullScan.Parallel - $it.Cost
+        if ($used + $delta -le $budget) { $it.Action = 'FULLSCAN'; $it.Seconds = $it.C.FullScan.Parallel; $used += $delta }
+    }
+    $chosen = @($items | Where-Object Action | Sort-Object { $_.Benefit } -Descending)
+    $skipped = @($items | Where-Object { -not $_.Action })
+    [pscustomobject]@{
+        Kind = 'MaintenancePlan'; Cost = $u; BudgetSeconds = $budget; UsedSeconds = $used; Chosen = $chosen; Skipped = $skipped; LeftOut = $left.ToArray()
+        Unchanged = @($u.Candidates).Count - $items.Count - $left.Count; Script = New-StatsMaintenanceScript $Connection.Database $chosen $budget $used
+    }
+}
+
+function New-StatsMaintenanceScript([string]$Database, $Chosen, [double]$Budget, [double]$Used) {
+    $l = New-Object 'System.Collections.Generic.List[string]'
+    $l.Add("-- SQLStatsXRay maintenance plan for [$Database], generated $((Get-Date).ToString('yyyy-MM-dd HH:mm', $script:Inv)).")
+    $l.Add((Format-Invariant '-- {0} statistics objects, estimated {1} of a {2} budget. Each statement runs only while the budget lasts.' @($Chosen).Count (Format-StatsSeconds $Used) (Format-StatsSeconds $Budget)))
+    $l.Add('-- Estimates come from a model of this server, not guarantees. Review the list before scheduling it.')
+    $l.Add("USE [$($Database.Replace(']', ']]'))];")
+    $l.Add('SET NOCOUNT ON;')
+    $l.Add("DECLARE @stop datetime2 = DATEADD(SECOND, $([int]$Budget), SYSDATETIME());")
+    foreach ($it in $Chosen) {
+        $c = $it.C
+        $with = @()
+        if ($it.Action -eq 'FULLSCAN') { $with += 'FULLSCAN' }
+        if ($c.NoRecompute) { $with += 'NORECOMPUTE' }
+        $stmt = "UPDATE STATISTICS $($c.Table) ($($c.Sql))" + $(if ($with) { ' WITH ' + ($with -join ', ') } else { '' }) + ';'
+        $why = Format-Invariant '{0}, {1}' (Format-StatsSeconds $it.Seconds) $(if ($null -eq $it.Ratio) { 'never updated' } else { Format-Invariant '{0:0}% modified' (100 * $c.Modifications / [Math]::Max(1, $c.Rows)) })
+        $l.Add("IF SYSDATETIME() < @stop $stmt  -- $why")
+    }
+    if (-not @($Chosen).Count) { $l.Add('-- Nothing to update: no statistics object changed enough since its last update.') }
+    return ($l.ToArray() -join "`r`n") + "`r`n"
+}
+
+function Format-StatsMaintenanceReport($P) {
+    $out = @()
+    $out += New-Section "MAINTENANCE PLAN: $($P.Cost.Scope), budget $(Format-StatsSeconds $P.BudgetSeconds)"
+    $ch = @($P.Chosen)
+    $full = @($ch | Where-Object Action -eq 'FULLSCAN').Count
+    $out += Format-Invariant '{0} statistics objects to update ({1} with FULLSCAN) in about {2} of the {3} budget; {4} more need an update but do not fit; {5} have not changed enough to need one.' `
+        $ch.Count $full (Format-StatsSeconds $P.UsedSeconds) (Format-StatsSeconds $P.BudgetSeconds) @($P.Skipped).Count $P.Unchanged
+    $out += ''
+    $out += Format-KeyValueTable ([ordered]@{
+            'Benefit'     = 'how far toward SQL Server''s auto-update threshold (modifications / min(20% + 500, sqrt(1000 x rows))), up to 1.5'
+            'Order'       = 'benefit per estimated second, until the budget is spent; time left upgrades small samples to FULLSCAN'
+            'Calibration' = $P.Cost.Factors.Probe
+        })
+    $out += ''
+    if ($ch) {
+        $rows = foreach ($it in $ch) {
+            [pscustomobject]@{
+                Table = $it.C.Table; Statistics = $it.C.Name; Action = $(if ($it.Action -eq 'FULLSCAN') { 'FULLSCAN' } else { $it.C.Next.Rule })
+                Modified = $(if ($null -eq $it.Ratio) { 'never updated' } else { Format-Invariant '{0:0.#}%' (100 * $it.C.Modifications / [Math]::Max(1, $it.C.Rows)) })
+                'Toward threshold' = $(if ($null -eq $it.Ratio) { '' } else { Format-Invariant '{0:0}%' (100 * $it.Ratio) })
+                Estimate = Format-StatsSeconds $it.Seconds
+            }
+        }
+        $cols = 'Table', 'Statistics', 'Action', 'Modified', 'Toward threshold', 'Estimate'
+        $out += Format-AsciiTable -Rows $rows -Columns $cols -RightAlign Modified, 'Toward threshold', Estimate
+    }
+    if (@($P.Skipped).Count) {
+        $out += ''
+        $out += "Need an update but do not fit the budget ($(@($P.Skipped).Count)), most useful first:"
+        foreach ($it in @($P.Skipped | Sort-Object Benefit -Descending | Select-Object -First 15)) { $out += Format-Invariant '  {0}.[{1}]: {2}, {3:0}% modified' $it.C.Table $it.C.Name (Format-StatsSeconds $it.Cost) (100 * $it.C.Modifications / [Math]::Max(1, $it.C.Rows)) }
+    }
+    if (@($P.LeftOut).Count) {
+        $out += ''
+        $out += "Left out ($(@($P.LeftOut).Count)): " + ((@($P.LeftOut | Select-Object -First 10) | ForEach-Object { "$($_.C.Table).[$($_.C.Name)]" }) -join ', ') + ' - NORECOMPUTE statistics (built ones among them): update them on purpose, or use -IncludeNoRecompute.'
+    }
+    return , $out
+}
+
+# ---- 14. filtered statistics advisor
+
+$script:SegmentTypes = @(48, 52, 56, 127, 104, 40, 175, 167, 239, 231, 36)   # integers, bit, date, character types, uniqueidentifier
+
+function ConvertTo-StatsFilterLiteral($Value, [int]$SystemTypeId) {
+    # the segment value as a literal of the column's own type (a filter must not convert the column)
+    if ($null -eq $Value -or $Value -is [DBNull]) { return $null }
+    switch ($SystemTypeId) {
+        { $_ -in 48, 52, 56, 127 } { return ([int64]$Value).ToString($script:Inv) }
+        104 { return $(if ([bool]$Value) { '1' } else { '0' }) }
+        40 { return "'" + ([datetime]$Value).ToString('yyyy-MM-dd', $script:Inv) + "'" }
+        36 { return "'" + [string]$Value + "'" }
+        { $_ -in 239, 231 } { return "N'" + ([string]$Value).Replace("'", "''") + "'" }
+        default { return "'" + ([string]$Value).Replace("'", "''") + "'" }
+    }
+}
+
+function Invoke-FilteredStatsAdvisor {
+    <#
+      Columns whose values split the table into segments (tenants, statuses, regions) that the target column behaves
+      differently in. For "segment = s AND target = x" the optimizer multiplies the two columns' selectivities (exponential
+      backoff since compatibility level 120), which is wrong when they are correlated; a filtered statistic on the target
+      for that segment has the segment's own histogram. A page sample is copied to tempdb once; for each candidate column
+      (2 to MaxSegments values, a type a filter can use), every segment with MinRows rows is scored: the q-error of the
+      estimate now against a histogram of the segment's own rows.
+    #>
+    param($Connection, [string]$TableName, [string]$StatName, [string]$ColumnName, [string[]]$SegmentColumns, [long]$MinRows = 1000,
+        [int]$MaxSegments = 200, [int]$MaxRecommendations = 10, [long]$SampleRows = 500000, [int]$TimeoutSeconds = 0)
+    Initialize-StatsBuilder
+    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to split into segments." }
+    $target = $(if ($StatName) { Get-StatsLeadingTarget $Connection $TableName $StatName } else { Get-StatsBuildTarget $Connection $TableName $null $ColumnName })
+    $rows = [double]$target.Rows; $pages = [double]$target.Pages
+    if ($rows -le 0) { throw 'The table is empty.' }
+    $types = ($script:SegmentTypes | ForEach-Object { [string]$_ }) -join ', '
+    $cols = @((Invoke-Query $Connection "SELECT c.name, c.system_type_id, c.max_length FROM sys.columns c WHERE c.object_id = @o AND c.system_type_id IN ($types) AND c.is_computed = 0 AND c.is_sparse = 0 AND c.name <> @t AND (c.max_length BETWEEN 1 AND 200) ORDER BY c.column_id" @{ '@o' = $target.ObjectId; '@t' = $target.Column })[0].Rows)
+    if ($SegmentColumns) { $cols = @($cols | Where-Object { [string]$_.name -in $SegmentColumns }) }
+    if (-not $cols) { throw 'No column can split this table into segments (integers, bit, date, uniqueidentifier or strings up to 200 bytes, not computed).' }
+    $q = { param([string]$n) '[' + $n.Replace(']', ']]') + ']' }
+    # one page sample, about SampleRows rows (every row when the table is smaller), copied once
+    $pct = [Math]::Min(100.0, 100.0 * $SampleRows / $rows)
+    if ($pages -lt 1024) { $pct = 100.0 }
+    $source = $(if ($pct -ge 100) { "$($target.Table) WITH (INDEX(0))" } else { "$($target.Table) TABLESAMPLE SYSTEM ($($pct.ToString('0.######', $script:Inv)) PERCENT) REPEATABLE (1) WITH (INDEX(0))" })
+    $list = (@($cols | ForEach-Object { & $q ([string]$_.name) }) + @($target.ColumnSql)) -join ', '
+    Set-StatsReadSession $Connection
+    try {
+        $c0 = $Connection.CreateCommand(); $c0.CommandTimeout = $TimeoutSeconds
+        $c0.CommandText = "IF OBJECT_ID('tempdb..#xray_seg') IS NOT NULL DROP TABLE #xray_seg; SELECT $list INTO #xray_seg FROM $source OPTION (MAXDOP 1); SELECT COUNT_BIG(*) FROM #xray_seg;"
+        $sampled = [double]$c0.ExecuteScalar()
+    } finally { Set-StatsReadSession $Connection -Off }
+    if ($sampled -le 0) { try { $null = Invoke-Query $Connection 'DROP TABLE #xray_seg;' } catch { }; throw 'The table is empty: there are no segments to compare.' }
+    $scale = $rows / [Math]::Max(1.0, $sampled)
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    $checked = New-Object 'System.Collections.Generic.List[object]'
+    try {
+        foreach ($col in $cols) {
+            $name = [string]$col.name; $sq = & $q $name
+            $n = [double](Invoke-Query $Connection "SELECT COUNT(DISTINCT $sq) + ISNULL(MAX(CASE WHEN $sq IS NULL THEN 1 ELSE 0 END), 0) AS n FROM #xray_seg")[0].Rows[0].n
+            if ($n -lt 2 -or $n -gt $MaxSegments) { $checked.Add([pscustomobject]@{ Column = $name; Values = $n; Note = $(if ($n -lt 2) { 'one value' } else { "more than $MaxSegments values" }) }); continue }
+            $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds
+            # ranks in each column's own order (equal under the collation = one rank); a NULL target has no rank
+            $cmd.CommandText = @"
+SELECT DENSE_RANK() OVER (ORDER BY g.s) AS sk, g.s, CASE WHEN g.t IS NULL THEN NULL ELSE DENSE_RANK() OVER (ORDER BY g.t) END AS tk, g.n
+FROM (SELECT $sq AS s, $($target.ColumnSql) AS t, COUNT_BIG(*) AS n FROM #xray_seg GROUP BY $sq, $($target.ColumnSql)) g OPTION (MAXDOP 1);
+"@
+            $r = $cmd.ExecuteReader()
+            try { $segs = [SQLStatsXRay.Builder.Segments]::Analyze($r, $scale, [double]$MinRows, 200, 7) } finally { $r.Close() }
+            $checked.Add([pscustomobject]@{ Column = $name; Values = $n; Note = "$($segs.Count) segment(s) of $MinRows rows or more" })
+            foreach ($s in $segs) {
+                $results.Add([pscustomobject]@{
+                        Column = $name; SystemTypeId = [int]$col.system_type_id; Raw = $s.Raw; IsNull = $s.IsNull; Rows = $s.Rows; Values = $s.Values
+                        NowEq = $s.NewEqP95; NowRange = $s.NewRangeP95; LegacyEq = $s.LegacyEqP95; FilteredEq = $s.FilteredEqP95; FilteredRange = $s.FilteredRangeP95
+                        Gain = [Math]::Max($s.NewEqP95 / [Math]::Max(1, $s.FilteredEqP95), $s.NewRangeP95 / [Math]::Max(1, $s.FilteredRangeP95))
+                    })
+            }
+        }
+    } finally { try { $null = Invoke-Query $Connection 'DROP TABLE #xray_seg;' } catch { } }
+    # worth a filtered statistic: off by 3x or more at the 95th percentile now, and at least twice as good with one
+    $worth = @($results | Where-Object { ($_.NowEq -ge 3 -or $_.NowRange -ge 3) -and $_.Gain -ge 2 } | Sort-Object { $_.Gain * [Math]::Log10(10 + $_.Rows) } -Descending | Select-Object -First $MaxRecommendations)
+    [pscustomobject]@{
+        Kind = 'FilteredAdvisor'; Target = $target; Rows = $rows; SampledRows = $sampled; Percent = $pct; Checked = $checked.ToArray(); Segments = $results.ToArray(); Recommended = $worth
+        Script = New-FilteredStatsScript $target $worth
+    }
+}
+
+function New-FilteredStatsScript($Target, $Recommended) {
+    $l = New-Object 'System.Collections.Generic.List[string]'
+    $l.Add("-- SQLStatsXRay filtered statistics advisor for $($Target.Table).[$($Target.Column)], generated $((Get-Date).ToString('yyyy-MM-dd HH:mm', $script:Inv)).")
+    if (-not @($Recommended).Count) { $l.Add('-- No segment needs a filtered statistic.'); return ($l.ToArray() -join "`r`n") + "`r`n" }
+    $l.Add('-- The optimizer uses a filtered statistic when the query''s predicate matches its filter at compile time (literals,')
+    $l.Add('-- OPTION (RECOMPILE)); a parameter does not match. Filtered statistics update on the whole table''s modification')
+    $l.Add('-- counter, so they go stale sooner: update them in maintenance.')
+    $used = @{}
+    foreach ($r in $Recommended) {
+        $lit = ConvertTo-StatsFilterLiteral $r.Raw $r.SystemTypeId
+        $where = '[' + $r.Column.Replace(']', ']]') + ']' + $(if ($r.IsNull) { ' IS NULL' } else { " = $lit" })
+        $base = ('xray_f_' + $Target.Column + '_' + $r.Column + '_' + $(if ($r.IsNull) { 'null' } else { [string]$r.Raw })) -replace '[^\w]', '_'
+        if ($base.Length -gt 100) { $base = $base.Substring(0, 100) }
+        $name = $base; $k = 2
+        while ($used.ContainsKey($name)) { $name = "${base}_$k"; $k++ }
+        $used[$name] = $true
+        $l.Add((Format-Invariant '-- {0:N0} rows; equality 95% within {1:0.##}x now, {2:0.##}x with it; ranges {3:0.##}x now, {4:0.##}x with it' $r.Rows $r.NowEq $r.FilteredEq $r.NowRange $r.FilteredRange))
+        $l.Add("CREATE STATISTICS [$name] ON $($Target.Table) ($($Target.ColumnSql)) WHERE $where WITH FULLSCAN;")
+    }
+    return ($l.ToArray() -join "`r`n") + "`r`n"
+}
+
+function Format-FilteredStatsReport($F) {
+    $t = $F.Target
+    $out = @()
+    $out += New-Section "FILTERED STATISTICS ADVISOR: $($t.Table).[$($t.Column)] ($($t.ColumnType))"
+    $rec = @($F.Recommended)
+    $out += $(if ($rec) { "$($rec.Count) filtered statistic(s) recommended: in these segments the estimates for [$($t.Column)] are off by 3x or more and a filtered statistic at least halves the error." }
+        else { "No filtered statistic needed: in no segment are the estimates for [$($t.Column)] off by 3x or more and fixed by one." })
+    $out += ''
+    $out += Format-KeyValueTable ([ordered]@{
+            'Sample'          = Format-Invariant '{0:N0} rows ({1:0.##}% of the pages), copied to tempdb once' $F.SampledRows $F.Percent
+            'Columns checked' = (@($F.Checked | ForEach-Object { "[$($_.Column)]: $(Format-Invariant '{0:N0}' $_.Values) values, $($_.Note)" }) -join '; ')
+            'Now'             = 'segment = s AND column = x estimated from each column''s own statistics (exponential backoff, compatibility level 120+)'
+            'With a filtered statistic' = 'a 200-step histogram of the segment''s own rows'
+        })
+    $out += ''
+    $show = @($F.Segments | Sort-Object Gain -Descending | Select-Object -First 30)
+    if ($show) {
+        $rows = foreach ($s in $show) {
+            [pscustomobject]@{
+                Segment = "[$($s.Column)] " + $(if ($s.IsNull) { 'IS NULL' } else { '= ' + (ConvertTo-StatsFilterLiteral $s.Raw $s.SystemTypeId) }) + $(if ($rec -contains $s) { '  <- recommended' } else { '' })
+                Rows = Format-Invariant '{0:N0}' $s.Rows; Values = Format-Invariant '{0:N0}' $s.Values
+                'Equality now' = Format-Invariant '{0:0.##}x' $s.NowEq; 'Equality filtered' = Format-Invariant '{0:0.##}x' $s.FilteredEq
+                'Ranges now' = Format-Invariant '{0:0.##}x' $s.NowRange; 'Ranges filtered' = Format-Invariant '{0:0.##}x' $s.FilteredRange
+                'Legacy CE' = Format-Invariant '{0:0.##}x' $s.LegacyEq
+            }
+        }
+        $cols = 'Segment', 'Rows', 'Values', 'Equality now', 'Equality filtered', 'Ranges now', 'Ranges filtered', 'Legacy CE'
+        $out += '95th percentile q-error (1x = exact) of the estimates inside each segment, against the sample:'
+        $out += Format-AsciiTable -Rows $rows -Columns $cols -RightAlign ($cols | Select-Object -Skip 1)
+        if (@($F.Segments).Count -gt 30) { $out += "The 30 segments with the most to gain of $(@($F.Segments).Count) shown." }
+    }
+    $out += 'Segment values are data from the table: handle the report and the script as customer data.'
     return , $out
 }
 
@@ -4448,7 +5493,7 @@ namespace StatsStreamDecoder.Appearance {
      var r=tabs.GetTabRect(i);bool selected=i==tabs.SelectedIndex;
      using(var b=new SolidBrush(selected?Color.FromArgb(52,61,73):Background))g.FillRectangle(b,r);
      using(var p=new Pen(Border))g.DrawRectangle(p,r.X,r.Y,Math.Max(0,r.Width-1),Math.Max(0,r.Height-1));
-     var text=r;text.Inflate(-4,-2);
+     var text=r;text.Inflate(-1,-2);
      TextRenderer.DrawText(g,tabs.TabPages[i].Text,tabs.Font,text,tabs.ForeColor,TextFormatFlags.HorizontalCenter|TextFormatFlags.VerticalCenter|TextFormatFlags.EndEllipsis|TextFormatFlags.PreserveGraphicsClipping);
      if(selected&&tabs.Focused){var focus=r;focus.Inflate(-3,-3);ControlPaint.DrawFocusRectangle(g,focus,tabs.ForeColor,Background);}
     }
@@ -4482,6 +5527,7 @@ function Get-GuiDefaultSettings {
         Theme = 'Dark'; ServerInstance = ''; Servers = @(); SqlAuthentication = $false; Login = ''; TrustServerCertificate = $true
         Validate = $true; UseDac = $false; HexDump = $false; FullPrecision = $false; StringIndexNodes = 300; SampledScanValues = 20; TrieOrientation = 'LeftToRight'
         CheckPageBudget = 100000; CheckTimeout = 60; CheckStepDelay = 0
+        ChartView = 'Bars'; ChartLog = $false; ChartAverage = $false; ChartIntervals = $true; Explain = $true
     }
 }
 
@@ -4496,6 +5542,8 @@ function Read-GuiSettings {
     $settings.Servers = @($settings.Servers | Where-Object { $_ } | ForEach-Object { [string]$_ })
     if ($settings.Theme -notin 'Light', 'Dark') { $settings.Theme = 'Dark' }
     if ($settings.TrieOrientation -notin 'TopDown', 'LeftToRight') { $settings.TrieOrientation = 'LeftToRight' }
+    if ($settings.ChartView -notin 'Bars', 'Cumulative') { $settings.ChartView = 'Bars' }
+    foreach ($k in 'ChartLog', 'ChartAverage', 'ChartIntervals', 'Explain') { $settings[$k] = [bool]$settings[$k] }
     foreach ($k in 'StringIndexNodes', 'SampledScanValues') { $settings[$k] = [int][Math]::Min([Math]::Max(0, [int]$settings[$k]), 1000000) }
     $settings.CheckPageBudget = [long][Math]::Min([Math]::Max(1, [long]$settings.CheckPageBudget), 1000000000)
     $settings.CheckTimeout = [int][Math]::Min([Math]::Max(1, [int]$settings.CheckTimeout), 3600)
@@ -4600,6 +5648,7 @@ function Set-GuiControlTheme($Control) {
         'Warn' { $Control.ForeColor = Get-GuiResultColor 'Fair' }
         'StatusOff' { $Control.ForeColor = $p.Muted }
         'Card' { $Control.BackColor = $p.Surface }
+        'Swatch' { $Control.BackColor = Get-GuiByteGroupColor $Control.AccessibleName }
     }
     if ($Control.Parent -and $Control.Parent.Tag -eq 'Card' -and $Control -is [Windows.Forms.Label]) { $Control.BackColor = $p.Surface }
     if ($Control -is [Windows.Forms.LinkLabel]) { $Control.LinkColor = $p.Link; $Control.ActiveLinkColor = $p.Link; $Control.VisitedLinkColor = $p.Link }
@@ -4685,11 +5734,11 @@ function Set-GuiControlTheme($Control) {
         }
     }
     if ($Control -is [Windows.Forms.TabControl]) {
-        # Reserve room for the captions at the current DPI.
-        $Control.DrawMode = 'Normal'; $Control.SizeMode = 'Fixed'
-        $width = 64
-        foreach ($page in $Control.TabPages) { $width = [Math]::Max($width, [Windows.Forms.TextRenderer]::MeasureText($page.Text, $Control.Font).Width + 20) }
-        $Control.ItemSize = New-Object Drawing.Size ($width, ($Control.Font.Height + 10))
+        # Each tab as wide as its caption (so many tabs still fit), the height for the current DPI.
+        $Control.DrawMode = 'Normal'; $Control.SizeMode = 'Normal'
+        $Control.Padding = New-Object Drawing.Point ([int](12 * (Get-GuiScale))), 4
+        $Control.ItemSize = New-Object Drawing.Size (64, ($Control.Font.Height + 10))
+        if ($script:App -and $Control -eq $script:App.Tabs) { Set-GuiTabFit }
     }
     foreach ($child in $Control.Controls) { Set-GuiControlTheme $child }
     [StatsStreamDecoder.Appearance.Skin]::Apply($Control, $dark)
@@ -4908,6 +5957,7 @@ function Update-GuiCommandState {
     $current = Get-GuiCurrentResult
     $g.CheckData.Enabled = -not $busy -and $on -and $current -and $current.PSObject.Properties['Target']
     foreach ($c in $g.Commands.Build) { $c.Enabled = -not $busy -and $on -and $g.Tables.SelectedIndex -ge 0 }
+    foreach ($c in @($g.Commands.Tools)) { if ($c) { $c.Enabled = -not $busy -and $on } }
     $s = $g.Settings
     $g.DecodeHint.Text = 'Validation {0}, DAC {1}. Change in Settings (Ctrl+,).' -f $(if ($s.Validate) { 'on' } else { 'off' }), $(if ($s.UseDac) { 'on' } else { 'off' })
 }
@@ -4954,14 +6004,14 @@ function Start-GuiDecode([hashtable]$Offline) {
     Start-GuiJob $p 'Decoding'
 }
 
-function Start-GuiJob([hashtable]$Parameters, [string]$Activity, $Check, $Build) {
+function Start-GuiJob([hashtable]$Parameters, [string]$Activity, $Check, $Build, $Tool) {
     # The script runs in its own runspace so the window stays responsive and can cancel it.
     $g = $script:App
     $ps = [PowerShell]::Create()
     $ps.Runspace = [RunspaceFactory]::CreateRunspace()
     $ps.Runspace.Open()
     $null = $ps.AddCommand($script:DecoderPath).AddParameters($Parameters)
-    $g.Job = @{ PowerShell = $ps; Async = $ps.BeginInvoke(); Started = [DateTime]::Now; FullPrecision = [bool]$Parameters.FullPrecision; Activity = $Activity; Check = $Check; Build = $Build }
+    $g.Job = @{ PowerShell = $ps; Async = $ps.BeginInvoke(); Started = [DateTime]::Now; FullPrecision = [bool]$Parameters.FullPrecision; Activity = $Activity; Check = $Check; Build = $Build; Tool = $Tool }
     Update-GuiCommandState
     Set-GuiStatus "$Activity..."
     $g.Timer.Start()
@@ -5059,12 +6109,13 @@ function Complete-GuiDecode {
     if ($failure -is [Management.Automation.PipelineStoppedException]) { Set-GuiStatus 'Cancelled.'; return }
     if ($failure -or -not $result) {
         $message = $(if ($failure) { $failure.Message } else { 'The decoder returned no result.' })
-        Set-GuiStatus $(if ($job.Check) { 'Data check failed.' } else { 'Decode failed.' })
+        Set-GuiStatus $(if ($job.Check) { 'Data check failed.' } elseif ($job.Tool) { "$($job.Tool.Title) failed." } else { 'Decode failed.' })
         Show-GuiMessage (@($message) + $notes -join [Environment]::NewLine) 'Error'
         return
     }
     if ($job.Check) { Complete-GuiDataCheck $job $result $notes; return }
     if ($job.Build) { Complete-GuiBuild $job $result $notes; return }
+    if ($job.Tool) { Complete-GuiTool $job $result $notes; return }
 
     $g.Results = @($result.Objects)
     $g.HasReport = $true
@@ -5094,7 +6145,7 @@ function Complete-GuiDecode {
 function Show-GuiBuildDialog {
     <#
       The statistics builder's options: what to build (the statistics object shown, a new one on a column, or every
-      statistics object of the table from one read), the sampler and sample, the algorithms, the Query Store workload
+      statistics object of the table from one read), the sampler and sample, the algorithms
       and NORECOMPUTE (recommended, not checked). The build runs in the background; the app only writes the script.
     #>
     $g = $script:App
@@ -5143,11 +6194,18 @@ function Show-GuiBuildDialog {
     Add-GuiRow $d.Layout '' (New-GuiHeading 'Histogram')
     $algos = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $true; MaximumSize = (New-Object Drawing.Size $noteWidth, 0) }
     $boxes = @{}
-    foreach ($a in 'EqualRows', 'MaxDiff', 'FrequentFirst', 'VOptimal', 'Workload') { $boxes[$a] = New-GuiControl CheckBox @{ Text = $a; AutoSize = $true; Checked = $true }; $algos.Controls.Add($boxes[$a]) }
+    # each algorithm's description as a tooltip (held long enough to read), and the short form under the boxes
+    $tips = New-Object Windows.Forms.ToolTip
+    $tips.AutoPopDelay = 30000; $tips.InitialDelay = 300; $tips.ShowAlways = $true
+    foreach ($a in $script:BuildAlgorithms.Keys) {
+        $x = $script:BuildAlgorithms[$a]
+        $boxes[$a] = New-GuiControl CheckBox @{ Text = $a; AutoSize = $true; Checked = $true }
+        $tips.SetToolTip($boxes[$a], ((@($x.How, "Best for: $($x.Good).", "Watch out: $($x.Weak).") | ForEach-Object { (ConvertTo-StatsWrapped $_ 80) -join "`n" }) -join "`n`n"))
+        $algos.Controls.Add($boxes[$a])
+    }
     Add-GuiRow $d.Layout 'Algorithms' $algos
-    $workload = New-GuiControl CheckBox @{ Text = 'Use the Query Store workload (predicate values and executions)'; AutoSize = $true; Checked = $true }
-    Add-GuiRow $d.Layout '' $workload
-    Add-GuiRow $d.Layout '' (& $note 'Every candidate is scored by q-error against the rows read, and the best one is written. With workload values, the best is the one that estimates the workload''s own predicates best.')
+    Add-GuiRow $d.Layout '' (& $note ((@($script:BuildAlgorithms.Keys | ForEach-Object { "${_}: $($script:BuildAlgorithms[$_].Short)." }) -join ' ') +
+            ' Hover an algorithm for how it works. Every candidate is scored by q-error against the rows read, and the best one on equality is written.'))
 
     Add-GuiRow $d.Layout '' (New-GuiHeading 'Script')
     $norecompute = New-GuiControl CheckBox @{ Text = 'NORECOMPUTE (recommended)'; AutoSize = $true; Checked = $false }
@@ -5164,7 +6222,7 @@ function Show-GuiBuildDialog {
     $sampler.Add_SelectedIndexChanged($toggle)
     & $toggle
     try { $result = $d.Form.ShowDialog($g.Form) }
-    finally { $g.Dlg = $null; $d.Form.Dispose() }
+    finally { $g.Dlg = $null; $tips.Dispose(); $d.Form.Dispose() }
     if ($result -ne 'OK') { return }
 
     $algorithms = @($boxes.Keys | Where-Object { $boxes[$_].Checked })
@@ -5172,7 +6230,7 @@ function Show-GuiBuildDialog {
     $p = @{
         GuiRun = $true; ServerInstance = $g.Conn.Server; Database = $database; Table = $table; Build = $true; Sample = $sample.Text.Trim()
         Sampler = $(if ($sampler.SelectedIndex -eq 1) { 'Adaptive' } else { 'SqlServer' }); AdaptiveLimit = [double]$limit.Value; Algorithm = [string[]]$algorithms
-        NoWorkload = -not $workload.Checked; NoRecompute = $norecompute.Checked; TrustServerCertificate = [bool]$g.Conn.Trust
+        NoRecompute = $norecompute.Checked; TrustServerCertificate = [bool]$g.Conn.Trust
     }
     if ($rStat.Checked) { $p.Statistics = [string[]]@($stat); $what = "[$stat]" }
     elseif ($rColumn.Checked) {
@@ -5218,12 +6276,14 @@ function Show-GuiBuildResult($B, [string[]]$Lines, $Info) {
     $summaryText = ($summary.ToArray() -join [Environment]::NewLine).Trim()
     # every candidate's scores, which the summary leaves out
     $all = New-Object 'System.Collections.Generic.List[string]'
-    $all.Add('Every algorithm tried, scored by q-error (1 = exact) against the rows read; equality per distinct value, ranges over 1,000 random ranges, workload by executions.')
+    $all.Add('Every algorithm tried, scored by q-error (1 = exact) against the rows read; equality per distinct value, ranges over 1,000 random ranges.')
     foreach ($c in $(if ($Info.All) { @($B.Results) } else { @($B) })) {
         $all.Add('')
-        if ($Info.All) { $all.Add("[$($c.StatName)] ($($c.Target.Column)), chosen on $($c.Objective):") } else { $all.Add("Chosen on $($c.Objective):") }
+        if ($Info.All) { $all.Add("[$($c.StatName)] ($($c.Target.Column)):") }
         $all.AddRange([string[]](Format-StatsBuildCandidates $c))
     }
+    $all.Add('')
+    $all.AddRange([string[]](Format-StatsBuildAlgorithms @($(if ($Info.All) { @($B.Results) } else { @($B) }) | ForEach-Object { $_.Candidates } | ForEach-Object Name | Select-Object -Unique)))
     foreach ($t in @(@('Summary', $summaryText), @('All algorithms', ($all.ToArray() -join [Environment]::NewLine)), @('Script', [string]$B.Script))) {
         $page = New-GuiControl TabPage @{ Text = $t[0]; Padding = (New-Object Windows.Forms.Padding 4) }
         $box = New-GuiControl TextBox @{ Dock = 'Fill'; ReadOnly = $true; Multiline = $true; WordWrap = $false; ScrollBars = 'Both'; MaxLength = 0; Font = $mono; BorderStyle = 'None'; Text = $t[1] }
@@ -5266,6 +6326,158 @@ function Show-GuiBuildResult($B, [string[]]$Lines, $Info) {
     finally { $dlg.Dispose(); $g.Dialog = $null }
 }
 
+function Get-GuiToolContext([switch]$NeedStat, [switch]$NeedTable) {
+    # the connection, database, table and decoded statistics object the advisors start from; $null after telling the user
+    $g = $script:App
+    if ($g.Job) { return $null }
+    if (-not $g.Conn) { Show-GuiMessage 'Connect to a server first (Ctrl+N).' 'Warning'; return $null }
+    $database = $g.Database.Text.Trim()
+    $table = [string]$g.Tables.SelectedItem
+    if (-not $database) { Show-GuiMessage 'Pick a database first.' 'Warning'; return $null }
+    if ($NeedTable -and -not $table) { Show-GuiMessage 'Pick a table first.' 'Warning'; return $null }
+    $current = Get-GuiCurrentResult
+    $stat = $(if ($current -and $current.PSObject.Properties['Target'] -and $current.Target.Table -eq $table -and $current.Target.Database -eq $database) { [string]$current.Target.Statistics })
+    if ($NeedStat -and -not $stat) { Show-GuiMessage 'Decode the table (F5) and pick the statistics object first.' 'Warning'; return $null }
+    $p = @{ GuiRun = $true; ServerInstance = $g.Conn.Server; Database = $database; TrustServerCertificate = [bool]$g.Conn.Trust }
+    if ($g.Conn.SqlAuth) { $p.Credential = New-Object Management.Automation.PSCredential ($g.Conn.Login, $g.Conn.Password) }
+    $column = $(if ($stat -and @($current.Columns).Count) { [string]@($current.Columns)[0].Name })
+    return @{ Database = $database; Table = $table; Stat = $stat; Column = $column; Parameters = $p }
+}
+
+function New-GuiToolNote([string]$Text, [string]$Tag = 'Muted') {
+    New-GuiControl Label @{ Text = $Text; AutoSize = $true; Tag = $Tag; MaximumSize = (New-Object Drawing.Size ([int](560 * (Get-GuiScale))), 0); Margin = (New-Object Windows.Forms.Padding 3, 2, 3, 8) }
+}
+
+function Show-GuiSampleAdvisorDialog {
+    $ctx = Get-GuiToolContext -NeedStat -NeedTable
+    if (-not $ctx) { return }
+    $d = New-GuiDialog "Sample size advisor: $($ctx.Table)"
+    Add-GuiRow $d.Layout '' (New-GuiToolNote 'It only reads; the script it writes changes the sample rate SQL Server uses for this statistic.')
+    Add-GuiRow $d.Layout 'Statistics object' (New-GuiControl Label @{ Text = "[$($ctx.Stat)]"; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 3, 6, 3, 3) })
+    $budget = New-GuiControl NumericUpDown @{ Minimum = 0; Maximum = 100000000; Increment = 10000; Value = 100000; Width = [int](140 * (Get-GuiScale)); ThousandsSeparator = $true }
+    Add-GuiRow $d.Layout 'Page budget' $budget
+    Add-GuiRow $d.Layout '' (New-GuiToolNote ('Reads the table once (every row, or this many pages; 0 = no limit), then replays page samples of growing size from memory: each gets a histogram scored ' +
+            'against the full read and a distinct value estimate. Recommends the smallest rate within 10% of a full scan.'))
+    $buttons = Add-GuiDialogButtons $d 'Advise'
+    $buttons.Ok.DialogResult = 'OK'
+    try { $r = $d.Form.ShowDialog($script:App.Form) } finally { $d.Form.Dispose() }
+    if ($r -ne 'OK') { return }
+    $p = $ctx.Parameters; $p.Table = $ctx.Table; $p.Statistics = [string[]]@($ctx.Stat); $p.AdviseSample = $true; $p.PageBudget = [long]$budget.Value
+    Start-GuiJob $p "Sample size advisor on [$($ctx.Stat)]" $null $null @{ Title = 'Sample size advisor'; File = "SampleAdvisor_$($ctx.Database)_$($ctx.Table)_$($ctx.Stat)" }
+}
+
+function Show-GuiMaintenanceDialog {
+    $ctx = Get-GuiToolContext
+    if (-not $ctx) { return }
+    $d = New-GuiDialog "Update cost and maintenance plan: $($ctx.Database)"
+    Add-GuiRow $d.Layout '' (New-GuiToolNote 'It reads metadata and runs a short probe query; the plan''s script updates statistics when you run it.')
+    Add-GuiRow $d.Layout '' (New-GuiHeading 'Scope' 2)
+    $rTable = New-GuiControl RadioButton @{ AutoSize = $true; Text = $(if ($ctx.Table) { "The table $($ctx.Table)" } else { 'The table (pick one first)' }); Enabled = [bool]$ctx.Table; Checked = [bool]$ctx.Table }
+    $rDb = New-GuiControl RadioButton @{ AutoSize = $true; Text = "Every user table of [$($ctx.Database)]"; Checked = -not $ctx.Table }
+    Add-GuiRow $d.Layout '' $rTable; Add-GuiRow $d.Layout '' $rDb
+    Add-GuiRow $d.Layout '' (New-GuiHeading 'Plan')
+    $plan = New-GuiControl CheckBox @{ Text = 'Plan the updates within a time budget'; AutoSize = $true; Checked = $true }
+    Add-GuiRow $d.Layout '' $plan
+    $minutes = New-GuiControl NumericUpDown @{ Minimum = 0.1; Maximum = 1440; DecimalPlaces = 1; Increment = 5; Value = 30; Width = [int](110 * (Get-GuiScale)) }
+    Add-GuiRow $d.Layout 'Budget (minutes)' $minutes
+    $noRecompute = New-GuiControl CheckBox @{ Text = 'Include NORECOMPUTE statistics (built ones are among them)'; AutoSize = $true }
+    Add-GuiRow $d.Layout '' $noRecompute
+    $probe = New-GuiControl CheckBox @{ Text = 'Probe this server''s read and sort speed (two short queries)'; AutoSize = $true; Checked = $true }
+    Add-GuiRow $d.Layout '' $probe
+    Add-GuiRow $d.Layout '' (New-GuiToolNote ('The cost of each update comes from a model of its reads and sort (calibrated on real UPDATE STATISTICS runs, scaled by the probe). The plan takes the statistics ' +
+            'by benefit (how far toward SQL Server''s auto-update threshold) per second until the budget is spent.'))
+    $buttons = Add-GuiDialogButtons $d 'Estimate'
+    $buttons.Ok.DialogResult = 'OK'
+    try { $r = $d.Form.ShowDialog($script:App.Form) } finally { $d.Form.Dispose() }
+    if ($r -ne 'OK') { return }
+    $p = $ctx.Parameters
+    if ($rTable.Checked) { $p.Table = $ctx.Table }
+    if ($plan.Checked) { $p.MaintenancePlan = $true; $p.TimeBudgetMinutes = [double]$minutes.Value; $p.IncludeNoRecompute = $noRecompute.Checked } else { $p.UpdateCost = $true }
+    $p.NoProbe = -not $probe.Checked
+    $scope = $(if ($rTable.Checked) { $ctx.Table } else { $ctx.Database })
+    Start-GuiJob $p "$(if ($plan.Checked) { 'Planning maintenance' } else { 'Estimating update costs' }) for $scope" $null $null @{ Title = $(if ($plan.Checked) { 'Maintenance plan' } else { 'Update cost estimate' }); File = "Maintenance_$($ctx.Database)_$scope" }
+}
+
+function Show-GuiFilteredAdvisorDialog {
+    $ctx = Get-GuiToolContext -NeedTable
+    if (-not $ctx) { return }
+    $types = ($script:BuildKeyTypes | ForEach-Object { [string]$_ }) -join ', '
+    try { $columns = Get-GuiServerList $script:App.Conn $ctx.Database "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(@t) AND c.system_type_id IN ($types) ORDER BY c.column_id" @{ '@t' = $ctx.Table } }
+    catch { Show-GuiMessage "Could not read the table's columns: $($_.Exception.Message)" 'Error'; return }
+    $d = New-GuiDialog "Filtered statistics advisor: $($ctx.Table)"
+    Add-GuiRow $d.Layout '' (New-GuiToolNote 'It reads a page sample into tempdb; the script it writes creates filtered statistics.')
+    $column = New-GuiControl ComboBox @{ DropDownStyle = 'DropDownList'; Width = [int](260 * (Get-GuiScale)) }
+    $null = $column.Items.AddRange([object[]]$columns)
+    # the column of the statistics object shown, when there is one
+    if ($ctx.Column -and $column.Items.Contains($ctx.Column)) { $column.SelectedItem = $ctx.Column } elseif ($columns.Count) { $column.SelectedIndex = 0 }
+    Add-GuiRow $d.Layout 'Column' $column
+    $minRows = New-GuiControl NumericUpDown @{ Minimum = 1; Maximum = 1000000000; Increment = 1000; Value = 1000; Width = [int](140 * (Get-GuiScale)); ThousandsSeparator = $true }
+    Add-GuiRow $d.Layout 'Smallest segment (rows)' $minRows
+    Add-GuiRow $d.Layout '' (New-GuiToolNote ('Every other column with 2 to 200 values (integers, bit, date, uniqueidentifier, short strings) splits the table into segments. In each segment, the estimates for the column ' +
+            'from the two columns'' own statistics are compared with a histogram of the segment''s own rows; a filtered statistic is recommended where it at least halves an error of 3x or more.'))
+    $buttons = Add-GuiDialogButtons $d 'Advise'
+    $buttons.Ok.DialogResult = 'OK'
+    try { $r = $d.Form.ShowDialog($script:App.Form) } finally { $d.Form.Dispose() }
+    if ($r -ne 'OK' -or -not $column.SelectedItem) { return }
+    $p = $ctx.Parameters; $p.Table = $ctx.Table; $p.Column = [string]$column.SelectedItem; $p.AdviseFiltered = $true; $p.MinSegmentRows = [long]$minRows.Value
+    Start-GuiJob $p "Filtered statistics advisor on [$($column.SelectedItem)]" $null $null @{ Title = 'Filtered statistics advisor'; File = "FilteredStats_$($ctx.Database)_$($ctx.Table)_$($column.SelectedItem)" }
+}
+
+function Complete-GuiTool($Job, $Result, [string[]]$Notes) {
+    $g = $script:App
+    $a = @($Result.Objects) | Select-Object -First 1
+    if (-not $a) { Set-GuiStatus "$($Job.Tool.Title) failed."; Show-GuiMessage ((@('No result.') + $Notes) -join [Environment]::NewLine) 'Error'; return }
+    $g.Report.AppendText(([Environment]::NewLine + ((@($Notes) + @($Result.Lines)) -join [Environment]::NewLine)))
+    $g.HasReport = $true
+    $verdict = @($Result.Lines | Where-Object { $_ -and $_ -notmatch '^[=+|]' -and $_ -notmatch '^\s+[A-Z][A-Z ()]+:' } | Select-Object -First 1)[0]
+    Set-GuiStatus "$($Job.Tool.Title): $verdict"
+    # the report without the script (the run appends it after a SCRIPT heading), then the script
+    $summary = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($l in @($Result.Lines)) { if ($l -eq '  SCRIPT') { if ($summary.Count -gt 1) { $summary.RemoveRange($summary.Count - 2, 2) }; break }; $summary.Add($l) }
+    Show-GuiToolResult $Job.Tool.Title ($summary.ToArray() -join [Environment]::NewLine).Trim() $(if ($a.PSObject.Properties['Script']) { [string]$a.Script }) $Job.Tool.File
+}
+
+function Show-GuiToolResult([string]$Title, [string]$Summary, [string]$Script, [string]$FileName) {
+    # An advisor's report and its script (when it writes one); the app never runs the script.
+    $g = $script:App
+    $dlg = New-GuiControl Form @{ Text = $Title; StartPosition = 'CenterParent'; Font = $g.Form.Font; Size = (New-Object Drawing.Size 1180, 760); MinimumSize = (New-Object Drawing.Size 760, 480); ShowInTaskbar = $false }
+    if ($g.Icon) { $dlg.Icon = $g.Icon }
+    $tabs = New-GuiControl TabControl @{ Dock = 'Fill' }
+    $mono = New-Object Drawing.Font 'Consolas', 9.75
+    $boxes = @{}
+    foreach ($t in @(@('Summary', $Summary), @('Script', $Script))) {
+        if ($t[0] -eq 'Script' -and -not $Script) { continue }
+        $page = New-GuiControl TabPage @{ Text = $t[0]; Padding = (New-Object Windows.Forms.Padding 4) }
+        $box = New-GuiControl TextBox @{ Dock = 'Fill'; ReadOnly = $true; Multiline = $true; WordWrap = $false; ScrollBars = 'Both'; MaxLength = 0; Font = $mono; BorderStyle = 'None'; Text = $t[1] }
+        $page.Controls.Add($box); $tabs.TabPages.Add($page); $boxes[$t[0]] = $box
+    }
+    $buttons = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; Dock = 'Bottom'; FlowDirection = 'RightToLeft'; Padding = (New-Object Windows.Forms.Padding 6) }
+    $close = New-GuiControl Button @{ Text = 'Close'; AutoSize = $true; DialogResult = 'Cancel' }
+    $buttons.Controls.Add($close)
+    if ($Script) {
+        $copy = New-GuiControl Button @{ Text = 'Copy script'; AutoSize = $true }
+        $save = New-GuiControl Button @{ Text = 'Save script as...'; AutoSize = $true; Tag = 'Primary' }
+        $buttons.Controls.AddRange(@($copy, $save))
+        $copy.Add_Click({ [Windows.Forms.Clipboard]::SetText($script:App.Dialog.Script.Text); Set-GuiStatus 'Script copied to the clipboard.' })
+        $save.Add_Click({
+                $state = $script:App.Dialog
+                $sfd = New-Object Windows.Forms.SaveFileDialog
+                $sfd.Filter = 'SQL scripts|*.sql|All files|*.*'
+                $sfd.FileName = ($state.File -replace '[\[\]\\/:*?"<>|\s]', '') + '.sql'
+                if ($sfd.ShowDialog($state.Form) -eq 'OK') { [IO.File]::WriteAllText($sfd.FileName, $state.Script.Text, (New-Object Text.UTF8Encoding $true)); Set-GuiStatus "Script saved to $($sfd.FileName)." }
+                $sfd.Dispose()
+            })
+    }
+    $note = New-GuiControl Label @{ Text = 'The app only writes the script; review it and run it yourself, on a test copy first. Reports hold names and values from the database: handle them as customer data.'; AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 3, 9, 16, 3) }
+    $buttons.Controls.Add($note)
+    $dlg.Controls.Add($tabs); $dlg.Controls.Add($buttons)
+    $dlg.CancelButton = $close
+    $g.Dialog = @{ Form = $dlg; Script = $boxes['Script']; File = $FileName }
+    $dlg.Add_Load({ param($s, $e) Set-GuiControlTheme $s })
+    try { $null = $dlg.ShowDialog($g.Form) }
+    finally { $dlg.Dispose(); $g.Dialog = $null }
+}
+
 function Set-GuiGrid($Grid, $Rows, [string[]]$Columns) {
     # Typed columns, so sorting is numeric and floats use the report's precision.
     $Rows = @($Rows | Where-Object { $null -ne $_ })
@@ -5302,7 +6514,43 @@ function Set-GuiGrid($Grid, $Rows, [string[]]$Columns) {
         }
         $null = $Grid.Rows.Add($values.ToArray())
     }
+    Set-GuiGridWidths $Grid
+    if ($script:App -and $script:App.Settings) { Set-GuiGridHelp $Grid }
     $Grid.ResumeLayout()
+}
+
+function Set-GuiGridWidths($Grid) {
+    <#
+      Column widths: fitted to the contents once (an auto-size mode would stop the user from resizing them), capped so one
+      long value does not push the others out of view, and a width the user dragged is kept for that grid's column for
+      the rest of the session.
+    #>
+    $g = $script:App
+    if (-not $g) { return }
+    if (-not $g.ColumnWidths) { $g.ColumnWidths = @{} }
+    if (-not $Grid.PSObject.Properties['GuiWidthsHooked']) {
+        $Grid | Add-Member NoteProperty GuiWidthsHooked $true
+        $Grid | Add-Member NoteProperty GuiWidthsPending $false
+        $Grid.Add_ColumnWidthChanged({
+                param($s, $e)
+                $app = $script:App
+                if ($app.GridSizing -or $e.Column.InheritedAutoSizeMode -eq 'Fill') { return }
+                $app.ColumnWidths["$($s.Name)|$($e.Column.Name)"] = $e.Column.Width
+            })
+        # a grid on a hidden tab cannot measure its cells: it is fitted when its tab is shown
+        $Grid.Add_VisibleChanged({ param($s) if ($s.Visible -and $s.GuiWidthsPending) { Set-GuiGridWidths $s } })
+    }
+    if (-not $Grid.Visible -or -not $Grid.IsHandleCreated) { $Grid.GuiWidthsPending = $true; return }
+    $Grid.GuiWidthsPending = $false
+    $g.GridSizing = $true
+    try {
+        $Grid.AutoResizeColumns($(if ($Grid.Rows.Count -gt 2000) { 'DisplayedCells' } else { 'AllCells' }))
+        $cap = [int](420 * (Get-GuiScale))
+        foreach ($col in $Grid.Columns) {
+            $key = "$($Grid.Name)|$($col.Name)"
+            if ($g.ColumnWidths.ContainsKey($key)) { $col.Width = $g.ColumnWidths[$key] } elseif ($col.Width -gt $cap) { $col.Width = $cap }
+        }
+    } finally { $g.GridSizing = $false }
 }
 
 function Get-GuiCurrentResult {
@@ -5384,6 +6632,10 @@ function Show-GuiResult($D) {
         foreach ($grid in $g.Grids.Values) { $grid.Rows.Clear(); $grid.Columns.Clear() }
         $g.ChartSteps = @(); $g.Chart.Invalidate()
         Show-GuiTrie $null
+        Show-GuiHistory $null
+        Show-GuiHealth $null
+        Show-GuiEstimates $null
+        Show-GuiBytes $null
         $g.CheckFindings.Text = ''
         Set-GuiEditMode
         Update-GuiCommandState
@@ -5408,6 +6660,8 @@ function Show-GuiResult($D) {
         for ($i = 0; $i -lt $hist.Count; $i++) { $g.Grids.Histogram.Rows[$i].Tag = $hist[$i].Item }
         $g.Grids.Histogram.ClearSelection()
         $g.ChartHover = -1; $g.ChartSelected = -1
+        $g.ChartFraction = Get-StatsSampleFraction $D
+        $g.ChartFrom = 0; $g.ChartTo = $null
         Update-GuiChartSteps $hist
 
         Show-GuiDensity $D
@@ -5415,6 +6669,10 @@ function Show-GuiResult($D) {
         Set-GuiGrid $g.Grids.Columns $D.Columns Ordinal, Name, TypeName, MaxLength, Precision, Scale, IsNullable, Collation, CodePage
         Set-GuiGrid $g.Grids.TraceFlag $D.TraceFlag2388 'Updated', 'Table Cardinality', 'Snapshot Ctr', 'Steps', 'Density', 'Rows Above', 'Rows Below',
         'Squared Variance Error', 'Inserts Since Last Update', 'Deletes Since Last Update', 'Leading column Type'
+        Show-GuiHistory $D
+        Show-GuiHealth $D
+        Show-GuiEstimates $D
+        if ($g.Tabs.SelectedTab -eq $g.BytesPage) { Show-GuiBytes $D }
         $validation = $null
         if ($D.PSObject.Properties['Validation']) { $validation = $D.Validation }
         Set-GuiGrid $g.Grids.Validation $validation Check, Server, Decoded, Result
@@ -5441,10 +6699,13 @@ function Show-GuiDensity($D) {
 
 function Update-GuiChartSteps($Rows) {
     $g = $script:App
+    $before = @($g.ChartSteps).Count
     $g.ChartSteps = @($Rows)
     $w = 0
     foreach ($h in $g.ChartSteps) { $w = [Math]::Max($w, [Windows.Forms.TextRenderer]::MeasureText([string]$h.RANGE_HI_KEY, $g.ChartFont).Width) }
     $g.ChartLabelWidth = $w
+    # a new histogram (or steps inserted or deleted) shows every step again; value edits keep the zoom
+    if ($g.ChartSteps.Count -ne $before -or $null -eq $g.ChartTo) { $g.ChartFrom = 0; $g.ChartTo = $null; if ($g.ChartZoomLabel) { $g.ChartZoomLabel.Text = "$($g.ChartSteps.Count) steps" } }
     $g.Chart.Invalidate()
 }
 
@@ -5844,29 +7105,64 @@ function Get-GuiNiceScale([double]$Max) {
     return @{ Hi = $hi; Ticks = $ticks }
 }
 
+function Get-GuiLogScale([double]$Max) {
+    # 0, 1, 10, 100, ... up to the first power of ten at or above the tallest value
+    $ticks = New-Object 'System.Collections.Generic.List[double]'
+    $hi = [Math]::Pow(10, [Math]::Max(1, [Math]::Ceiling([Math]::Log10([Math]::Max($Max, 1.0) + 1))))
+    $ticks.Add(0)
+    for ($v = 1.0; $v -le $hi; $v *= 10) { $ticks.Add($v) }
+    return @{ Hi = $hi; Ticks = $ticks; Log = $true }
+}
+
+function Get-GuiChartRange {
+    # the steps on screen: the whole histogram, or the zoomed window
+    $g = $script:App
+    $n = @($g.ChartSteps).Count
+    $from = [Math]::Max(0, [int]$g.ChartFrom); $to = $(if ($null -eq $g.ChartTo -or $g.ChartTo -ge $n) { $n - 1 } else { [int]$g.ChartTo })
+    if ($to -lt $from) { $from = 0; $to = $n - 1 }
+    return @{ From = $from; To = $to; Count = $to - $from + 1 }
+}
+
 function Get-GuiHistogramLayout {
-    # Two panels sharing the step positions: RANGE_ROWS on top, EQ_ROWS below, each with its own
-    # y scale so a skew in one never flattens the other. $null when there is no room.
+    # Bars: two panels sharing the step positions, RANGE_ROWS on top, EQ_ROWS below, each with its own y scale (linear
+    # or log) so a skew in one never flattens the other. Cumulative: one panel, the share of rows up to each key.
+    # Only the steps in the zoom window. $null when there is no room.
     $g = $script:App
     $steps = @($g.ChartSteps)
     if ($steps.Count -eq 0) { return $null }
+    $range = Get-GuiChartRange
+    $visible = @($steps[$range.From..$range.To])
     $scale = $g.Chart.DeviceDpi / 96.0
     $font = $g.ChartFont
+    $s = $g.Settings
+    $f = $(if ($g.ChartFraction) { $g.ChartFraction } else { 1.0 })
     $panels = @()
     $labelWidth = 0
-    foreach ($field in 'RANGE_ROWS', 'EQ_ROWS') {
-        $max = 0.0; $sum = 0.0
-        foreach ($st in $steps) { $v = [double]$st.$field; $sum += $v; if ($v -gt $max) { $max = $v } }
-        $sc = Get-GuiNiceScale $max
-        foreach ($t in $sc.Ticks) { $labelWidth = [Math]::Max($labelWidth, [Windows.Forms.TextRenderer]::MeasureText((Format-GuiAxisNumber $t), $font).Width) }
-        $panels += @{ Field = $field; Hi = $sc.Hi; Ticks = $sc.Ticks; Average = $sum / $steps.Count }
+    if ($s.ChartView -eq 'Cumulative') {
+        $sc = @{ Hi = 100.0; Ticks = (New-Object 'System.Collections.Generic.List[double]'); Log = $false }
+        foreach ($t in 0, 25, 50, 75, 100) { $sc.Ticks.Add($t) }
+        foreach ($t in $sc.Ticks) { $labelWidth = [Math]::Max($labelWidth, [Windows.Forms.TextRenderer]::MeasureText("$t%", $font).Width) }
+        $panels += @{ Field = 'CUMULATIVE'; Hi = 100.0; Ticks = $sc.Ticks; Log = $false; Average = $null }
+    } else {
+        foreach ($field in 'RANGE_ROWS', 'EQ_ROWS') {
+            $max = 0.0; $sum = 0.0
+            foreach ($st in $visible) {
+                $v = [double]$st.$field; $sum += $v
+                if ($s.ChartIntervals -and $f -lt 1) { $v += Get-StatsCountInterval $v $f }
+                if ($field -eq 'EQ_ROWS' -and $s.ChartAverage) { $v = [Math]::Max($v, [double]$st.AVG_RANGE_ROWS) }
+                if ($v -gt $max) { $max = $v }
+            }
+            $sc = $(if ($s.ChartLog) { Get-GuiLogScale $max } else { Get-GuiNiceScale $max })
+            foreach ($t in $sc.Ticks) { $labelWidth = [Math]::Max($labelWidth, [Windows.Forms.TextRenderer]::MeasureText((Format-GuiAxisNumber $t), $font).Width) }
+            $panels += @{ Field = $field; Hi = $sc.Hi; Ticks = $sc.Ticks; Log = [bool]$s.ChartLog; Average = $sum / $visible.Count }
+        }
     }
-    # Both panels use the same left edge, so a step sits at the same x in each.
+    # every panel uses the same left edge, so a step sits at the same x in each
     $left = $labelWidth + 12 * $scale
     $right = $g.Chart.ClientSize.Width - 14 * $scale
     $title = 26 * $scale; $between = 14 * $scale; $top = 4 * $scale
     $bottom = $font.Height + 14 * $scale
-    $plotHeight = ($g.Chart.ClientSize.Height - $top - 2 * $title - $between - $bottom) / 2
+    $plotHeight = ($g.Chart.ClientSize.Height - $top - $panels.Count * $title - ($panels.Count - 1) * $between - $bottom) / $panels.Count
     if ($right - $left -lt 40 -or $plotHeight -lt 30) { return $null }
     $y = $top
     foreach ($pn in $panels) {
@@ -5874,24 +7170,40 @@ function Get-GuiHistogramLayout {
         $pn.Plot = New-Object Drawing.Rectangle ([int]$left), ([int]($y + $title)), ([int]($right - $left)), ([int]$plotHeight)
         $y += $title + $plotHeight + $between
     }
-    $first = $panels[0].Plot; $last = $panels[1].Plot
+    $first = $panels[0].Plot; $last = $panels[$panels.Count - 1].Plot
     $all = New-Object Drawing.Rectangle $first.Left, $first.Top, $first.Width, ($last.Bottom - $first.Top)
-    return @{ Panels = $panels; Plot = $all; Slot = $all.Width / $steps.Count; Scale = $scale }
+    return @{ Panels = $panels; Plot = $all; Slot = $all.Width / $range.Count; Scale = $scale; From = $range.From; To = $range.To }
 }
 
 function Get-GuiChartY($Panel, [double]$Value) {
     $p = $Panel.Plot
-    $f = [Math]::Max(0.0, [Math]::Min(1.0, $Value / $Panel.Hi))
+    $f = $(if ($Panel.Log) { [Math]::Log10(1 + [Math]::Max(0.0, $Value)) / [Math]::Log10(1 + $Panel.Hi) } else { $Value / $Panel.Hi })
+    $f = [Math]::Max(0.0, [Math]::Min(1.0, $f))
     return [single]($p.Bottom - $f * $p.Height)
 }
 
-function Get-GuiChartStepAt([Drawing.Point]$Point) {
-    # Any point over either panel (or the gap between them) maps to the step in that column.
+function Get-GuiChartStepAt([Drawing.Point]$Point, [switch]$Clamp) {
+    # Any point over the panels (or the gaps between them) maps to the step in that column (an index into all the steps).
     $layout = $script:App.ChartLayout
     if (-not $layout) { return -1 }
     $p = $layout.Plot
-    if ($Point.X -lt $p.Left -or $Point.X -ge $p.Right -or $Point.Y -lt $p.Top -or $Point.Y -gt $p.Bottom + 4) { return -1 }
-    return [Math]::Min(@($script:App.ChartSteps).Count - 1, [int][Math]::Floor(($Point.X - $p.Left) / $layout.Slot))
+    if (-not $Clamp -and ($Point.X -lt $p.Left -or $Point.X -ge $p.Right -or $Point.Y -lt $p.Top -or $Point.Y -gt $p.Bottom + 4)) { return -1 }
+    $i = $layout.From + [int][Math]::Floor(($Point.X - $p.Left) / $layout.Slot)
+    return [Math]::Max($layout.From, [Math]::Min($layout.To, $i))
+}
+
+function Set-GuiChartZoom([int]$From, [int]$To) {
+    # zoom to steps From..To (indices into all the steps); a window of at least 5 steps
+    $g = $script:App
+    $n = @($g.ChartSteps).Count
+    if ($n -eq 0) { return }
+    if ($To -lt $From) { $t = $From; $From = $To; $To = $t }
+    if ($To - $From -lt 4) { $mid = [int](($From + $To) / 2); $From = $mid - 2; $To = $mid + 2 }
+    if ($From -lt 0) { $To -= $From; $From = 0 }
+    if ($To -ge $n) { $From -= ($To - $n + 1); $To = $n - 1 }
+    $g.ChartFrom = [Math]::Max(0, $From); $g.ChartTo = $To
+    $g.ChartZoomLabel.Text = $(if ($g.ChartFrom -eq 0 -and $g.ChartTo -eq $n - 1) { "$n steps" } else { "Steps $($g.ChartFrom + 1)-$($g.ChartTo + 1) of $n" })
+    $g.Chart.Invalidate()
 }
 
 function New-GuiTopRoundedPath([single]$X, [single]$Y, [single]$Width, [single]$Height, [single]$Radius) {
@@ -5909,7 +7221,8 @@ function New-GuiTopRoundedPath([single]$X, [single]$Y, [single]$Width, [single]$
 }
 
 function Invoke-GuiHistogramPaint([Drawing.Graphics]$Graphics) {
-    # One panel per measure: RANGE_ROWS (rows between keys) and EQ_ROWS (rows equal to the key).
+    # Bars: one panel per measure, RANGE_ROWS (rows between keys) and EQ_ROWS (rows equal to the key), with optional
+    # AVG_RANGE_ROWS marks and 95% intervals (sampled statistics). Cumulative: the share of rows up to each key.
     $g = $script:App
     $pal = Get-GuiPalette
     $Graphics.Clear($pal.Surface)
@@ -5926,81 +7239,129 @@ function Invoke-GuiHistogramPaint([Drawing.Graphics]$Graphics) {
     $layout = Get-GuiHistogramLayout
     $g.ChartLayout = $layout
     if (-not $layout) { return }
-    $s = $layout.Scale; $all = $layout.Plot; $slot = $layout.Slot
+    $s = $layout.Scale; $all = $layout.Plot; $slot = $layout.Slot; $from = $layout.From; $to = $layout.To
+    $set = $g.Settings
+    $frac = $(if ($g.ChartFraction) { $g.ChartFraction } else { 1.0 })
     $colors = Get-GuiSeriesColors
     $left = [Windows.Forms.TextFormatFlags]::Left -bor [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::NoPadding
-    $descriptions = @{ RANGE_ROWS = 'rows between the previous key and this key'; EQ_ROWS = 'rows equal to the key (RANGE_HI_KEY)' }
+    $descriptions = @{ RANGE_ROWS = 'rows between the previous key and this key'; EQ_ROWS = 'rows equal to the key (RANGE_HI_KEY)'; CUMULATIVE = 'share of the rows up to and including each key' }
+    if ($set.ChartAverage) { $descriptions.EQ_ROWS += '; marks: AVG_RANGE_ROWS, rows per value inside the step' }
+    if ($set.ChartIntervals -and $frac -lt 1) { $descriptions.RANGE_ROWS += '; whiskers: 95% interval from the sample'; $descriptions.EQ_ROWS += '; whiskers: 95% interval' }
+    if ($set.ChartLog -and $set.ChartView -ne 'Cumulative') { foreach ($k in 'RANGE_ROWS', 'EQ_ROWS') { $descriptions[$k] += ' (log scale)' } }
     $brushes = @(); $pens = @()
     try {
         $rangeBrush = New-Object Drawing.SolidBrush $colors[0]; $eqBrush = New-Object Drawing.SolidBrush $colors[1]
         $surfaceBrush = New-Object Drawing.SolidBrush $pal.Surface; $hoverBrush = New-Object Drawing.SolidBrush $pal.Alternate
         $selectBrush = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(110, $pal.Selection))
+        $dragBrush = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(70, $pal.Link))
         $gridPen = New-Object Drawing.Pen $pal.Border; $basePen = New-Object Drawing.Pen $pal.Muted
         # Average line: a dashed reference in the text color, so it never reads as another series.
         $avgPen = New-Object Drawing.Pen $pal.Text, ([single](1.5 * $s))
         $avgPen.DashPattern = [single[]]@(4, 3)
-        $brushes = $rangeBrush, $eqBrush, $surfaceBrush, $hoverBrush, $selectBrush; $pens = $gridPen, $basePen, $avgPen
-        $seriesBrushes = $rangeBrush, $eqBrush
+        $whiskerPen = New-Object Drawing.Pen $pal.Text, ([single][Math]::Max(1, $s))
+        $markPen = New-Object Drawing.Pen $pal.Text, ([single](2 * $s))
+        $linePen = New-Object Drawing.Pen $colors[0], ([single](2 * $s))
+        $brushes = $rangeBrush, $eqBrush, $surfaceBrush, $hoverBrush, $selectBrush, $dragBrush; $pens = $gridPen, $basePen, $avgPen, $whiskerPen, $markPen, $linePen
+        $seriesBrushes = @{ RANGE_ROWS = $rangeBrush; EQ_ROWS = $eqBrush; CUMULATIVE = $rangeBrush }
 
         # bars: <= 24px with a 2px surface gap between neighbors
         $gap = $(if ($slot -ge 6 * $s) { 2 * $s } elseif ($slot -ge 3) { 1 } else { 0 })
         $bw = [Math]::Max(1.0, [Math]::Min(24 * $s, $slot - $gap))
         if ($bw -ge 2) { $bw = [Math]::Floor($bw) }
         $radius = $(if ($bw -ge 8 * $s) { 4 * $s } else { 0 })
+        $xOf = { param([int]$i) $layout.Plot.Left + $slot * ($i - $from + 0.5) }
+
+        # the share of rows up to each key, over the whole histogram
+        $cum = $null
+        if ($set.ChartView -eq 'Cumulative') {
+            $total = 0.0; foreach ($st in $steps) { $total += [double]$st.RANGE_ROWS + [double]$st.EQ_ROWS }
+            $cum = New-Object double[] $steps.Count; $run = 0.0
+            for ($i = 0; $i -lt $steps.Count; $i++) { $run += [double]$steps[$i].RANGE_ROWS + [double]$steps[$i].EQ_ROWS; $cum[$i] = $(if ($total -gt 0) { 100 * $run / $total } else { 0 }) }
+        }
 
         for ($n = 0; $n -lt $layout.Panels.Count; $n++) {
-            $pn = $layout.Panels[$n]; $p = $pn.Plot; $brush = $seriesBrushes[$n]
+            $pn = $layout.Panels[$n]; $p = $pn.Plot; $brush = $seriesBrushes[$pn.Field]
 
             # title: one series per panel, so the title names it (no legend box)
             $x = [single]$p.Left
             $Graphics.FillRectangle($brush, $x, [single]($pn.TitleTop + 8 * $s), [single](10 * $s), [single](10 * $s))
             $tw = [Windows.Forms.TextRenderer]::MeasureText($pn.Field, $font).Width
             [Windows.Forms.TextRenderer]::DrawText($Graphics, $pn.Field, $font, (New-Object Drawing.Rectangle ([int]($x + 15 * $s)), ([int]$pn.TitleTop), $tw, ([int](26 * $s))), $pal.Text, $left)
-            [Windows.Forms.TextRenderer]::DrawText($Graphics, $descriptions[$pn.Field], $font, (New-Object Drawing.Rectangle ([int]($x + 15 * $s + $tw + 10 * $s)), ([int]$pn.TitleTop), 420, ([int](26 * $s))), $pal.Muted, $left)
+            [Windows.Forms.TextRenderer]::DrawText($Graphics, $descriptions[$pn.Field], $font, (New-Object Drawing.Rectangle ([int]($x + 15 * $s + $tw + 10 * $s)), ([int]$pn.TitleTop), ([int]($p.Width - $tw - 30 * $s)), ([int](26 * $s))), $pal.Muted, ($left -bor [Windows.Forms.TextFormatFlags]::EndEllipsis))
 
-            # recessive grid and y labels
+            # recessive grid and y labels (a label too close to the one below it is left out: 0 and 1 on a log scale)
+            $lastY = [double]::MaxValue
             foreach ($t in $pn.Ticks) {
                 $y = Get-GuiChartY $pn $t
                 if ($t -gt 0) { $Graphics.DrawLine($gridPen, [single]$p.Left, $y, [single]$p.Right, $y) }
+                if ($lastY - $y -lt $font.Height) { continue }
+                $lastY = $y
                 $r = New-Object Drawing.Rectangle 0, ([int]($y - 10 * $s)), ([int]($p.Left - 8 * $s)), ([int](20 * $s))
-                [Windows.Forms.TextRenderer]::DrawText($Graphics, (Format-GuiAxisNumber $t), $font, $r, $pal.Muted, ([Windows.Forms.TextFormatFlags]::Right -bor [Windows.Forms.TextFormatFlags]::VerticalCenter))
+                $label = $(if ($pn.Field -eq 'CUMULATIVE') { "$t%" } else { Format-GuiAxisNumber $t })
+                [Windows.Forms.TextRenderer]::DrawText($Graphics, $label, $font, $r, $pal.Muted, ([Windows.Forms.TextFormatFlags]::Right -bor [Windows.Forms.TextFormatFlags]::VerticalCenter))
             }
 
-            # hover and selection bands behind the bars, in both panels
+            # drag-to-zoom band, then hover and selection bands behind the bars, in every panel
+            if ($g.ChartDrag -and $g.ChartDrag.Moved) {
+                $a = [Math]::Min($g.ChartDrag.From, $g.ChartDrag.To); $b = [Math]::Max($g.ChartDrag.From, $g.ChartDrag.To)
+                $Graphics.FillRectangle($dragBrush, [single]($p.Left + $slot * ($a - $from)), [single]$p.Top, [single]($slot * ($b - $a + 1)), [single]$p.Height)
+            }
             foreach ($band in @(@($g.ChartSelected, $selectBrush), @($g.ChartHover, $hoverBrush))) {
-                if ($band[0] -ge 0 -and $band[0] -lt $steps.Count) { $Graphics.FillRectangle($band[1], [single]($p.Left + $slot * $band[0]), [single]$p.Top, [single][Math]::Max(1.0, $slot), [single]$p.Height) }
+                if ($band[0] -ge $from -and $band[0] -le $to) { $Graphics.FillRectangle($band[1], [single]($p.Left + $slot * ($band[0] - $from)), [single]$p.Top, [single][Math]::Max(1.0, $slot), [single]$p.Height) }
             }
 
             $Graphics.SmoothingMode = 'AntiAlias'
-            for ($i = 0; $i -lt $steps.Count; $i++) {
-                $v = [double]$steps[$i].($pn.Field)
-                if ($v -le 0) { continue }
-                $x0 = [single][Math]::Round($p.Left + $slot * ($i + 0.5) - $bw / 2)
-                $yT = Get-GuiChartY $pn $v
-                if ($p.Bottom - $yT -lt $s) { $yT = [single]($p.Bottom - $s) }
-                $path = New-GuiTopRoundedPath $x0 $yT $bw ([single]($p.Bottom - $yT)) $radius
-                $Graphics.FillPath($brush, $path); $path.Dispose()
+            if ($pn.Field -eq 'CUMULATIVE') {
+                $pts = New-Object 'System.Collections.Generic.List[Drawing.PointF]'
+                for ($i = $from; $i -le $to; $i++) { $pts.Add((New-Object Drawing.PointF ([single](& $xOf $i)), (Get-GuiChartY $pn $cum[$i]))) }
+                if ($pts.Count -ge 2) { $Graphics.DrawLines($linePen, $pts.ToArray()) }
+                if ($slot -ge 5 * $s) { foreach ($pt in $pts) { $Graphics.FillEllipse($rangeBrush, [single]($pt.X - 2.5 * $s), [single]($pt.Y - 2.5 * $s), [single](5 * $s), [single](5 * $s)) } }
+            } else {
+                for ($i = $from; $i -le $to; $i++) {
+                    $v = [double]$steps[$i].($pn.Field)
+                    $cx = & $xOf $i
+                    if ($v -gt 0) {
+                        $x0 = [single][Math]::Round($cx - $bw / 2)
+                        $yT = Get-GuiChartY $pn $v
+                        if ($p.Bottom - $yT -lt $s) { $yT = [single]($p.Bottom - $s) }
+                        $path = New-GuiTopRoundedPath $x0 $yT $bw ([single]($p.Bottom - $yT)) $radius
+                        $Graphics.FillPath($brush, $path); $path.Dispose()
+                        if ($set.ChartIntervals -and $frac -lt 1) {
+                            # 95% interval of a count scaled up from the rows sampled
+                            $h = Get-StatsCountInterval $v $frac
+                            $y1 = Get-GuiChartY $pn ($v + $h); $y2 = Get-GuiChartY $pn ([Math]::Max(0, $v - $h)); $cap = [single][Math]::Min(4 * $s, $bw / 2)
+                            $Graphics.DrawLine($whiskerPen, [single]$cx, $y1, [single]$cx, $y2)
+                            $Graphics.DrawLine($whiskerPen, [single]($cx - $cap), $y1, [single]($cx + $cap), $y1)
+                        }
+                    }
+                    if ($pn.Field -eq 'EQ_ROWS' -and $set.ChartAverage -and [double]$steps[$i].RANGE_ROWS -gt 0) {
+                        $ya = Get-GuiChartY $pn ([double]$steps[$i].AVG_RANGE_ROWS); $half = [single][Math]::Max(2 * $s, $bw / 2 + 2 * $s)
+                        $Graphics.DrawLine($markPen, [single]($cx - $half), $ya, [single]($cx + $half), $ya)
+                    }
+                }
             }
             $Graphics.SmoothingMode = 'None'
             $Graphics.DrawLine($basePen, [single]$p.Left, [single]$p.Bottom, [single]$p.Right, [single]$p.Bottom)
 
-            # average of this measure over all steps, labeled at the right end
-            $ya = Get-GuiChartY $pn $pn.Average
-            $Graphics.DrawLine($avgPen, [single]$p.Left, $ya, [single]$p.Right, $ya)
-            $avgText = 'avg ' + $pn.Average.ToString('#,0.##', $script:Inv)
-            $at = [Windows.Forms.TextRenderer]::MeasureText($avgText, $font)
-            $ay = [int][Math]::Max($p.Top, $ya - $at.Height - 2 * $s)
-            $ar = New-Object Drawing.Rectangle ([int]($p.Right - $at.Width - 4 * $s)), $ay, ([int]($at.Width + 4 * $s)), $at.Height
-            $Graphics.FillRectangle($surfaceBrush, $ar)
-            [Windows.Forms.TextRenderer]::DrawText($Graphics, $avgText, $font, $ar, $pal.Text, $center)
+            # average of this measure over the steps shown, labeled at the right end
+            if ($null -ne $pn.Average) {
+                $ya = Get-GuiChartY $pn $pn.Average
+                $Graphics.DrawLine($avgPen, [single]$p.Left, $ya, [single]$p.Right, $ya)
+                $avgText = 'avg ' + $pn.Average.ToString('#,0.##', $script:Inv)
+                $at = [Windows.Forms.TextRenderer]::MeasureText($avgText, $font)
+                $ay = [int][Math]::Max($p.Top, $ya - $at.Height - 2 * $s)
+                $ar = New-Object Drawing.Rectangle ([int]($p.Right - $at.Width - 4 * $s)), $ay, ([int]($at.Width + 4 * $s)), $at.Height
+                $Graphics.FillRectangle($surfaceBrush, $ar)
+                [Windows.Forms.TextRenderer]::DrawText($Graphics, $avgText, $font, $ar, $pal.Text, $center)
+            }
         }
 
         # x labels under the bottom panel: RANGE_HI_KEY on every k-th step so they never collide
         $p = $layout.Panels[$layout.Panels.Count - 1].Plot
         $lw = [int][Math]::Min([Math]::Max($g.ChartLabelWidth, 20), 140 * $s)
         $every = [Math]::Max(1, [int][Math]::Ceiling(($lw + 12 * $s) / $slot))
-        for ($i = 0; $i -lt $steps.Count; $i += $every) {
-            $cx = $p.Left + $slot * ($i + 0.5)
+        for ($i = $from; $i -le $to; $i += $every) {
+            $cx = & $xOf $i
             $lx = [int][Math]::Max(0.0, [Math]::Min($cx - $lw / 2, $box.Width - $lw))
             $r = New-Object Drawing.Rectangle $lx, ([int]($p.Bottom + 4 * $s)), $lw, ($font.Height + 4)
             [Windows.Forms.TextRenderer]::DrawText($Graphics, [string]$steps[$i].RANGE_HI_KEY, $font, $r, $pal.Muted,
@@ -6009,7 +7370,7 @@ function Invoke-GuiHistogramPaint([Drawing.Graphics]$Graphics) {
 
         # hover readout, beside the hovered column at the top of the first panel
         $hi = $g.ChartHover
-        if ($hi -ge 0 -and $hi -lt $steps.Count) {
+        if ($hi -ge $from -and $hi -le $to -and -not ($g.ChartDrag -and $g.ChartDrag.Moved)) {
             $st = $steps[$hi]
             $fmt = $(if ($g.FullPrecisionRun) { 'R' } else { 'G7' })
             $key = [string]$st.RANGE_HI_KEY
@@ -6018,7 +7379,16 @@ function Invoke-GuiHistogramPaint([Drawing.Graphics]$Graphics) {
             $rows = @(@('Step', [string]$st.Step), @('RANGE_HI_KEY', $key))
             foreach ($field in 'RANGE_ROWS', 'EQ_ROWS', 'DISTINCT_RANGE_ROWS', 'AVG_RANGE_ROWS') {
                 $v = $st.$field
-                $rows += , @($field, $(if ($v -is [IFormattable]) { $v.ToString($fmt, $script:Inv) } else { [string]$v }))
+                $text = $(if ($v -is [IFormattable]) { $v.ToString($fmt, $script:Inv) } else { [string]$v })
+                if ($frac -lt 1 -and $field -in 'RANGE_ROWS', 'EQ_ROWS' -and $v -is [IFormattable] -and [double]$v -gt 0) { $text += ' +/- ' + (Get-StatsCountInterval ([double]$v) $frac).ToString('#,0', $script:Inv) }
+                $rows += , @($field, $text)
+            }
+            if ($cum) { $rows += , @('Rows up to the key', ($cum[$hi].ToString('0.##', $script:Inv) + '%')) }
+            if ($set.Explain) {
+                # what the optimizer does with this step
+                $rows += , @('', '')
+                $rows += , @('= key', 'estimates EQ_ROWS rows')
+                $rows += , @('inside', 'each value estimates AVG_RANGE_ROWS rows')
             }
             $c1 = 0; $c2 = 0
             foreach ($row in $rows) {
@@ -6027,8 +7397,8 @@ function Invoke-GuiHistogramPaint([Drawing.Graphics]$Graphics) {
             }
             $lh = $font.Height + 2 * $s; $pad = 8 * $s
             $bwid = [int]($c1 + $c2 + 3 * $pad); $bht = [int]($rows.Count * $lh + 2 * $pad)
-            $bx = $all.Left + $slot * ($hi + 1) + 8 * $s
-            if ($bx + $bwid -gt $box.Width - 4) { $bx = $all.Left + $slot * $hi - 8 * $s - $bwid }
+            $bx = $all.Left + $slot * ($hi - $from + 1) + 8 * $s
+            if ($bx + $bwid -gt $box.Width - 4) { $bx = $all.Left + $slot * ($hi - $from) - 8 * $s - $bwid }
             $bx = [int][Math]::Max(4.0, $bx); $by = [int]($all.Top + 4 * $s)
             $bgBrush = New-Object Drawing.SolidBrush $pal.Background; $brushes += $bgBrush
             $Graphics.FillRectangle($bgBrush, $bx, $by, $bwid, $bht)
@@ -6347,7 +7717,7 @@ function Set-GuiTrieZoom([double]$Zoom, $Anchor) {
 }
 
 function Show-GuiTrie($D) {
-    # String index tab for the selected statistics object; layouts are built once per orientation.
+    # Strings tab (the string index) for the selected statistics object; layouts are built once per orientation.
     $g = $script:App
     $si = $null
     if ($D -and $D.StringIndex -and @($D.StringIndex.Nodes).Count) { $si = $D.StringIndex }
@@ -6402,7 +7772,7 @@ function Save-GuiTrieImage {
 }
 
 function New-GuiTriePage($Page) {
-    # String index tab: a toolbar (orientation, zoom, save) over a scrollable, owner-drawn canvas.
+    # Strings tab (the string index): a toolbar (orientation, zoom, save) over a scrollable, owner-drawn canvas.
     $g = $script:App
     $bar = New-GuiControl FlowLayoutPanel @{ Dock = 'Top'; AutoSize = $true; WrapContents = $true; Margin = (New-Object Windows.Forms.Padding 0) }
     $g.TrieSummary = New-GuiControl Label @{ AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 3, 7, 14, 3) }
@@ -6476,6 +7846,639 @@ function New-GuiTriePage($Page) {
             }
             $s.Invalidate()
         })
+}
+
+function Show-GuiHealth($D) {
+    # Health tab: the findings of the statistic alone, worst first, the rating colored like the data check's
+    $g = $script:App
+    $rows = $(if ($D) { Get-StatsHealthFindings $D } else { @() })
+    $grid = $g.Grids.Health
+    Set-GuiGrid $grid $rows Result, Finding, Detail
+    if ($grid.Columns.Count) {
+        $grid.Columns['Detail'].DefaultCellStyle.WrapMode = 'True'
+        # the detail takes the room left; the other two keep the widths fitted to them (and can be resized)
+        $grid.Columns['Detail'].AutoSizeMode = 'Fill'
+        $grid.AutoSizeRowsMode = 'AllCells'
+    }
+}
+
+function Show-GuiEstimates($D) {
+    # Estimates tab: each step's estimate against the unknown-value estimate (chart), the summary, the density vector's estimates
+    $g = $script:App
+    $g.EstimateData = $(if ($D -and $D.Blob) { Get-StatsEstimateAnalysis $D } else { $null })
+    $g.EstimateHover = -1
+    $a = $g.EstimateData
+    $vectors = $(if ($a) { @($a.Vectors | ForEach-Object { [pscustomobject]@{ Columns = $_.Columns; 'All density' = $_.AllDensity; 'GROUP BY / DISTINCT rows' = [Math]::Round($_.Distinct); 'Equality on unknown values' = $_.UnknownEquality } }) } else { @() })
+    Set-GuiGrid $g.Grids.Estimates $vectors Columns, 'All density', 'GROUP BY / DISTINCT rows', 'Equality on unknown values'
+    $lines = $(if ($D -and $D.Blob) { @([string[]](Format-StatsEstimatesSection $D) | Where-Object { $_ -and $_ -notmatch '^[=+|]' -and $_ -notmatch '^\s+[A-Z][A-Z ,:]+$' -and $_ -notlike 'GROUP BY / DISTINCT and*' }) } else { @() })
+    $g.EstimateFindings.Text = ($lines | Select-Object -First 4 | ForEach-Object { [char]0x2022 + ' ' + $_ }) -join [Environment]::NewLine
+    $g.EstimateFindings.Select(0, 0)
+    $g.EstimateChart.Invalidate()
+}
+
+function Get-GuiEstimateLayout {
+    $g = $script:App
+    $a = $g.EstimateData
+    if (-not $a -or -not @($a.Steps).Count) { return $null }
+    $s = $g.EstimateChart.DeviceDpi / 96.0
+    $max = [Math]::Max([double]$a.Unknown, (@($a.Steps | ForEach-Object { [Math]::Max([double]$_.EqRows, [double]$_.AvgRangeRows) }) | Measure-Object -Maximum).Maximum)
+    $sc = Get-GuiLogScale $max
+    $lw = 0; foreach ($t in $sc.Ticks) { $lw = [Math]::Max($lw, [Windows.Forms.TextRenderer]::MeasureText((Format-GuiAxisNumber $t), $g.ChartFont).Width) }
+    $left = $lw + 12 * $s; $right = $g.EstimateChart.ClientSize.Width - 14 * $s
+    $top = 30 * $s; $bottom = $g.EstimateChart.ClientSize.Height - $g.ChartFont.Height - 14 * $s
+    if ($right - $left -lt 40 -or $bottom - $top -lt 40) { return $null }
+    $plot = New-Object Drawing.Rectangle ([int]$left), ([int]$top), ([int]($right - $left)), ([int]($bottom - $top))
+    return @{ Plot = $plot; Panel = @{ Plot = $plot; Hi = $sc.Hi; Log = $true }; Ticks = $sc.Ticks; Slot = $plot.Width / @($a.Steps).Count; Scale = $s }
+}
+
+function Invoke-GuiEstimatesPaint([Drawing.Graphics]$Graphics) {
+    # EQ_ROWS of each key (what the optimizer estimates for "= key"), log scale, against the dashed unknown-value estimate;
+    # keys 10x or more away from it in the warning color; marks: AVG_RANGE_ROWS (values inside the step).
+    $g = $script:App
+    $pal = Get-GuiPalette
+    $Graphics.Clear($pal.Surface)
+    $font = $g.ChartFont
+    $center = [Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [Windows.Forms.TextFormatFlags]::VerticalCenter
+    $L = Get-GuiEstimateLayout
+    $g.EstimateLayout = $L
+    if (-not $L) { [Windows.Forms.TextRenderer]::DrawText($Graphics, 'Decode a statistics object to see its estimates.', $font, $g.EstimateChart.ClientRectangle, $pal.Muted, $center); return }
+    $a = $g.EstimateData; $steps = @($a.Steps); $p = $L.Plot; $s = $L.Scale; $slot = $L.Slot
+    $left = [Windows.Forms.TextFormatFlags]::Left -bor [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::NoPadding
+    $colors = Get-GuiSeriesColors
+    $warn = Get-GuiResultColor 'Poor'
+    $disp = @()
+    try {
+        $keyBrush = New-Object Drawing.SolidBrush $colors[0]; $warnBrush = New-Object Drawing.SolidBrush $warn; $hoverBrush = New-Object Drawing.SolidBrush $pal.Alternate
+        $gridPen = New-Object Drawing.Pen $pal.Border; $basePen = New-Object Drawing.Pen $pal.Muted
+        $unkPen = New-Object Drawing.Pen $pal.Text, ([single](1.5 * $s)); $unkPen.DashPattern = [single[]]@(4, 3)
+        $markPen = New-Object Drawing.Pen $pal.Text, ([single](2 * $s))
+        $disp = @($keyBrush, $warnBrush, $hoverBrush, $gridPen, $basePen, $unkPen, $markPen)
+        # title and legend
+        $x = [single]$p.Left
+        $items = @(@($keyBrush, 'key estimate (EQ_ROWS)'), @($warnBrush, '10x or more from the unknown-value estimate'))
+        foreach ($it in $items) {
+            $Graphics.FillRectangle($it[0], $x, [single](8 * $s), [single](10 * $s), [single](10 * $s))
+            $tw = [Windows.Forms.TextRenderer]::MeasureText($it[1], $font).Width
+            [Windows.Forms.TextRenderer]::DrawText($Graphics, $it[1], $font, (New-Object Drawing.Rectangle ([int]($x + 14 * $s)), 0, $tw, ([int](26 * $s))), $pal.Text, $left)
+            $x += 14 * $s + $tw + 16 * $s
+        }
+        $Graphics.DrawLine($markPen, $x, [single](13 * $s), [single]($x + 12 * $s), [single](13 * $s))
+        [Windows.Forms.TextRenderer]::DrawText($Graphics, 'AVG_RANGE_ROWS (values inside the step); dashed: unknown value; log scale', $font, (New-Object Drawing.Rectangle ([int]($x + 16 * $s)), 0, 600, ([int](26 * $s))), $pal.Muted, $left)
+        foreach ($t in $L.Ticks) {
+            $y = Get-GuiChartY $L.Panel $t
+            if ($t -gt 0) { $Graphics.DrawLine($gridPen, [single]$p.Left, $y, [single]$p.Right, $y) }
+            [Windows.Forms.TextRenderer]::DrawText($Graphics, (Format-GuiAxisNumber $t), $font, (New-Object Drawing.Rectangle 0, ([int]($y - 10 * $s)), ([int]($p.Left - 8 * $s)), ([int](20 * $s))), $pal.Muted, ([Windows.Forms.TextFormatFlags]::Right -bor [Windows.Forms.TextFormatFlags]::VerticalCenter))
+        }
+        $h = $g.EstimateHover
+        if ($h -ge 0 -and $h -lt $steps.Count) { $Graphics.FillRectangle($hoverBrush, [single]($p.Left + $slot * $h), [single]$p.Top, [single][Math]::Max(1.0, $slot), [single]$p.Height) }
+        $bw = [Math]::Max(1.0, [Math]::Min(24 * $s, $slot - $(if ($slot -ge 6 * $s) { 2 * $s } else { 0 })))
+        for ($i = 0; $i -lt $steps.Count; $i++) {
+            $st = $steps[$i]; $cx = $p.Left + $slot * ($i + 0.5)
+            $y = Get-GuiChartY $L.Panel ([double]$st.EqRows)
+            $b = $(if ($st.KeyRatio -ge 10) { $warnBrush } else { $keyBrush })
+            if ($p.Bottom - $y -ge 1) { $Graphics.FillRectangle($b, [single]($cx - $bw / 2), $y, [single]$bw, [single]($p.Bottom - $y)) }
+            if ([double]$st.RangeRows -gt 0) {
+                $ya = Get-GuiChartY $L.Panel ([double]$st.AvgRangeRows); $half = [single][Math]::Max(2 * $s, $bw / 2 + 2 * $s)
+                $Graphics.DrawLine($markPen, [single]($cx - $half), $ya, [single]($cx + $half), $ya)
+            }
+        }
+        $Graphics.DrawLine($basePen, [single]$p.Left, [single]$p.Bottom, [single]$p.Right, [single]$p.Bottom)
+        $yu = Get-GuiChartY $L.Panel ([double]$a.Unknown)
+        $Graphics.DrawLine($unkPen, [single]$p.Left, $yu, [single]$p.Right, $yu)
+        $ut = 'unknown value: ' + ([double]$a.Unknown).ToString('#,0.#', $script:Inv) + ' rows'
+        $us = [Windows.Forms.TextRenderer]::MeasureText($ut, $font)
+        $ur = New-Object Drawing.Rectangle ([int]($p.Right - $us.Width - 6 * $s)), ([int][Math]::Max($p.Top, $yu - $us.Height - 2 * $s)), ([int]($us.Width + 4 * $s)), $us.Height
+        $sb = New-Object Drawing.SolidBrush $pal.Surface; $disp += $sb
+        $Graphics.FillRectangle($sb, $ur)
+        [Windows.Forms.TextRenderer]::DrawText($Graphics, $ut, $font, $ur, $pal.Text, $center)
+        # x labels: every k-th key
+        $lw = [int](110 * $s); $every = [Math]::Max(1, [int][Math]::Ceiling(($lw + 12 * $s) / $slot))
+        for ($i = 0; $i -lt $steps.Count; $i += $every) {
+            $cx = $p.Left + $slot * ($i + 0.5)
+            [Windows.Forms.TextRenderer]::DrawText($Graphics, [string]$steps[$i].Key, $font, (New-Object Drawing.Rectangle ([int][Math]::Max(0, $cx - $lw / 2)), ([int]($p.Bottom + 4 * $s)), $lw, ($font.Height + 4)), $pal.Muted,
+                ([Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [Windows.Forms.TextFormatFlags]::EndEllipsis -bor [Windows.Forms.TextFormatFlags]::NoPrefix))
+        }
+        if ($h -ge 0 -and $h -lt $steps.Count) {
+            $st = $steps[$h]
+            # (each value in parentheses: a comma binds tighter than +)
+            $rows = @(@('Step', [string]$st.Step), @('RANGE_HI_KEY', $(if ($st.Key.Length -gt 50) { $st.Key.Substring(0, 47) + '...' } else { $st.Key })),
+                @('= key estimates', (([double]$st.EqRows).ToString('#,0.##', $script:Inv) + ' rows')), @('inside the step', (([double]$st.AvgRangeRows).ToString('#,0.##', $script:Inv) + ' rows per value')),
+                @('unknown value', (([double]$a.Unknown).ToString('#,0.##', $script:Inv) + ' rows')), @('key vs unknown', (([double]$st.KeyRatio).ToString('#,0.#', $script:Inv) + 'x ' + $(if ($st.Over) { 'more' } else { 'less' }))))
+            $c1 = 0; $c2 = 0
+            foreach ($r in $rows) { $c1 = [Math]::Max($c1, [Windows.Forms.TextRenderer]::MeasureText($r[0], $font).Width); $c2 = [Math]::Max($c2, [Windows.Forms.TextRenderer]::MeasureText($r[1], $font).Width) }
+            $lh = $font.Height + 2 * $s; $pad = 8 * $s
+            $bwid = [int]($c1 + $c2 + 3 * $pad); $bht = [int]($rows.Count * $lh + 2 * $pad)
+            $bx = $p.Left + $slot * ($h + 1) + 8 * $s
+            if ($bx + $bwid -gt $g.EstimateChart.ClientSize.Width - 4) { $bx = $p.Left + $slot * $h - 8 * $s - $bwid }
+            $bx = [int][Math]::Max(4.0, $bx); $by = [int]($p.Top + 4 * $s)
+            $bg = New-Object Drawing.SolidBrush $pal.Background; $disp += $bg
+            $Graphics.FillRectangle($bg, $bx, $by, $bwid, $bht); $Graphics.DrawRectangle($gridPen, $bx, $by, $bwid - 1, $bht - 1)
+            for ($k = 0; $k -lt $rows.Count; $k++) {
+                $ry = [int]($by + $pad + $k * $lh)
+                [Windows.Forms.TextRenderer]::DrawText($Graphics, $rows[$k][0], $font, (New-Object Drawing.Rectangle ([int]($bx + $pad)), $ry, $c1, ([int]$lh)), $pal.Muted, $left)
+                [Windows.Forms.TextRenderer]::DrawText($Graphics, $rows[$k][1], $font, (New-Object Drawing.Rectangle ([int]($bx + 2 * $pad + $c1)), $ry, $c2, ([int]$lh)), $pal.Text, ($left -bor [Windows.Forms.TextFormatFlags]::NoPrefix))
+            }
+        }
+    } finally { foreach ($x in $disp) { $x.Dispose() } }
+}
+
+# Explain mode: what each field means, as tooltips on grid headers, header fields and tabs
+$script:FieldHelp = @{
+    'RANGE_HI_KEY' = 'The step''s upper bound: a value of the column. "= this value" estimates EQ_ROWS rows.'
+    'RANGE_ROWS' = 'Rows above the previous step''s key and below this key (the key itself not included).'
+    'EQ_ROWS' = 'Rows equal to RANGE_HI_KEY: the estimate for an equality on the key.'
+    'DISTINCT_RANGE_ROWS' = 'Distinct values inside the step, the key not included.'
+    'AVG_RANGE_ROWS' = 'RANGE_ROWS / DISTINCT_RANGE_ROWS: the estimate for an equality on any value inside the step.'
+    'Step' = 'Position in the histogram (at most 200 steps, plus the NULL step).'
+    'RecOffset' = 'Byte offset of the step record in the stream (see the Bytes tab).'
+    'RecLen' = 'Length of the step record in bytes.'
+    'Updated' = 'When the statistics were last built (server time).'
+    'Rows' = 'Rows in the table (or in the filter) when the statistics were built.'
+    'Rows Sampled' = 'Rows read to build them: equal to Rows for a full scan.'
+    'Density' = 'A density kept for compatibility (pre-SQL Server 2008); the optimizer uses the density vector.'
+    'Average key length' = 'Average bytes of the statistics columns, all of them together.'
+    'Unfiltered Rows' = 'Rows in the whole table, for filtered statistics.'
+    'Pages sampled' = 'Pages read by a sampled update.'
+    'Persisted sample percent' = 'The sample rate PERSIST_SAMPLE_PERCENT keeps for later updates.'
+    'Vector' = 'Leading columns covered: 1 = the first column, 2 = the first two, and so on.'
+    'All density' = '1 / distinct values of these columns (NULL counted as one value). Unknown-value equality estimates density x rows; GROUP BY estimates 1 / density.'
+    'Average Length' = 'Average bytes of these columns together.'
+    'Column avg length (stored)' = 'Average bytes of this vector''s last column, as stored.'
+    'Columns' = 'The statistics columns this row covers.'
+    'Table Cardinality' = 'Rows when that update ran.'
+    'Snapshot Ctr' = 'The leading column''s modification counter at that update.'
+    'Steps' = 'Histogram steps at that update.'
+    'Rows Above' = 'Rows inserted above the previous histogram''s last step before this update (ascending keys).'
+    'Rows Below' = 'Rows inserted below the previous histogram''s first step before this update.'
+    'Inserts Since Last Update' = 'Rows inserted between the previous update and this one.'
+    'Deletes Since Last Update' = 'Rows deleted between the previous update and this one.'
+    'Squared Variance Error' = 'How far the new rows were from the previous histogram''s shape (used internally).'
+    'Leading column Type' = 'Ascending, Descending, Stationary or Unknown: three updates in a row with most new rows past the same end brand a column (trace flags 2389/2390).'
+    'Result' = 'Rating: Good, Fair, Poor, or INFO for facts worth knowing.'
+    'Finding' = 'What was found in the statistic.'
+    'Detail' = 'Why it matters and what to do.'
+    'GROUP BY / DISTINCT rows' = 'Rows a GROUP BY or DISTINCT on these columns estimates: 1 / all density.'
+    'Equality on unknown values' = 'Rows an equality on all these columns estimates when the values are unknown at compile time (local variables, OPTIMIZE FOR UNKNOWN): all density x rows.'
+    'Offset' = 'Byte offset in the stream.'
+    'Length' = 'Bytes in the range.'
+    'Field' = 'What the bytes hold.'
+    'Value' = 'The decoded value.'
+    'Group' = 'The part of the stream.'
+    'Check' = 'What was compared with DBCC SHOW_STATISTICS.'
+    'Server' = 'What SQL Server returned.'
+    'Decoded' = 'What the decoder read from the stream.'
+}
+$script:TabHelp = @{
+    'Report' = 'Everything decoded, as text: what Copy report and Save report write.'
+    'Header' = 'The statistics header: when they were built, from how many rows, from how many sampled.'
+    'Histogram' = 'Up to 200 steps on the leading column: how the optimizer estimates equalities and ranges on it.'
+    'Density' = 'Density vector: one density per leading column combination, for unknown-value and GROUP BY estimates.'
+    'Strings' = 'String index: the trie behind LIKE estimates on string columns.'
+    'Columns' = 'The statistics columns, their types and collations.'
+    'History' = 'Update history: the current update and up to three before it, with what changed between them.'
+    'Health' = 'Problems visible in the statistic itself, worst first.'
+    'Estimates' = 'Each key''s estimate against the unknown-value estimate: parameter sensitivity, and GROUP BY estimates.'
+    'Validation' = 'The decoded values compared with DBCC SHOW_STATISTICS.'
+    'Data check' = 'The histogram compared with the table''s real counts (reads the table on request).'
+    'Bytes' = 'The raw stream, every byte mapped to its field.'
+}
+
+function Set-GuiGridHelp($Grid) {
+    # explain mode: each column header's tooltip, and each field of the Header grid (unbound grids take the text directly)
+    $on = [bool]$script:App.Settings.Explain
+    $help = $script:FieldHelp
+    $Grid.ShowCellToolTips = $on
+    foreach ($c in $Grid.Columns) { $c.ToolTipText = $(if ($on -and $help.ContainsKey($c.Name)) { $help[$c.Name] } else { '' }) }
+    if ($Grid.Name -eq 'Header' -and $Grid.Columns.Contains('Field')) {
+        foreach ($r in $Grid.Rows) { $k = [string]$r.Cells['Field'].Value; $r.Cells['Field'].ToolTipText = $(if ($on -and $help.ContainsKey($k)) { $help[$k] } else { '' }) }
+    }
+}
+
+function Set-GuiTabFit {
+    # The result tabs in one row, without scroll arrows: when the captions do not fit, their side padding shrinks, and
+    # grows back when the window does. Padding changes recreate the tab strip, so only on a change.
+    $t = $script:App.Tabs
+    if (-not $t -or $t.TabCount -eq 0 -or -not $t.IsHandleCreated) { return }
+    $full = [int](12 * (Get-GuiScale)); $n = $t.TabCount
+    # Windows sizes each tab for its caption measured at 96 DPI, but the skin draws it at the screen's DPI (wider when the
+    # display is scaled): the padding never goes below what the widest shortfall needs, with the skin's 1-pixel inset and
+    # 1 pixel to spare a side
+    $min = 2
+    for ($i = 0; $i -lt $n; $i++) {
+        $reserved = $t.GetTabRect($i).Width - 2 * $t.Padding.X
+        $drawn = [Windows.Forms.TextRenderer]::MeasureText($t.TabPages[$i].Text, $t.Font).Width
+        $min = [Math]::Max($min, [int][Math]::Ceiling(($drawn + 4 - $reserved) / 2.0))
+    }
+    $min = [Math]::Min($min, $full)
+    # the strip's width at full padding, from the current one (each tab has the padding on both sides)
+    $need = $t.GetTabRect($n - 1).Right - $t.GetTabRect(0).Left + 2 * $n * ($full - $t.Padding.X) + 6
+    $p = $full
+    if ($need -gt $t.ClientSize.Width) { $p = [Math]::Max($min, $full - [int][Math]::Ceiling(($need - $t.ClientSize.Width) / (2.0 * $n))) }
+    if ($p -ne $t.Padding.X) { $t.Padding = New-Object Drawing.Point $p, $t.Padding.Y }
+}
+
+function Set-GuiExplainMode([bool]$On) {
+    # tooltips on every grid and tab while explain mode is on
+    $g = $script:App
+    $g.Settings.Explain = $On
+    $g.Tabs.ShowToolTips = $On
+    foreach ($page in $g.Tabs.TabPages) { $page.ToolTipText = $(if ($On -and $script:TabHelp.ContainsKey($page.Text)) { $script:TabHelp[$page.Text] } else { '' }) }
+    foreach ($grid in $g.Grids.Values) { Set-GuiGridHelp $grid }
+    if ($g.ExplainItem) { $g.ExplainItem.Checked = $On }
+    $g.Chart.Invalidate()
+}
+
+function Show-GuiHistory($D) {
+    # History tab (update history): the chart and the findings, over the TF 2388 grid.
+    $g = $script:App
+    $g.HistoryRows = @()
+    if ($D) { $g.HistoryRows = @($D.TraceFlag2388 | Where-Object { $null -ne $_.Updated }) }
+    [array]::Reverse($g.HistoryRows)
+    $findings = $(if ($D) { @(Get-StatsHistoryFindings $D) } else { @() })
+    $g.HistoryFindings.Text = $(if ($findings) { ($findings | ForEach-Object { [char]0x2022 + ' ' + $_ }) -join [Environment]::NewLine }
+        elseif ($D) { 'This statistics object has no update before the current one: the stream keeps the previous updates once there are some.' } else { '' })
+    if ($findings) { $g.HistoryFindings.Text += [Environment]::NewLine + [char]0x2022 + ' Above and Below: new rows past the last or before the first step of the previous histogram.' }
+    $g.HistoryFindings.Select(0, 0)
+    $g.HistoryChart.Invalidate()
+}
+
+function Invoke-GuiHistoryPaint([Drawing.Graphics]$Graphics) {
+    # Four small panels over the updates, oldest to newest: table rows, histogram steps, distinct values (1 / density),
+    # and what changed before each update (inserts, deletes, and new rows above or below the previous histogram).
+    $g = $script:App
+    $pal = Get-GuiPalette
+    $Graphics.Clear($pal.Surface)
+    $font = $g.ChartFont
+    $box = $g.HistoryChart.ClientRectangle
+    $rows = @($g.HistoryRows)
+    $center = [Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::NoPrefix
+    if ($rows.Count -eq 0) {
+        [Windows.Forms.TextRenderer]::DrawText($Graphics, $(if ($g.Results.Count) { 'No update history for this statistics object.' } else { 'Decode a statistics object to see its update history.' }), $font, $box, $pal.Muted, $center)
+        return
+    }
+    $s = $g.HistoryChart.DeviceDpi / 96.0
+    $series = Get-GuiSeriesColors
+    $changeColors = @($series[0], $series[1], (Get-GuiByteGroupColor 'String index'), (Get-GuiByteGroupColor 'Blob'))
+    $panels = @(
+        @{ Title = 'Table rows'; Values = @($rows | ForEach-Object { [double]$_.'Table Cardinality' }) }
+        @{ Title = 'Histogram steps'; Values = @($rows | ForEach-Object { [double]$_.Steps }) }
+        @{ Title = 'Distinct values (1 / density)'; Values = @($rows | ForEach-Object { if ([double]$_.Density -gt 0) { 1 / [double]$_.Density } else { 0 } }) }
+        @{ Title = 'Changes before each update'; Groups = @('Inserts', 'Deletes', 'Above', 'Below')
+            Values = @($rows | ForEach-Object { , @($_.'Inserts Since Last Update', $_.'Deletes Since Last Update', $_.'Rows Above', $_.'Rows Below') })
+        }
+    )
+    $gap = 18 * $s; $title = 24 * $s; $xlab = 2 * $font.Height + 8 * $s
+    $pw = ($box.Width - 3 * $gap) / 2; $ph = ($box.Height - 3 * $gap) / 2
+    if ($pw -lt 120 -or $ph -lt 90) { return }
+    $left = [Windows.Forms.TextFormatFlags]::Left -bor [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::NoPadding
+    $brushes = @(); $pens = @()
+    try {
+        $gridPen = New-Object Drawing.Pen $pal.Border; $basePen = New-Object Drawing.Pen $pal.Muted; $pens = @($gridPen, $basePen)
+        for ($n = 0; $n -lt 4; $n++) {
+            $pn = $panels[$n]
+            $x = $gap + ($n % 2) * ($pw + $gap); $y = $gap + [Math]::Floor($n / 2) * ($ph + $gap)
+            [Windows.Forms.TextRenderer]::DrawText($Graphics, $pn.Title, $font, (New-Object Drawing.Rectangle ([int]$x), ([int]$y), ([int]$pw), ([int]$title)), $pal.Text, $left)
+            if ($pn.Groups) {
+                # legend for the grouped panel, right of its title
+                $lx = $x + [Windows.Forms.TextRenderer]::MeasureText($pn.Title, $font).Width + 14 * $s
+                for ($k = 0; $k -lt $pn.Groups.Count; $k++) {
+                    $b = New-Object Drawing.SolidBrush $changeColors[$k]; $brushes += $b
+                    $Graphics.FillRectangle($b, [single]$lx, [single]($y + 8 * $s), [single](9 * $s), [single](9 * $s))
+                    $tw = [Windows.Forms.TextRenderer]::MeasureText($pn.Groups[$k], $font).Width
+                    [Windows.Forms.TextRenderer]::DrawText($Graphics, $pn.Groups[$k], $font, (New-Object Drawing.Rectangle ([int]($lx + 13 * $s)), ([int]$y), $tw, ([int]$title)), $pal.Muted, $left)
+                    $lx += 13 * $s + $tw + 10 * $s
+                }
+            }
+            $plot = New-Object Drawing.RectangleF ([single]($x + 4 * $s)), ([single]($y + $title + $font.Height + 4 * $s)), ([single]($pw - 8 * $s)), ([single]($ph - $title - $xlab - $font.Height - 4 * $s))
+            if ($plot.Height -lt 20) { continue }
+            $all = @(); foreach ($v in $pn.Values) { foreach ($u in @($v)) { if ($null -ne $u) { $all += [double]$u } } }
+            $max = $(if ($all.Count) { [Math]::Max(1.0, ($all | Measure-Object -Maximum).Maximum) } else { 1.0 })
+            $sc = Get-GuiNiceScale $max
+            foreach ($t in $sc.Ticks) { if ($t -gt 0) { $ty = [single]($plot.Bottom - $t / $sc.Hi * $plot.Height); $Graphics.DrawLine($gridPen, $plot.Left, $ty, $plot.Right, $ty) } }
+            $slot = $plot.Width / $rows.Count
+            for ($i = 0; $i -lt $rows.Count; $i++) {
+                $vals = @($pn.Values[$i])
+                $k = $vals.Count
+                $bw = [Math]::Min($(if ($k -gt 1) { 22 * $s } else { 46 * $s }), $slot * 0.75 / $k)
+                $x0 = $plot.Left + $slot * $i + ($slot - $bw * $k) / 2
+                for ($j = 0; $j -lt $k; $j++) {
+                    $v = $vals[$j]
+                    $bx = [single]($x0 + $j * $bw)
+                    if ($null -eq $v) {
+                        if ($j -eq 0) { [Windows.Forms.TextRenderer]::DrawText($Graphics, 'no data', $font, (New-Object Drawing.Rectangle ([int]($plot.Left + $slot * $i)), ([int]($plot.Bottom - $font.Height - 2)), ([int]$slot), $font.Height), $pal.Muted, $center) }
+                        continue
+                    }
+                    $h = [single]([double]$v / $sc.Hi * $plot.Height)
+                    $b = New-Object Drawing.SolidBrush $(if ($k -gt 1) { $changeColors[$j] } else { $series[0] }); $brushes += $b
+                    if ($h -gt 0) { $Graphics.FillRectangle($b, $bx, [single]($plot.Bottom - [Math]::Max($h, 1)), [single][Math]::Max(1, $bw - 2 * $s), [single][Math]::Max($h, 1)) }
+                    if ($k -eq 1 -or $bw -ge 30 * $s) {
+                        $label = Format-GuiAxisNumber ([double]$v)
+                        $lw = [int]([Windows.Forms.TextRenderer]::MeasureText($label, $font).Width + 4)
+                        [Windows.Forms.TextRenderer]::DrawText($Graphics, $label, $font, (New-Object Drawing.Rectangle ([int]($bx + $bw / 2 - $lw / 2)), ([int]($plot.Bottom - $h - $font.Height - 2)), $lw, $font.Height), $pal.Text, $center)
+                    }
+                }
+                # x label: which update and when
+                $u = $(if ($i -eq $rows.Count - 1) { 'Current' } else { "Update $($i + 1)" })
+                $when = ([datetime]$rows[$i].Updated).ToString('yyyy-MM-dd HH:mm:ss', $script:Inv)
+                $r = New-Object Drawing.Rectangle ([int]($plot.Left + $slot * $i)), ([int]($plot.Bottom + 3 * $s)), ([int]$slot), ([int](2 * $font.Height + 2))
+                [Windows.Forms.TextRenderer]::DrawText($Graphics, "$u`n$when", $font, $r, $pal.Muted, ([Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [Windows.Forms.TextFormatFlags]::NoPrefix -bor [Windows.Forms.TextFormatFlags]::EndEllipsis))
+            }
+            $Graphics.DrawLine($basePen, $plot.Left, $plot.Bottom, $plot.Right, $plot.Bottom)
+        }
+    } finally {
+        foreach ($b in $brushes) { $b.Dispose() }
+        foreach ($p in $pens) { $p.Dispose() }
+    }
+}
+
+function Get-GuiByteGroupColor([string]$Group) {
+    # one hue per part of the stream, blended into the surface when painted
+    $hex = @{ Header = '4C8BF5'; Columns = '13A89E'; Blob = '8E6BD8'; Histogram = 'E8833A'; 'String index' = '3BAA5C'; 'Update history' = 'D9506A'; 'Other items' = 'C9A227' }
+    if ($hex.ContainsKey($Group)) { return [Drawing.ColorTranslator]::FromHtml('#' + $hex[$Group]) }
+    return (Get-GuiPalette).Muted
+}
+
+function Get-GuiBlend([Drawing.Color]$Base, [Drawing.Color]$Over, [double]$Amount) {
+    [Drawing.Color]::FromArgb([int]($Base.R + ($Over.R - $Base.R) * $Amount), [int]($Base.G + ($Over.G - $Base.G) * $Amount), [int]($Base.B + ($Over.B - $Base.B) * $Amount))
+}
+
+function New-GuiBytesPage($Page) {
+    # Bytes tab: the stream as hex, each byte tinted by the part of the stream it belongs to; hover a byte for its field,
+    # click it (or a row of the list) to select the field.
+    $g = $script:App
+    if (-not ('SQLStatsXRay.ByteOwners' -as [type])) {
+        Add-Type -TypeDefinition @'
+namespace SQLStatsXRay {
+ public static class ByteOwners {
+  // For each byte, the index of the innermost (shortest) range covering it, or -1. Ranges come longest first.
+  public static int[] Map(int length, long[] offsets, long[] lengths, int[] order) {
+   var owner = new int[length];
+   for (int i = 0; i < length; i++) owner[i] = -1;
+   foreach (int k in order) { long end = System.Math.Min(length, offsets[k] + lengths[k]); for (long i = System.Math.Max(0, offsets[k]); i < end; i++) owner[i] = k; }
+   return owner;
+  }
+ }
+}
+'@
+    }
+    $bar = New-GuiControl FlowLayoutPanel @{ Dock = 'Top'; AutoSize = $true; WrapContents = $true; Margin = (New-Object Windows.Forms.Padding 0) }
+    $g.BytesLegend = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $true; Margin = (New-Object Windows.Forms.Padding 0, 0, 12, 0) }
+    $hint = New-GuiControl Label @{ Text = 'Hover a byte to see its field; click a byte or a row of the list to select the field.'; AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 3, 7, 3, 6) }
+    $bar.Controls.AddRange(@($g.BytesLegend, $hint))
+    $split = New-GuiControl SplitContainer @{ Dock = 'Fill'; SplitterWidth = 6; FixedPanel = 'Panel2' }
+    $canvas = New-GuiControl Panel @{ Dock = 'Fill'; AutoScroll = $true }
+    [Windows.Forms.Control].GetProperty('DoubleBuffered', [Reflection.BindingFlags]'NonPublic, Instance').SetValue($canvas, $true, $null)
+    $right = New-GuiControl SplitContainer @{ Dock = 'Fill'; Orientation = 'Horizontal'; SplitterWidth = 6 }
+    $g.BytesDetails = New-GuiControl TextBox @{ Dock = 'Fill'; ReadOnly = $true; Multiline = $true; WordWrap = $true; ScrollBars = 'Vertical'; BorderStyle = 'None'; Font = (New-Object Drawing.Font 'Consolas', 9.75) }
+    $grid = New-GuiControl DataGridView @{
+        Name = 'Bytes'; Dock = 'Fill'; ReadOnly = $true; AllowUserToAddRows = $false; AllowUserToDeleteRows = $false; RowHeadersVisible = $false
+        AutoSizeColumnsMode = 'None'; SelectionMode = 'FullRowSelect'; MultiSelect = $false; ClipboardCopyMode = 'EnableWithAutoHeaderText'; BorderStyle = 'None'
+    }
+    $g.Grids['Bytes'] = $grid
+    $right.Panel1.Controls.Add($g.BytesDetails)
+    $right.Panel2.Controls.Add($grid)
+    $split.Panel1.Controls.Add($canvas)
+    $split.Panel2.Controls.Add($right)
+    $Page.Controls.Add($split)
+    $Page.Controls.Add($bar)
+    $g.BytesCanvas = $canvas; $g.BytesSplit = $split; $g.BytesRight = $right
+    $g.BytesFont = New-Object Drawing.Font 'Consolas', 10
+    $g.BytesMap = $null; $g.BytesHover = -1; $g.BytesSelected = -1; $g.BytesFor = $null
+
+    $canvas.Add_Paint({ param($s, $e) Invoke-GuiBytesPaint $e.Graphics })
+    $canvas.Add_Scroll({ $script:App.BytesCanvas.Invalidate() })
+    $canvas.Add_Resize({ $script:App.BytesCanvas.Invalidate() })
+    $canvas.Add_MouseWheel({ $script:App.BytesCanvas.Invalidate() })
+    $canvas.Add_MouseMove({
+            param($s, $e)
+            $app = $script:App
+            $i = Get-GuiByteAt $e.Location
+            if ($i -ne $app.BytesHover) { $app.BytesHover = $i; Update-GuiBytesDetails; $s.Invalidate() }
+        })
+    $canvas.Add_MouseLeave({ $app = $script:App; if ($app.BytesHover -ge 0) { $app.BytesHover = -1; Update-GuiBytesDetails; $app.BytesCanvas.Invalidate() } })
+    $canvas.Add_MouseClick({
+            param($s, $e)
+            $app = $script:App
+            $i = Get-GuiByteAt $e.Location
+            if ($i -lt 0 -or -not $app.BytesMap) { return }
+            Select-GuiByteRegion $app.BytesMap.Owner[$i] -FromCanvas
+        })
+    $grid.Add_SelectionChanged({
+            param($s, $e)
+            $app = $script:App
+            if ($app.BytesSync -or $s.SelectedRows.Count -eq 0) { return }
+            Select-GuiByteRegion ([int]$s.SelectedRows[0].Tag)
+        })
+    # the hex view gets the width of its 16 columns, the list and the details the rest
+    $split.Add_SizeChanged({ param($s, $e) try { $s.SplitterDistance = [int][Math]::Max(200, [Math]::Min((Get-GuiBytesMetrics).Width + [Windows.Forms.SystemInformation]::VerticalScrollBarWidth + 4, $s.Width - 320)) } catch { } })
+    $right.Add_SizeChanged({ param($s, $e) try { $s.SplitterDistance = [int][Math]::Max(60, [Math]::Min(170, $s.Height / 3)) } catch { } })
+}
+
+function Get-GuiBytesMetrics {
+    # character cell, row height and the x of the offset, hex and text columns
+    $g = $script:App
+    $sz = [Windows.Forms.TextRenderer]::MeasureText('0000000000', $g.BytesFont, (New-Object Drawing.Size 1000, 100), [Windows.Forms.TextFormatFlags]::NoPadding)
+    $cw = $sz.Width / 10.0
+    $pad = 8 * (Get-GuiScale)
+    $hex = $pad + 10 * $cw
+    @{ Char = $cw; Row = [int]($sz.Height + 3); Offset = $pad; Hex = $hex; Text = $hex + (16 * 3 + 2) * $cw; Width = [int]($hex + (16 * 3 + 2 + 16) * $cw + 2 * $pad) }
+}
+
+function Get-GuiByteX($Metrics, [int]$Column) {
+    # hex cell of byte column 0-15, with a gap after the 8th
+    $Metrics.Hex + ($Column * 3 + $(if ($Column -ge 8) { 1 } else { 0 })) * $Metrics.Char
+}
+
+function Get-GuiByteAt([Drawing.Point]$Point) {
+    $g = $script:App
+    $map = $g.BytesMap
+    if (-not $map) { return -1 }
+    $m = Get-GuiBytesMetrics
+    $y = $Point.Y - $g.BytesCanvas.AutoScrollPosition.Y; $x = $Point.X - $g.BytesCanvas.AutoScrollPosition.X
+    $row = [int][Math]::Floor($y / $m.Row)
+    $col = -1
+    for ($c = 0; $c -lt 16; $c++) { $x0 = Get-GuiByteX $m $c; if ($x -ge $x0 - $m.Char / 2 -and $x -lt $x0 + 2.5 * $m.Char) { $col = $c; break } }
+    if ($col -lt 0 -and $x -ge $m.Text -and $x -lt $m.Text + 16 * $m.Char) { $col = [int][Math]::Floor(($x - $m.Text) / $m.Char) }
+    $i = $row * 16 + $col
+    if ($col -lt 0 -or $row -lt 0 -or $i -ge $map.Raw.Length) { return -1 }
+    return $i
+}
+
+function Show-GuiBytes($D) {
+    # (Re)builds the map for the shown statistics; called when the Bytes tab is open, the ranges are cached on the result.
+    $g = $script:App
+    if (-not $g.BytesCanvas) { return }
+    if ($g.BytesFor -and [object]::ReferenceEquals($g.BytesFor, $D)) { return }
+    $g.BytesFor = $D; $g.BytesHover = -1; $g.BytesSelected = -1
+    $g.BytesLegend.Controls.Clear()
+    if (-not $D -or -not $D.Raw) {
+        $g.BytesMap = $null; $g.Grids.Bytes.Rows.Clear(); $g.BytesDetails.Text = 'Decode a statistics object to see its bytes.'
+        $g.BytesCanvas.AutoScrollMinSize = New-Object Drawing.Size 0, 0; $g.BytesCanvas.Invalidate(); return
+    }
+    if (-not $D.PSObject.Properties['ByteRegions']) { $D | Add-Member ByteRegions (Get-StatsByteRegions $D) }
+    $regions = @($D.ByteRegions)
+    $n = $regions.Count
+    $off = New-Object long[] $n; $len = New-Object long[] $n
+    for ($i = 0; $i -lt $n; $i++) { $off[$i] = $regions[$i].Offset; $len[$i] = $regions[$i].Length }
+    $order = [int[]](0..([Math]::Max(0, $n - 1)) | Sort-Object { - $len[$_] }, { $_ })
+    if ($n -eq 0) { $order = [int[]]@() }
+    $owner = [SQLStatsXRay.ByteOwners]::Map($D.Raw.Length, $off, $len, $order)
+    # neighbouring ranges of one part alternate between two tints, so each field's edges show
+    $shade = New-Object int[] $n
+    $last = @{}
+    for ($i = 0; $i -lt $D.Raw.Length; $i++) {
+        $k = $owner[$i]
+        if ($k -lt 0 -or ($i -gt 0 -and $owner[$i - 1] -eq $k)) { continue }
+        $grp = $regions[$k].Group
+        $shade[$k] = $(if ($last.ContainsKey($grp)) { 1 - $last[$grp] } else { 0 })
+        $last[$grp] = $shade[$k]
+    }
+    $g.BytesMap = @{ Raw = $D.Raw; Regions = $regions; Owner = $owner; Shade = $shade }
+    foreach ($grp in @('Header', 'Columns', 'Blob', 'Histogram', 'String index', 'Update history', 'Other items')) {
+        if (-not @($regions | Where-Object Group -eq $grp).Count) { continue }
+        $chip = New-GuiControl Label @{ Text = '  '; AutoSize = $true; BackColor = (Get-GuiByteGroupColor $grp); Margin = (New-Object Windows.Forms.Padding 6, 9, 3, 3); Tag = 'Swatch'; AccessibleName = $grp }
+        $name = New-GuiControl Label @{ Text = $grp; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 0, 7, 6, 3) }
+        $g.BytesLegend.Controls.AddRange(@($chip, $name))
+    }
+    # the list: every range in stream order, outer ranges before the ones inside them
+    $grid = $g.Grids.Bytes
+    $g.BytesSync = $true
+    try {
+        $grid.SuspendLayout(); $grid.Rows.Clear(); $grid.Columns.Clear()
+        foreach ($c in @(@('Offset', 60, 'MiddleRight'), @('Length', 52, 'MiddleRight'), @('Field', 280, 'MiddleLeft'), @('Value', 240, 'MiddleLeft'), @('Group', 100, 'MiddleLeft'))) {
+            $col = New-Object Windows.Forms.DataGridViewTextBoxColumn
+            $col.Name = $c[0]; $col.HeaderText = $c[0]; $col.Width = [int]($c[1] * (Get-GuiScale)); $col.DefaultCellStyle.Alignment = $c[2]; $col.SortMode = 'NotSortable'
+            $null = $grid.Columns.Add($col)
+        }
+        $listed = 0..([Math]::Max(0, $n - 1)) | Sort-Object { $off[$_] }, { - $len[$_] }
+        if ($n -eq 0) { $listed = @() }
+        foreach ($k in $listed) {
+            $r = $regions[$k]
+            $ri = $grid.Rows.Add([object[]]@([string]$r.Offset, [string]$r.Length, $r.Field, $r.Value, $r.Group))
+            $grid.Rows[$ri].Tag = $k
+        }
+        $grid.ClearSelection()
+        Set-GuiGridHelp $grid
+        $grid.ResumeLayout()
+    } finally { $g.BytesSync = $false }
+    $m = Get-GuiBytesMetrics
+    $g.BytesCanvas.AutoScrollMinSize = New-Object Drawing.Size $m.Width, ([int][Math]::Ceiling($D.Raw.Length / 16.0) * $m.Row + $m.Row)
+    $g.BytesCanvas.AutoScrollPosition = New-Object Drawing.Point 0, 0
+    Update-GuiBytesDetails
+    $g.BytesCanvas.Invalidate()
+}
+
+function Select-GuiByteRegion([int]$Index, [switch]$FromCanvas) {
+    $g = $script:App
+    $map = $g.BytesMap
+    if (-not $map -or $Index -lt 0) { return }
+    $g.BytesSelected = $Index
+    $r = $map.Regions[$Index]
+    if (-not $FromCanvas) {
+        # bring the range's first row into view
+        $m = Get-GuiBytesMetrics
+        $y = [int][Math]::Floor($r.Offset / 16) * $m.Row
+        $view = $g.BytesCanvas.ClientSize.Height
+        $top = - $g.BytesCanvas.AutoScrollPosition.Y
+        if ($y -lt $top -or $y + $m.Row -gt $top + $view) { $g.BytesCanvas.AutoScrollPosition = New-Object Drawing.Point (- $g.BytesCanvas.AutoScrollPosition.X), ([int][Math]::Max(0, $y - $view / 3)) }
+    } else {
+        $grid = $g.Grids.Bytes
+        $g.BytesSync = $true
+        try {
+            foreach ($row in $grid.Rows) {
+                if ([int]$row.Tag -eq $Index) { $row.Selected = $true; try { $grid.FirstDisplayedScrollingRowIndex = [Math]::Max(0, $row.Index - 3) } catch { }; break }
+            }
+        } finally { $g.BytesSync = $false }
+    }
+    Update-GuiBytesDetails
+    $g.BytesCanvas.Invalidate()
+}
+
+function Update-GuiBytesDetails {
+    # the hovered byte (or the selected range): its value, then every range around it, outermost first
+    $g = $script:App
+    $map = $g.BytesMap
+    if (-not $map) { return }
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $at = $g.BytesHover
+    if ($at -lt 0 -and $g.BytesSelected -ge 0) { $at = [int]$map.Regions[$g.BytesSelected].Offset }
+    if ($at -lt 0) {
+        $lines.Add("$($map.Raw.Length) bytes, $(@($map.Regions).Count) described ranges.")
+        $lines.Add('Hover a byte to see which field it belongs to.')
+    } else {
+        $lines.Add(('Byte {0} (0x{0:X}): 0x{1:X2}' -f $at, $map.Raw[$at]))
+        $inside = @($map.Regions | Where-Object { $at -ge $_.Offset -and $at -lt $_.Offset + $_.Length } | Sort-Object { - $_.Length })
+        if (-not $inside) { $lines.Add('Not described by the decoder.') }
+        $depth = 0
+        foreach ($r in $inside) {
+            $lines.Add(('{0}{1}  [{2}, {3} byte(s)]{4}' -f ('  ' * $depth), $r.Field, $r.Offset, $r.Length, $(if ($r.Value) { ' = ' + $r.Value } else { '' })))
+            $depth++
+        }
+    }
+    $g.BytesDetails.Text = $lines.ToArray() -join [Environment]::NewLine
+}
+
+function Invoke-GuiBytesPaint([Drawing.Graphics]$Graphics) {
+    $g = $script:App
+    $pal = Get-GuiPalette
+    $Graphics.Clear($pal.Surface)
+    $map = $g.BytesMap
+    $canvas = $g.BytesCanvas
+    $font = $g.BytesFont
+    if (-not $map) {
+        [Windows.Forms.TextRenderer]::DrawText($Graphics, 'Decode a statistics object to see its bytes.', $font, $canvas.ClientRectangle, $pal.Muted, ([Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [Windows.Forms.TextFormatFlags]::VerticalCenter))
+        return
+    }
+    $m = Get-GuiBytesMetrics
+    $dx = $canvas.AutoScrollPosition.X; $dy = $canvas.AutoScrollPosition.Y
+    $raw = $map.Raw; $owner = $map.Owner; $regions = $map.Regions
+    $rows = [int][Math]::Ceiling($raw.Length / 16.0)
+    $first = [int][Math]::Max(0, [Math]::Floor(- $dy / $m.Row)); $last = [int][Math]::Min($rows - 1, $first + [Math]::Ceiling($canvas.ClientSize.Height / $m.Row) + 1)
+    $flags = [Windows.Forms.TextFormatFlags]::NoPadding -bor [Windows.Forms.TextFormatFlags]::NoPrefix
+    $brushes = @{}
+    $hoverRegion = $(if ($g.BytesHover -ge 0) { $owner[$g.BytesHover] } else { -1 })
+    # the selected range covers every byte in it (it can be an outer range: a whole step record, an item)
+    $selFrom = -1; $selTo = -1
+    if ($g.BytesSelected -ge 0) { $selFrom = [long]$regions[$g.BytesSelected].Offset; $selTo = $selFrom + [long]$regions[$g.BytesSelected].Length }
+    $brushOf = {
+        param([int]$k, [bool]$sel)
+        $key = $(if ($sel) { 'sel' } elseif ($k -lt 0) { 'none' } elseif ($k -eq $hoverRegion) { "hover|$($regions[$k].Group)" } else { "$($regions[$k].Group)|$($map.Shade[$k])" })
+        if (-not $brushes.ContainsKey($key)) {
+            # the selection is a tint too, so the theme's text color stays readable on it
+            $color = $(if ($sel) { Get-GuiBlend $pal.Surface $pal.Link 0.55 } elseif ($k -lt 0) { $pal.Surface } elseif ($k -eq $hoverRegion) { Get-GuiBlend $pal.Surface (Get-GuiByteGroupColor $regions[$k].Group) 0.7 }
+                else { Get-GuiBlend $pal.Surface (Get-GuiByteGroupColor $regions[$k].Group) $(if ($map.Shade[$k]) { 0.42 } else { 0.24 }) })
+            $brushes[$key] = New-Object Drawing.SolidBrush $color
+        }
+        return $brushes[$key]
+    }
+    try {
+        for ($row = $first; $row -le $last; $row++) {
+            $y = [single]($row * $m.Row + $dy)
+            $start = $row * 16; $count = [Math]::Min(16, $raw.Length - $start)
+            # backgrounds, one rectangle per run of bytes in the same range
+            $c = 0
+            while ($c -lt $count) {
+                $k = $owner[$start + $c]; $e = $c
+                $sel = $start + $c -ge $selFrom -and $start + $c -lt $selTo
+                while ($e + 1 -lt $count -and $owner[$start + $e + 1] -eq $k -and $e + 1 -ne 8 -and (($start + $e + 1 -ge $selFrom -and $start + $e + 1 -lt $selTo) -eq $sel)) { $e++ }
+                $x0 = (Get-GuiByteX $m $c) - $m.Char / 2 + $dx; $x1 = (Get-GuiByteX $m $e) + 2.5 * $m.Char + $dx
+                $brush = & $brushOf $k $sel
+                $Graphics.FillRectangle($brush, [single]$x0, $y, [single]($x1 - $x0), [single]($m.Row - 1))
+                $Graphics.FillRectangle($brush, [single]($m.Text + $c * $m.Char + $dx), $y, [single](($e - $c + 1) * $m.Char), [single]($m.Row - 1))
+                $c = $e + 1
+            }
+            $hex = New-Object Text.StringBuilder; $text = New-Object Text.StringBuilder
+            for ($c = 0; $c -lt $count; $c++) {
+                $b = $raw[$start + $c]
+                if ($c -eq 8) { $null = $hex.Append(' ') }
+                $null = $hex.Append($b.ToString('X2')).Append(' ')
+                $null = $text.Append($(if ($b -ge 32 -and $b -lt 127) { [char]$b } else { '.' }))
+            }
+            [Windows.Forms.TextRenderer]::DrawText($Graphics, $start.ToString('X8'), $font, (New-Object Drawing.Point ([int]($m.Offset + $dx)), ([int]$y + 1)), $pal.Muted, $flags)
+            [Windows.Forms.TextRenderer]::DrawText($Graphics, $hex.ToString(), $font, (New-Object Drawing.Point ([int]($m.Hex + $dx)), ([int]$y + 1)), $pal.Text, $flags)
+            [Windows.Forms.TextRenderer]::DrawText($Graphics, $text.ToString(), $font, (New-Object Drawing.Point ([int]($m.Text + $dx)), ([int]$y + 1)), $pal.Text, $flags)
+        }
+    } finally { foreach ($b in $brushes.Values) { $b.Dispose() } }
 }
 
 function New-GuiDialog([string]$Title) {
@@ -6625,7 +8628,7 @@ function Show-GuiSettingsDialog {
             'grids. Off: 7 significant digits, as DBCC SHOW_STATISTICS shows them.'))
     $trie = New-GuiControl NumericUpDown @{ Minimum = 0; Maximum = 1000000; Value = [int]$s.StringIndexNodes; Width = $numberWidth; Anchor = 'Left' }
     Add-GuiRow $d.Layout 'String index nodes' $trie
-    Add-GuiRow $d.Layout '' (& $note ('Trie nodes the report lists for statistics on a string column; long strings can produce thousands. The String index tab ' +
+    Add-GuiRow $d.Layout '' (& $note ('Trie nodes the report lists for statistics on a string column; long strings can produce thousands. The Strings tab ' +
             'always draws every node. 0 = no limit.') 3)
     $scan = New-GuiControl NumericUpDown @{ Minimum = 0; Maximum = 1000000; Value = [int]$s.SampledScanValues; Width = $numberWidth; Anchor = 'Left' }
     Add-GuiRow $d.Layout 'Synopsis values' $scan
@@ -6908,11 +8911,16 @@ function Show-DecoderWindow {
     $mSettings = New-GuiMenuItem '&Settings...' 0xE713 'Control, Oemcomma' { Show-GuiSettingsDialog }
     $mSettings.ShortcutKeyDisplayString = 'Ctrl+,'
     $mBuild = New-GuiMenuItem '&Build statistics (beta)...' 0xE9D9 'Control, B' { Show-GuiBuildDialog }
-    $null = $toolsMenu.DropDownItems.AddRange([Windows.Forms.ToolStripItem[]]@($mBuild, (New-Object Windows.Forms.ToolStripSeparator), $mSettings))
+    $mSample = New-GuiMenuItem 'Sample si&ze advisor...' 0 '' { Show-GuiSampleAdvisorDialog }
+    $mMaint = New-GuiMenuItem '&Update cost and maintenance plan...' 0 '' { Show-GuiMaintenanceDialog }
+    $mFiltered = New-GuiMenuItem '&Filtered statistics advisor...' 0 '' { Show-GuiFilteredAdvisorDialog }
+    $null = $toolsMenu.DropDownItems.AddRange([Windows.Forms.ToolStripItem[]]@($mBuild, $mSample, $mMaint, $mFiltered, (New-Object Windows.Forms.ToolStripSeparator), $mSettings))
     $helpMenu = New-Object Windows.Forms.ToolStripMenuItem '&Help'
     $mProject = New-GuiMenuItem 'SQLStatsXRay on &GitHub' 0xE774 '' { Open-GuiProjectPage }
     $mAbout = New-GuiMenuItem '&About SQLStatsXRay' 0xE946 '' { Show-GuiAboutDialog }
-    $null = $helpMenu.DropDownItems.AddRange([Windows.Forms.ToolStripItem[]]@($mProject, (New-Object Windows.Forms.ToolStripSeparator), $mAbout))
+    $g.ExplainItem = New-GuiMenuItem '&Explain fields (tooltips)' 0 'F1' { Set-GuiExplainMode (-not $script:App.Settings.Explain); Save-GuiSettings }
+    $g.ExplainItem.CheckOnClick = $false; $g.ExplainItem.Checked = [bool]$settings.Explain
+    $null = $helpMenu.DropDownItems.AddRange([Windows.Forms.ToolStripItem[]]@($g.ExplainItem, (New-Object Windows.Forms.ToolStripSeparator), $mProject, (New-Object Windows.Forms.ToolStripSeparator), $mAbout))
     $null = $menu.Items.AddRange([Windows.Forms.ToolStripItem[]]@($fileMenu, $toolsMenu, $helpMenu))
 
     # ---- toolbar
@@ -7004,7 +9012,7 @@ function Show-DecoderWindow {
     $pickerRow = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $true; Dock = 'Fill'; Margin = (New-Object Windows.Forms.Padding 0, 0, 0, 4) }
     $pickerLabel = New-GuiControl Label @{ Text = 'Statistics object'; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 3, 7, 6, 3) }
     $g.Picker = New-GuiControl ComboBox @{ DropDownStyle = 'DropDownList'; Width = 380 }
-    # editing: Header, Histogram and Density vector grids, then a script that loads the edited stream
+    # editing: Header, Histogram and Density grids, then a script that loads the edited stream
     $g.EditMode = New-GuiControl CheckBox @{ Text = 'Edit statistics'; AutoSize = $true; Enabled = $false; Margin = (New-Object Windows.Forms.Padding 18, 6, 3, 3) }
     $g.Generate = New-GuiControl Button @{ Text = 'Generate script...'; AutoSize = $true; Enabled = $false; Tag = 'Primary'; Margin = (New-Object Windows.Forms.Padding 10, 2, 3, 2) }
     $g.Discard = New-GuiControl Button @{ Text = 'Discard edits'; AutoSize = $true; Enabled = $false; Margin = (New-Object Windows.Forms.Padding 6, 2, 3, 2) }
@@ -7012,12 +9020,13 @@ function Show-DecoderWindow {
     $g.BuildButton = New-GuiControl Button @{ Text = 'Build statistics (beta)...'; AutoSize = $true; Enabled = $false; Margin = (New-Object Windows.Forms.Padding 18, 2, 3, 2) }
     $g.BuildButton.Add_Click({ Show-GuiBuildDialog })
     $g.Commands.Build = @($mBuild, $g.BuildButton)
+    $g.Commands.Tools = @($mSample, $mMaint, $mFiltered)
     $pickerRow.Controls.AddRange(@($pickerLabel, $g.Picker, $g.EditMode, $g.Generate, $g.Discard, $g.BuildButton, $g.EditInfo))
     $right.Controls.Add($pickerRow, 0, 0)
 
     $g.ChartFont = New-Object Drawing.Font 'Segoe UI', 9
     $g.TrieFont = New-Object Drawing.Font 'Segoe UI', 9
-    $g.ChartSteps = @(); $g.ChartHover = -1; $g.ChartSelected = -1; $g.ChartLabelWidth = 0
+    $g.ChartSteps = @(); $g.ChartHover = -1; $g.ChartSelected = -1; $g.ChartLabelWidth = 0; $g.ChartFrom = 0; $g.ChartTo = $null; $g.ChartDrag = $null; $g.ChartFraction = 1.0
     $tabs = New-GuiControl TabControl @{ Dock = 'Fill' }
     $reportPage = New-GuiControl TabPage @{ Text = 'Report'; Padding = (New-Object Windows.Forms.Padding 4) }
     $g.Report = New-GuiControl RichTextBox @{ Dock = 'Fill'; ReadOnly = $true; WordWrap = $false; DetectUrls = $false; Font = (New-Object Drawing.Font 'Consolas', 9.75); BorderStyle = 'None' }
@@ -7038,19 +9047,39 @@ function Show-DecoderWindow {
     ) -join [Environment]::NewLine
     $reportPage.Controls.Add($g.Report)
     $tabs.TabPages.Add($reportPage)
-    foreach ($t in @(@('Header', 'Header'), @('Histogram', 'Histogram'), @('Density', 'Density vector'), @('StringIndex', 'String index'), @('Columns', 'Columns'), @('TraceFlag', 'TF 2388'), @('Validation', 'Validation'))) {
+    foreach ($t in @(@('Header', 'Header'), @('Histogram', 'Histogram'), @('Density', 'Density'), @('StringIndex', 'Strings'), @('Columns', 'Columns'), @('TraceFlag', 'History'), @('Health', 'Health'), @('Estimates', 'Estimates'), @('Validation', 'Validation'))) {
         $page = New-GuiControl TabPage @{ Text = $t[1]; Padding = (New-Object Windows.Forms.Padding 4) }
         if ($t[0] -eq 'StringIndex') { New-GuiTriePage $page; $tabs.TabPages.Add($page); continue }
         $grid = New-GuiControl DataGridView @{
             Name = $t[0]; Dock = 'Fill'; ReadOnly = $true; AllowUserToAddRows = $false; AllowUserToDeleteRows = $false; RowHeadersVisible = $false
-            AutoSizeColumnsMode = 'AllCells'; ClipboardCopyMode = 'EnableWithAutoHeaderText'; BorderStyle = 'None'; EditMode = 'EditOnKeystrokeOrF2'
+            AutoSizeColumnsMode = 'None'; ClipboardCopyMode = 'EnableWithAutoHeaderText'; BorderStyle = 'None'; EditMode = 'EditOnKeystrokeOrF2'
         }
         if ($t[0] -eq 'Histogram') {
             # Chart first, grid below; the splitter keeps its proportion when the window resizes.
             $histSplit = New-GuiControl SplitContainer @{ Dock = 'Fill'; Orientation = 'Horizontal'; SplitterWidth = 6 }
-            $chartBar = New-GuiControl FlowLayoutPanel @{ Dock = 'Top'; AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0) }
-            $chartHint = New-GuiControl Label @{ Text = 'Hover a bar for its values; click it to select the step in the grid.'; AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 3, 3, 3, 6) }
-            $chartBar.Controls.Add($chartHint)
+            $chartBar = New-GuiControl FlowLayoutPanel @{ Dock = 'Top'; AutoSize = $true; WrapContents = $true; Margin = (New-Object Windows.Forms.Padding 0) }
+            # views: bars or the cumulative share, log scale, AVG_RANGE_ROWS marks, 95% intervals; zoom by dragging
+            $g.ChartViewBox = New-GuiControl ComboBox @{ DropDownStyle = 'DropDownList'; Width = [int](130 * $sc); Margin = (New-Object Windows.Forms.Padding 3, 2, 8, 4) }
+            $null = $g.ChartViewBox.Items.AddRange([object[]]@('Bars', 'Cumulative'))
+            $g.ChartViewBox.SelectedItem = [string]$settings.ChartView
+            $g.ChartLogBox = New-GuiControl CheckBox @{ Text = 'Log scale'; AutoSize = $true; Checked = [bool]$settings.ChartLog; Margin = (New-Object Windows.Forms.Padding 3, 5, 8, 4) }
+            $g.ChartAvgBox = New-GuiControl CheckBox @{ Text = 'AVG_RANGE_ROWS'; AutoSize = $true; Checked = [bool]$settings.ChartAverage; Margin = (New-Object Windows.Forms.Padding 3, 5, 8, 4) }
+            $g.ChartIntervalBox = New-GuiControl CheckBox @{ Text = '95% intervals (sampled)'; AutoSize = $true; Checked = [bool]$settings.ChartIntervals; Margin = (New-Object Windows.Forms.Padding 3, 5, 8, 4) }
+            $zoomOut = New-GuiControl Button @{ Text = 'Zoom out'; AutoSize = $true; Padding = (New-Object Windows.Forms.Padding 6, 0, 6, 0); Margin = (New-Object Windows.Forms.Padding 10, 1, 3, 4) }
+            $zoomAll = New-GuiControl Button @{ Text = 'All steps'; AutoSize = $true; Padding = (New-Object Windows.Forms.Padding 6, 0, 6, 0); Margin = (New-Object Windows.Forms.Padding 3, 1, 3, 4) }
+            $g.ChartZoomLabel = New-GuiControl Label @{ Text = 'All steps'; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 6, 5, 3, 4) }
+            $chartHint = New-GuiControl Label @{ Text = 'Hover a bar for its values; click it to select the step; drag across steps to zoom in.'; AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 10, 5, 3, 4) }
+            $chartBar.Controls.AddRange(@($g.ChartViewBox, $g.ChartLogBox, $g.ChartAvgBox, $g.ChartIntervalBox, $zoomOut, $zoomAll, $g.ChartZoomLabel, $chartHint))
+            $zoomOut.Add_Click({ $app = $script:App; $r = Get-GuiChartRange; $w = $r.Count; Set-GuiChartZoom ($r.From - [int]($w / 2)) ($r.To + [int]($w / 2)) })
+            $zoomAll.Add_Click({ Set-GuiChartZoom 0 (@($script:App.ChartSteps).Count - 1) })
+            $onView = {
+                $app = $script:App; $st = $app.Settings
+                $st.ChartView = [string]$app.ChartViewBox.SelectedItem; $st.ChartLog = $app.ChartLogBox.Checked; $st.ChartAverage = $app.ChartAvgBox.Checked; $st.ChartIntervals = $app.ChartIntervalBox.Checked
+                $app.ChartLogBox.Enabled = $st.ChartView -ne 'Cumulative'; $app.ChartAvgBox.Enabled = $st.ChartView -ne 'Cumulative'; $app.ChartIntervalBox.Enabled = $st.ChartView -ne 'Cumulative'
+                Save-GuiSettings; $app.Chart.Invalidate()
+            }
+            $g.ChartViewBox.Add_SelectedIndexChanged($onView)
+            foreach ($box in $g.ChartLogBox, $g.ChartAvgBox, $g.ChartIntervalBox) { $box.Add_CheckedChanged($onView); $box.Enabled = $settings.ChartView -ne 'Cumulative' }
             $g.Chart = New-GuiControl PictureBox @{ Dock = 'Fill' }
             $histSplit.Panel1.Controls.Add($g.Chart)
             $histSplit.Panel1.Controls.Add($chartBar)
@@ -7058,6 +9087,36 @@ function Show-DecoderWindow {
             $page.Controls.Add($histSplit)
             $g.HistSplit = $histSplit
             $g.HistRatio = 0.62
+        } elseif ($t[0] -eq 'TraceFlag') {
+            # the updates as charts and findings, then the TF 2388 result set
+            $historySplit = New-GuiControl SplitContainer @{ Dock = 'Fill'; Orientation = 'Horizontal'; SplitterWidth = 6 }
+            $g.HistoryChart = New-GuiControl PictureBox @{ Dock = 'Fill' }
+            $g.HistoryFindings = New-GuiControl TextBox @{ Dock = 'Bottom'; ReadOnly = $true; Multiline = $true; WordWrap = $true; ScrollBars = 'Vertical'; BorderStyle = 'None'; Height = [int](110 * $sc) }
+            $historySplit.Panel1.Controls.Add($g.HistoryChart)
+            $historySplit.Panel1.Controls.Add($g.HistoryFindings)
+            $historySplit.Panel2.Controls.Add($grid)
+            $page.Controls.Add($historySplit)
+            # the forecast date (the rows past the last step by then, the next automatic update)
+            $forecastBar = New-GuiControl FlowLayoutPanel @{ Dock = 'Top'; AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0) }
+            $g.ForecastPicker = New-GuiControl DateTimePicker @{ Format = 'Custom'; CustomFormat = 'yyyy-MM-dd HH:mm'; Width = [int](150 * $sc); Margin = (New-Object Windows.Forms.Padding 3, 2, 6, 4) }
+            $forecastNow = New-GuiControl Button @{ Text = 'Now'; AutoSize = $true; Padding = (New-Object Windows.Forms.Padding 6, 0, 6, 0); Margin = (New-Object Windows.Forms.Padding 3, 1, 3, 4) }
+            $forecastBar.Controls.AddRange(@((New-GuiControl Label @{ Text = 'Forecast at'; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 3, 6, 6, 4) }), $g.ForecastPicker, $forecastNow,
+                    (New-GuiControl Label @{ Text = 'The forecast uses the change rate between past updates; the stream''s dates are the server''s local time.'; AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 10, 6, 3, 4) })))
+            $page.Controls.Add($forecastBar)
+            $g.ForecastPicker.Add_ValueChanged({ $app = $script:App; $script:ForecastAt = $app.ForecastPicker.Value; $d = Get-GuiCurrentResult; Show-GuiHistory $d; Show-GuiHealth $d })
+            $forecastNow.Add_Click({ $script:App.ForecastPicker.Value = Get-Date })
+            $g.HistorySplit = $historySplit
+            $g.HistoryRows = @()
+        } elseif ($t[0] -eq 'Estimates') {
+            # each key's estimate against the unknown-value estimate, the summary, then the density vector's estimates
+            $estSplit = New-GuiControl SplitContainer @{ Dock = 'Fill'; Orientation = 'Horizontal'; SplitterWidth = 6 }
+            $g.EstimateChart = New-GuiControl PictureBox @{ Dock = 'Fill' }
+            $g.EstimateFindings = New-GuiControl TextBox @{ Dock = 'Bottom'; ReadOnly = $true; Multiline = $true; WordWrap = $true; ScrollBars = 'Vertical'; BorderStyle = 'None'; Height = [int](80 * $sc) }
+            $estSplit.Panel1.Controls.Add($g.EstimateChart)
+            $estSplit.Panel1.Controls.Add($g.EstimateFindings)
+            $estSplit.Panel2.Controls.Add($grid)
+            $page.Controls.Add($estSplit)
+            $g.EstimateSplit = $estSplit; $g.EstimateHover = -1
         } else { $page.Controls.Add($grid) }
         $tabs.TabPages.Add($page)
         $g.Grids[$t[0]] = $grid
@@ -7077,7 +9136,7 @@ function Show-DecoderWindow {
     foreach ($name in 'CheckSummary', 'CheckSteps') {
         $g.Grids[$name] = New-GuiControl DataGridView @{
             Name = $name; Dock = 'Fill'; ReadOnly = $true; AllowUserToAddRows = $false; AllowUserToDeleteRows = $false; RowHeadersVisible = $false
-            AutoSizeColumnsMode = 'AllCells'; ClipboardCopyMode = 'EnableWithAutoHeaderText'; BorderStyle = 'None'
+            AutoSizeColumnsMode = 'None'; ClipboardCopyMode = 'EnableWithAutoHeaderText'; BorderStyle = 'None'
         }
     }
     $g.CheckFindings = New-GuiControl TextBox @{ Dock = 'Fill'; ReadOnly = $true; Multiline = $true; WordWrap = $true; ScrollBars = 'Vertical'; BorderStyle = 'None' }
@@ -7089,7 +9148,13 @@ function Show-DecoderWindow {
     $g.CheckPage.Controls.Add($checkBar)
     $tabs.TabPages.Add($g.CheckPage)
     $g.CheckSplits = @($checkSplit, $topSplit)
+    $g.BytesPage = New-GuiControl TabPage @{ Text = 'Bytes'; Padding = (New-Object Windows.Forms.Padding 4) }
+    New-GuiBytesPage $g.BytesPage
+    $tabs.TabPages.Add($g.BytesPage)
     $g.Tabs = $tabs
+    $tabs.Add_SizeChanged({ Set-GuiTabFit })
+    # the byte map is built when its tab is opened
+    $tabs.Add_SelectedIndexChanged({ $app = $script:App; if ($app.Tabs.SelectedTab -eq $app.BytesPage) { Show-GuiBytes (Get-GuiCurrentResult) } })
     $right.Controls.Add($tabs, 0, 1)
     $split.Panel2.Controls.Add($right)
     $g.HistMenu = New-Object Windows.Forms.ContextMenuStrip
@@ -7155,7 +9220,7 @@ function Show-DecoderWindow {
     $g.EditMode.Add_CheckedChanged({
             foreach ($grid in $script:App.Grids.Values) { $null = $grid.EndEdit() }
             Set-GuiEditMode
-            if ($script:App.EditMode.Checked) { Set-GuiStatus 'Edit mode: change values in the Header, Histogram and Density vector tabs; right-click the histogram grid to insert or delete steps.' }
+            if ($script:App.EditMode.Checked) { Set-GuiStatus 'Edit mode: change values in the Header, Histogram and Density tabs; right-click the histogram grid to insert or delete steps.' }
         })
     $g.Generate.Add_Click({ Show-GuiScriptDialog })
     $g.Discard.Add_Click({
@@ -7198,11 +9263,24 @@ function Show-DecoderWindow {
     $g.Chart.Add_Resize({ $script:App.Chart.Invalidate() })
     $g.Chart.Add_MouseMove({
             param($s, $e)
+            $app = $script:App
+            if ($app.ChartDrag) {
+                $j = Get-GuiChartStepAt $e.Location -Clamp
+                if ($j -ne $app.ChartDrag.To) { $app.ChartDrag.To = $j; $app.ChartDrag.Moved = $app.ChartDrag.Moved -or $j -ne $app.ChartDrag.From; $s.Invalidate() }
+                return
+            }
             $i = Get-GuiChartStepAt $e.Location
-            if ($i -ne $script:App.ChartHover) { $script:App.ChartHover = $i; $s.Invalidate() }
+            if ($i -ne $app.ChartHover) { $app.ChartHover = $i; $s.Invalidate() }
         })
     $g.Chart.Add_MouseLeave({ if ($script:App.ChartHover -ge 0) { $script:App.ChartHover = -1; $script:App.Chart.Invalidate() } })
-    $g.Chart.Add_MouseClick({ param($s, $e) $i = Get-GuiChartStepAt $e.Location; if ($i -ge 0) { Select-GuiHistogramRow $i } })
+    # a click selects the step; a drag across steps zooms to them
+    $g.Chart.Add_MouseDown({ param($s, $e) if ($e.Button -eq 'Left') { $i = Get-GuiChartStepAt $e.Location; if ($i -ge 0) { $script:App.ChartDrag = @{ From = $i; To = $i; Moved = $false } } } })
+    $g.Chart.Add_MouseUp({
+            param($s, $e)
+            $app = $script:App; $drag = $app.ChartDrag; $app.ChartDrag = $null
+            if (-not $drag) { return }
+            if ($drag.Moved -and [Math]::Abs($drag.To - $drag.From) -ge 1) { Set-GuiChartZoom $drag.From $drag.To } else { Select-GuiHistogramRow $drag.From; $s.Invalidate() }
+        })
     $g.Grids.Histogram.Add_SelectionChanged({
             # Grid selection -> highlight the step in the chart (Step n is chart index n - 1).
             param($s, $e)
@@ -7215,6 +9293,19 @@ function Show-DecoderWindow {
             try { $s.SplitterDistance = [int][Math]::Min([Math]::Max(60, ($s.Height - $s.SplitterWidth) * $script:App.HistRatio), [Math]::Max(60, $s.Height - $s.SplitterWidth - 60)) } catch { }
         })
     $g.HistSplit.Add_SplitterMoved({ param($s, $e) if ($s.Height -gt 0) { $script:App.HistRatio = $s.SplitterDistance / [double]($s.Height - $s.SplitterWidth) } })
+    $g.EstimateChart.Add_Paint({ param($s, $e) Invoke-GuiEstimatesPaint $e.Graphics })
+    $g.EstimateChart.Add_Resize({ $script:App.EstimateChart.Invalidate() })
+    $g.EstimateChart.Add_MouseMove({
+            param($s, $e)
+            $app = $script:App; $L = $app.EstimateLayout; $i = -1
+            if ($L -and $e.X -ge $L.Plot.Left -and $e.X -lt $L.Plot.Right -and $e.Y -ge $L.Plot.Top -and $e.Y -le $L.Plot.Bottom) { $i = [int][Math]::Floor(($e.X - $L.Plot.Left) / $L.Slot) }
+            if ($i -ne $app.EstimateHover) { $app.EstimateHover = $i; $s.Invalidate() }
+        })
+    $g.EstimateChart.Add_MouseLeave({ $script:App.EstimateHover = -1; $script:App.EstimateChart.Invalidate() })
+    $g.EstimateSplit.Add_SizeChanged({ param($s, $e) try { $s.SplitterDistance = [int][Math]::Max(120, ($s.Height - $s.SplitterWidth) * 0.72) } catch { } })
+    $g.HistoryChart.Add_Paint({ param($s, $e) Invoke-GuiHistoryPaint $e.Graphics })
+    $g.HistoryChart.Add_Resize({ $script:App.HistoryChart.Invalidate() })
+    $g.HistorySplit.Add_SizeChanged({ param($s, $e) try { $s.SplitterDistance = [int][Math]::Max(120, ($s.Height - $s.SplitterWidth) * 0.7) } catch { } })
     $g.CheckData.Add_Click({ Start-GuiDataCheck })
     $g.Grids.CheckSummary.Add_CellFormatting({
             # the Result row's value in its rating color
@@ -7242,6 +9333,7 @@ function Show-DecoderWindow {
             $split.SplitterDistance = [int](380 * $s.DeviceDpi / 96.0)
             Write-GuiStartup "Applying the $($script:GuiTheme.ToLower()) theme..."
             Set-GuiControlTheme $s
+            Set-GuiExplainMode ([bool]$script:App.Settings.Explain)
             $s.ResumeLayout()
             [StatsStreamDecoder.Appearance.Cue]::Set($script:App.TableFilter, 'Search tables')
         })
@@ -7256,7 +9348,7 @@ function Show-DecoderWindow {
             Save-GuiSettings
         })
 
-    $form.Add_Shown({ Write-GuiStartup 'SQLStatsXRay is open. Keep this console window open: closing it closes the application.' })
+    $form.Add_Shown({ Set-GuiTabFit; Write-GuiStartup 'SQLStatsXRay is open. Keep this console window open: closing it closes the application.' })
 
     Set-GuiConnected $null
     Set-GuiStatus 'Connect to a server (Ctrl+N), or paste a STATS_STREAM (Ctrl+Shift+V).'
@@ -7277,6 +9369,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Gui') {
     return
 }
 
+$script:ForecastAt = $(if ($ForecastDate) { [datetime]$ForecastDate } else { $null })
 $allLines = New-Object 'System.Collections.Generic.List[string]'
 $objects = @()
 $buildReport = $GuiRun -or -not $PassThru
@@ -7328,13 +9421,14 @@ if ($PSCmdlet.ParameterSetName -in 'Hex', 'File') {
     try {
         $ver = (Invoke-Query $cn "SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) v, @@SERVERNAME s")[0].Rows[0]
         if ($Build) {
+            if (-not $Table) { throw '-Build needs -Table.' }
             if (@($Statistics).Count -gt 1) { throw '-Build takes one statistics object (or -AllStatistics).' }
             if ($AllStatistics) {
                 $b = Invoke-StatsBuildTable -Connection $cn -Database $Database -TableName $Table -Sample $Sample -Sampler $Sampler -Algorithms $Algorithm `
-                    -NoRecompute ([bool]$NoRecompute) -Seed $Seed -TimeoutSeconds 0 -UseWorkload (-not $NoWorkload) -AdaptiveLimit $AdaptiveLimit
+                    -NoRecompute ([bool]$NoRecompute) -Seed $Seed -TimeoutSeconds 0 -AdaptiveLimit $AdaptiveLimit
             } else {
                 $b = Invoke-StatsBuild -Connection $cn -Database $Database -TableName $Table -StatName $(if ($Statistics) { $Statistics[0] }) -ColumnName $Column -Sample $Sample `
-                    -Sampler $Sampler -Algorithms $Algorithm -NewStatName $NewStatisticsName -NoRecompute ([bool]$NoRecompute) -Seed $Seed -TimeoutSeconds 0 -UseWorkload (-not $NoWorkload) -AdaptiveLimit $AdaptiveLimit
+                    -Sampler $Sampler -Algorithms $Algorithm -NewStatName $NewStatisticsName -NoRecompute ([bool]$NoRecompute) -Seed $Seed -TimeoutSeconds 0 -AdaptiveLimit $AdaptiveLimit
             }
             $objects += $b
             if ($OutputScript) {
@@ -7346,7 +9440,39 @@ if ($PSCmdlet.ParameterSetName -in 'Hex', 'File') {
                 else { $allLines.AddRange([string[]](New-Section 'SCRIPT')); $allLines.AddRange([string[]]($b.Script -split "`r`n")) }
             }
             $target = [pscustomobject]@{ Schema = ''; Table = ''; Stats = @() }
-        } else { $target = Get-StatsTargets $cn $Table $Statistics }
+        } elseif ($AdviseSample -or $UpdateCost -or $MaintenancePlan -or $AdviseFiltered) {
+            # the advisors: a report and a script, nothing changed on the server
+            if (($AdviseSample -or $AdviseFiltered) -and -not $Table) { throw '-AdviseSample and -AdviseFiltered need -Table.' }
+            if ($AdviseSample) {
+                if (@($Statistics).Count -ne 1) { throw '-AdviseSample takes one statistics object (-Statistics).' }
+                $a = Invoke-SampleAdvisor -Connection $cn -TableName $Table -StatName $Statistics[0] -PageBudget $PageBudget
+                $lines = Format-SampleAdvisorReport $a
+            } elseif ($AdviseFiltered) {
+                if (-not $Statistics -and -not $Column) { throw '-AdviseFiltered needs -Statistics or -Column.' }
+                $a = Invoke-FilteredStatsAdvisor -Connection $cn -TableName $Table -StatName $(if ($Statistics) { $Statistics[0] }) -ColumnName $Column -SegmentColumns $SegmentColumn -MinRows $MinSegmentRows
+                $lines = Format-FilteredStatsReport $a
+            } elseif ($MaintenancePlan) {
+                $a = Invoke-StatsMaintenancePlan -Connection $cn -TableName $Table -BudgetMinutes $TimeBudgetMinutes -IncludeNoRecompute:$IncludeNoRecompute -NoProbe:$NoProbe
+                $plan = Format-StatsMaintenanceReport $a; $cost = Format-StatsUpdateCostReport $a.Cost 25
+                $lines = [string[]]$plan + [string[]]$cost
+            } else {
+                $a = Invoke-StatsUpdateCost -Connection $cn -TableName $Table -NoProbe:$NoProbe
+                $lines = Format-StatsUpdateCostReport $a
+            }
+            $objects += $a
+            if ($OutputScript -and $a.PSObject.Properties['Script']) { [IO.File]::WriteAllText([IO.Path]::GetFullPath($OutputScript), $a.Script, (New-Object Text.UTF8Encoding $true)) }
+            if ($buildReport) {
+                $allLines.AddRange([string[]]$lines)
+                if ($a.PSObject.Properties['Script']) {
+                    if ($OutputScript) { $allLines.Add("Script written to $([IO.Path]::GetFullPath($OutputScript)).") }
+                    else { $allLines.AddRange([string[]](New-Section 'SCRIPT')); $allLines.AddRange([string[]]($a.Script -split "`r`n")) }
+                }
+            }
+            $target = [pscustomobject]@{ Schema = ''; Table = ''; Stats = @() }
+        } else {
+            if (-not $Table) { throw 'Give -Table (the advisors -UpdateCost and -MaintenancePlan also work on a whole database).' }
+            $target = Get-StatsTargets $cn $Table $Statistics
+        }
         $qualified = '[' + $target.Schema.Replace(']', ']]') + '].[' + $target.Table.Replace(']', ']]') + ']'
         $tf2388 = $null
         if ($Validate) { $tf2388 = Get-TraceFlag2388FromServer $cn $qualified @($target.Stats | ForEach-Object { [string]$_.name }) }
