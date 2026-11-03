@@ -49,7 +49,7 @@ From the stream alone, with no further query to the server, the report and the a
 ![The Data check tab on a 17% sampled statistic: summary, findings, and one row per range with the histogram's counts next to the table's](assets/screenshot-data-check.png)
 
 - **One seek per step.** It reads through a rowstore index whose first key column is the statistics' leading column (the smallest one), so column statistics are checked too. Each step's range gives the real EQ_ROWS, RANGE_ROWS and DISTINCT_RANGE_ROWS, plus the largest row count for a single value inside the step. Two more seeks count the NULL rows and the rows above the last step (the ascending key problem).
-- **Low impact.** READ UNCOMMITTED, `LOCK_TIMEOUT 1000`, `MAXDOP 1`, a query timeout, an optional pause between steps, and a page budget (default 100,000 pages, about 780 MB). On a larger index it becomes a spot check: the NULL rows, both ends of the histogram, then steps at random while they fit.
+- **Low impact.** READ UNCOMMITTED, `LOCK_TIMEOUT 100`, `MAXDOP 1`, a query timeout, an optional pause between steps, and a page budget (default 100,000 pages, about 780 MB). On a larger index it becomes a spot check: the NULL rows, both ends of the histogram, then steps at random while they fit.
 - **No side effects on the statistics.** The queries use `OPTION (KEEPFIXED PLAN)`, which keeps them from triggering an automatic update of a stale statistic they read.
 - **Typed comparisons.** Each step key is bound as a parameter of the column's own type, and `varchar` keys are converted in the column's collation, so case-insensitive, trailing-space and code-page rules match the histogram's.
 - **Clones and emptied tables.** In a statistics-only clone (`DBCC CLONEDATABASE`) the tables hold no rows, so the check skips them and says why. A table emptied or reloaded without counting modifications (`TRUNCATE TABLE`, a partition `SWITCH`) is reported as such, not as a loaded stream.
@@ -129,7 +129,7 @@ In the lab (1.9 million orders over 7 years, SQL Server's default sample), `-Foc
 
 The advisors only read; the scripts they write change statistics when you run them. In a statistics-only clone (`DBCC CLONEDATABASE`), the update cost estimate works from the copied row and page counts. The builder, the sample and filtered advisors and the maintenance plan refuse to run there, because updating a clone's statistics would replace the copied ones. Three advisors answer the questions that come before building anything: how big a sample a statistic needs, how long updating statistics takes, and where a filtered statistic would fix estimates. In the app they are under **Tools**; each one opens a results window with a report and, when there is one, the script.
 
-- **Sample size advisor** (`-AdviseSample`). It reads the table once, as (value, page) pairs (every row, or `-PageBudget` pages). Then it replays page samples of growing size from memory, as `TABLESAMPLE` keeps whole pages. Each rate gets a histogram scored against the full read and a distinct-value estimate made the way SQL Server makes it. On a column whose values cluster by page, its estimates matched SQL Server's own density within 2% at every rate tried (10% to 75%). It recommends the smallest rate within 10% of a full scan, as `UPDATE STATISTICS ... WITH SAMPLE n PERCENT, PERSIST_SAMPLE_PERCENT = ON`.
+- **Sample size advisor** (`-AdviseSample`). It reads the table once, as (value, page) pairs (every row, or `-PageBudget` pages). Then it replays page samples of growing size from memory, as `TABLESAMPLE` keeps whole pages. Each rate gets a histogram scored against the full read and a distinct-value estimate made the way SQL Server makes it. On a column whose values cluster by page, its estimates matched SQL Server's own density within 2% at every rate tried (10% to 75%). It recommends the smallest rate within 10% of a full scan, as `UPDATE STATISTICS ... WITH SAMPLE n PERCENT, PERSIST_SAMPLE_PERCENT = ON`. Without `-Table` it checks the whole database (see [Sample sizes for a whole database](#sample-sizes-for-a-whole-database)).
 - **Update cost estimate** (`-UpdateCost`). It estimates how long `UPDATE STATISTICS` takes for every statistics object of a table, or of a whole database when `-Table` is left out. It covers both the next update's sample (default or persisted) and `FULLSCAN`, serial and with the server's MAXDOP. The model was calibrated on real updates in the lab:
   - base-table reads by page and row;
   - the sort, by rows × log₂(rows), costlier for long strings;
@@ -141,20 +141,70 @@ The advisors only read; the scripts they write change statistics when you run th
   - **Order:** by benefit per estimated second. Any time left over goes to upgrading small samples to `FULLSCAN`.
   - **Script:** each statement runs only while the budget lasts.
   - **NORECOMPUTE statistics** are left out unless `-IncludeNoRecompute`, because a plain update turns automatic updates back on and replaces a built histogram.
-- **Filtered statistics advisor** (`-AdviseFiltered`). For a column, every other column with 2 to 200 values (a tenant, a status, a region) splits the table into segments. In each segment it compares two things: the optimizer's estimate for `segment = s AND column = x`, made from the two columns' own statistics, and a histogram of the segment's own rows. It recommends `CREATE STATISTICS ... WHERE` where a filtered statistic at least halves an error of 3× or more. In the lab, for a tenant with 1% of the rows, it predicted the optimizer's estimate was 10× off. SQL Server's estimate was exactly 10× off, and exact with the recommended filtered statistic.
+- **Filtered statistics advisor** (`-AdviseFiltered`). For a column, every other column with 2 to 200 values (a tenant, a status, a region) splits the table into segments. In each segment it compares two things: the optimizer's estimate for `segment = s AND column = x`, made from the two columns' own statistics, and a histogram of the segment's own rows. It recommends `CREATE STATISTICS ... WHERE` where a filtered statistic at least halves an error of 3× or more. In the lab, for a tenant with 1% of the rows, it predicted the optimizer's estimate was 10× off. SQL Server's estimate was exactly 10× off, and exact with the recommended filtered statistic. Without `-Table` it checks the whole database (see below).
+
+### Filtered statistics for a whole database
+
+`-AdviseFiltered` without `-Table`, or **Tools > Filtered statistics advisor** in the app, checks every table worth it and writes one ranked script for the database.
+
+- **Candidates come from metadata, without reading any table.** A table needs `-MinTableRows` rows (100,000 by default). A column counts when it leads a statistics object: SQL Server creates one when a query filters on the column, so these are the columns queries use (`-AnyColumn` also takes the others, for databases with `AUTO_CREATE_STATISTICS` off). A segment column needs 2 to 200 values and one value with `-MinSegmentRows` rows, which its histogram tells (`sys.dm_db_stats_histogram`). Identity columns and single-column unique keys are left out. `-CandidatesOnly` stops here and lists the tables, their column pairs and a time estimate.
+- **Each table is read once**, the biggest first: a page sample of about `-SegmentSampleRows` rows (200,000 by default) is copied to tempdb, and every pair of a column and a segment column is scored there.
+- **Within a time budget** (`-TimeBudgetMinutes`). The time estimate starts from a model measured in the lab (most of a pair's time is the groups it reads back, about 5 µs each) and follows the server's real speed as tables finish. A table that does not fit the time left is passed over for smaller ones, and the report lists it with the time it needs.
+- **One list for the database**: at most `-MaxPerTable` per table (3) and `-MaxRecommendations` in all (25), most useful first. Filtered statistics that already exist are not suggested again. The **Column pairs** view shows when one pair needs many of them: a tenant whose products differ from every other tenant's needs one per tenant.
+- **The cause of each error.** *Correlated values*: each segment has its own distribution of the column, so estimating from the whole column is wrong there. *Independent columns*: the column is spread alike in every segment, but SQL Server (compatibility level 120 and later) assumes two predicates are partly correlated (exponential backoff) and estimates too many rows. A filtered statistic fixes either, one segment at a time, so the independent ones rank lower.
+
+The app runs it as a wizard: **Scope** (what to check and the limits), **Candidates** (the tables from metadata, with their estimates; clear the ones to skip, or keep what fits the budget), **Analysis** and **Results**. The analysis shows a bar for all the tables and one for the table being read, the step running (`Pair 3 of 8: [product] in the segments of [tenant]`), the time elapsed, the time left and when it should end, the time budget left, and a line per finished table. **Stop and show results** cancels the query running and keeps what is done. The results list every segment worth a filtered statistic, the recommended ones checked; the script follows the checks.
+
+![The filtered statistics advisor's analysis step: progress for all tables and for the table being read, time left, budget left and the finished tables](assets/screenshot-filtered-progress.png)
+
+![The filtered statistics advisor's results: the recommended filtered statistics checked, with the estimate errors now and with each one, and their cause](assets/screenshot-filtered-results.png)
+
+On a lab database with six tables and planted correlations (a tenant's products, a region's ticket categories), it found both and ranked an independent pair below them, in about 3 seconds. On a copy of a production database with 8,048 tables, the metadata step took 3 seconds and kept 308 tables with 30,840 column pairs (about 3.5 hours of reading); a 3-minute budget checked the 33 biggest that fit and stopped on time.
+
+### Sample sizes for a whole database
+
+`-AdviseSample` without `-Table`, or **Tools > Sample size advisor** in the app (the same four steps), finds the statistics whose default sample estimates noticeably worse than a full read, and writes one script that persists a better rate for each.
+
+- **Candidates come from metadata.** A table needs `-MinTableRows` rows, and its default sample must read only part of it (under about 1,024 pages the default reads everything, so there is nothing to advise). Filtered and incremental statistics are left out, and so are statistics that already have a persisted rate, unless `-IncludePersisted`.
+- **Each table is read once for all its statistics**: at most `-PageBudget` pages (50,000 per table here), each row's page and every candidate leading column copied to tempdb. Each leading column is then replayed from that copy at the default sample and larger ones, the same way as for one statistic. Statistics led by the same column share one analysis.
+- **A rate is recommended only where it matters**: the smallest rate within 10% of the read, and only when the default is noticeably worse (an error at least 1.2× bigger and off by a real margin, or the distinct values 15% or more off). Rates that would help a little are listed as *Small gain*.
+- **What it costs.** For each statistic, the update cost model shows how long an update takes at the new rate against the default, and the script's header gives the total. A short probe scales the model to the server (`-NoProbe` skips it).
+- **Within a time budget**, biggest tables first, with the same progress, time left and **Stop and show results** as the filtered statistics advisor. In the app, the Scope step also offers one table or the statistics object shown; when five statistics or fewer are checked, the report lists every rate tried for each, as the advisor for one statistic does.
+
+![The sample size advisor's results: one row per statistics object, the recommended rates checked, with the errors and update times at the default sample and at the recommended rate](assets/screenshot-sample-results.png)
+
+On the lab database it read 7 tables in about 30 seconds and recommended one rate: 75% for a `datetime2` column whose distinct values the default sample put 19% too low. On the copy of a production database, the metadata step took 26 seconds and kept 293 tables with 4,493 statistics (about 5.4 hours of reading); a 3-minute budget checked the 6 biggest tables, 73 statistics, and recommended a larger rate for 18 of them (5%, 10% or FULLSCAN).
 
 ```powershell
 # How big a sample this statistic needs
 .\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.Orders -Statistics st_OrderDate -AdviseSample
+
+# Sample rates for every statistics object of the database that needs one, within 15 minutes
+.\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -AdviseSample -TimeBudgetMinutes 15 -OutputScript .\samples.sql
 
 # A 30-minute maintenance plan for the whole database
 .\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -MaintenancePlan -TimeBudgetMinutes 30 -OutputScript .\maintenance.sql
 
 # Segments where a filtered statistic on ProductID would help
 .\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -Table dbo.OrderLines -Column ProductID -AdviseFiltered
+
+# The tables and column pairs a whole-database check would read, from metadata only
+.\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -AdviseFiltered -CandidatesOnly
+
+# Filtered statistics for the whole database (or -TableFilter 'sales.*'), within 10 minutes
+.\Decode-StatsStream.ps1 -ServerInstance "localhost" -Database DB1 -AdviseFiltered -TimeBudgetMinutes 10 -OutputScript .\filtered.sql
 ```
 
 The binary layout is documented in [STATS_STREAM-format.md](STATS_STREAM-format.md).
+
+## Locks
+
+Every connection the app and the PowerShell script open runs `SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` and `SET LOCK_TIMEOUT 100`: no query takes shared locks, and none waits more than 100 ms for someone else's lock.
+
+- **Row and table locks never stop it.** Under READ UNCOMMITTED, reads go past other sessions' row, page and even exclusive table locks.
+- **A schema change in progress does** (`ALTER TABLE`, an offline index rebuild, `TRUNCATE`): in the lab, on SQL Server 2017 and 2025, it made the table's metadata functions (`OBJECT_ID`, `OBJECT_NAME`, `OBJECTPROPERTY`), its `sys.partitions` rows, `sys.dm_db_stats_properties` and `sys.dm_db_stats_histogram`, `DBCC SHOW_STATISTICS` and reads of its data wait. The catalog views (`sys.objects`, `sys.stats`, `sys.columns`, `sys.indexes`) did not, so the script looks names up through them, not through `OBJECT_ID`.
+- **What it does then.** Whole-database metadata is read in one batch on the server. First the lock manager (`sys.dm_tran_locks`) says which tables are locked for a schema change, and the reads leave them out by ranges of object ids (a `NOT IN` over a list of ids was not enough: SQL Server can still touch the locked table before filtering it out). When a read still times out (a lock taken in the meantime, or a login without `VIEW SERVER STATE`, which cannot see the locks), the same batch reads ranges of tables and halves the ones that time out, so one locked table among thousands costs about a dozen 100 ms waits. Either way it is one round trip. On a copy of a production database (8,048 tables, 31,692 statistics) with one table locked, reading the statistics metadata took 105 s when the script went table by table from the client; it now takes about 10 s, with or without the lock manager's help. A statistics object or table that times out later is skipped too: in a decode, an advisor or the maintenance plan, the others go on, and the report ends with the objects skipped. A run aimed at the locked table itself (a decode, the builder, one table's advisor) stops with that reason.
+- **The other way round.** A query of ours holds a schema stability lock on the table it reads, so a schema change waits for it, and new queries can queue behind the schema change. The page budgets, time budgets and query timeouts keep those reads short; still, run the advisors that read data outside maintenance windows.
 
 ## Requirements
 
@@ -182,8 +232,7 @@ Double-click `SQLStatsXRay.cmd`, or run:
 - **Help > Explain fields** (F1) turns on tooltips that explain each tab, each column header and each Header field in plain words, along with how the optimizer uses a step in the chart's readout.
 - **History** charts the current update and the up to three before it: table rows, histogram steps, distinct values, and what changed before each update (inserts, deletes, new rows above or below the previous histogram). It explains them in words, the leading column type, the update rhythm and the forecast included, above the TF 2388 result. **Forecast at** picks the date of the forecast.
 - **Bytes** shows the stream as hex, each byte tinted by the part it belongs to (header, columns, blob, histogram, string index, update history). Hover a byte to see every field around it, down to a step record's EQ_ROWS or a string index node; click a byte or a row of the field list to select the field.
-- **Tools > Sample size advisor**, **Update cost and maintenance plan** and **Filtered statistics advisor** run the [advisors](#advisors) in the background and show their report and script.
-- **Tools > Build statistics (beta)...** (Ctrl+B) builds a histogram of our own for the statistics object shown, a new one on a column, or every statistics object of the table (see [Statistics builder](#statistics-builder-beta)). The results window shows the verdict and the report, every algorithm's scores (**All algorithms**) and the script; **Show histogram** opens the built histogram in the tabs.
+- **Tools > Sample size advisor**, **Update cost and maintenance plan** and **Filtered statistics advisor** run the [advisors](#advisors) in the background and show their report and script. The sample size and filtered statistics advisors are wizards for the whole database, one table, or one statistics object or column (see [Sample sizes for a whole database](#sample-sizes-for-a-whole-database) and [Filtered statistics for a whole database](#filtered-statistics-for-a-whole-database)).- **Tools > Build statistics (beta)...** (Ctrl+B) builds a histogram of our own for the statistics object shown, a new one on a column, or every statistics object of the table (see [Statistics builder](#statistics-builder-beta)). The results window shows the verdict and the report, every algorithm's scores (**All algorithms**) and the script; **Show histogram** opens the built histogram in the tabs.
 - **Check against the table (F6)** on the Data check tab compares the selected statistics object's histogram with the table data (see [Checking histograms against the data](#checking-histograms-against-the-data)). It runs only when you ask, one statistics object at a time.
 - **Edit statistics** turns on editing of the header, histogram steps (insert and delete with a right click) and density vector. **Generate script...** builds the edited stream with a new checksum and writes the `UPDATE STATISTICS ... WITH STATS_STREAM` script, optionally with `NORECOMPUTE` and a commented block that restores the original statistics. The app never runs the script itself.
 - **Tools > Settings...** holds the theme, connection defaults and report limits. They are saved per user in `%LOCALAPPDATA%\SQLStatsXRay\settings.json`. Passwords are never saved.

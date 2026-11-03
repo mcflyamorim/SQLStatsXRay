@@ -73,7 +73,7 @@
     index whose first key column is the statistics' leading column (the smallest such index),
     with one seek per step: it counts the real EQ_ROWS, RANGE_ROWS and DISTINCT_RANGE_ROWS,
     the largest number of rows for one value inside each step, the NULL rows and the rows
-    above the last step. The queries run under READ UNCOMMITTED, LOCK_TIMEOUT 1000, MAXDOP 1
+    above the last step. The queries run under READ UNCOMMITTED, LOCK_TIMEOUT 100, MAXDOP 1
     and KEEPFIXED PLAN, which keeps them from triggering an automatic update of the
     statistics they check. Each range is rated by q-error (how many times the estimate is
     off, either way), and the results separate sampling error from modifications since the
@@ -180,9 +180,18 @@
     histogram (scored against the full read) and the distinct value estimate change. Recommends the
     smallest rate within 10% of a full scan, with an UPDATE STATISTICS ... PERSIST_SAMPLE_PERCENT
     script. Nothing is changed on the server.
+    Without -Table it checks the whole database: metadata picks the statistics (tables of
+    -MinTableRows rows whose default sample does not read them whole; not filtered, incremental or
+    with a persisted rate), then the biggest tables are read first within -TimeBudgetMinutes, once
+    each for all their statistics, and the ones the default sample estimates noticeably worse
+    make one script, with what their updates would cost at the new rates. -CandidatesOnly,
+    -TableFilter and -MaxRecommendations work as for -AdviseFiltered.
 
 .PARAMETER PageBudget
-    -AdviseSample: the most pages read (default 100000, 0 = no limit).
+    -AdviseSample: the most pages read (default 100000, 0 = no limit; 50000 per table without -Table).
+
+.PARAMETER IncludePersisted
+    -AdviseSample without -Table: also statistics that already have a persisted sample rate.
 
 .PARAMETER UpdateCost
     How long UPDATE STATISTICS takes for every statistics object of the table (or, without
@@ -195,7 +204,7 @@
     script that stops when the budget runs out. Table or whole database, like -UpdateCost.
 
 .PARAMETER TimeBudgetMinutes
-    -MaintenancePlan: the time budget (default 30).
+    -MaintenancePlan: the time budget (default 30). -AdviseFiltered without -Table: how long it reads.
 
 .PARAMETER IncludeNoRecompute
     -MaintenancePlan: also plans NORECOMPUTE statistics (left out by default: they may be built ones).
@@ -204,16 +213,45 @@
     -UpdateCost, -MaintenancePlan: no probe query; the lab's constants are used.
 
 .PARAMETER AdviseFiltered
-    Filtered statistics advisor for a column (-Statistics or -Column): finds segments (values
-    of other columns, such as a tenant or status) where estimates for the column are off because
-    the columns are correlated, and writes CREATE STATISTICS ... WHERE for the ones a filtered
-    statistic fixes. Reads one page sample into tempdb.
+    Filtered statistics advisor for a column (-Table with -Statistics or -Column): finds segments
+    (values of other columns, such as a tenant or status) where estimates for the column are off
+    because the columns are correlated, and writes CREATE STATISTICS ... WHERE for the ones a
+    filtered statistic fixes. Reads one page sample into tempdb.
+    Without -Table it checks the whole database: metadata picks the tables (-MinTableRows) and the
+    column pairs (columns that lead a statistics object; segment columns with 2 to 200 values by
+    their histogram), then the biggest tables are read first within -TimeBudgetMinutes, one
+    sample each, and the best segments make one ranked script (-MaxPerTable, -MaxRecommendations).
+    The console shows the progress and the time left.
 
 .PARAMETER SegmentColumn
-    -AdviseFiltered: the columns to try as segments (default: every column of a type a filter can use).
+    -AdviseFiltered -Table: the columns to try as segments (default: every column of a type a filter can use).
 
 .PARAMETER MinSegmentRows
     -AdviseFiltered: the smallest segment considered, in table rows (default 1000).
+
+.PARAMETER MinTableRows
+    -AdviseFiltered without -Table: the smallest table checked (default 100000 rows).
+
+.PARAMETER SegmentSampleRows
+    -AdviseFiltered without -Table: rows read per table (default 200000; every row of a smaller table).
+
+.PARAMETER MaxRecommendations
+    -AdviseFiltered without -Table: the most filtered statistics in the script (default 25).
+
+.PARAMETER MaxPerTable
+    -AdviseFiltered without -Table: the most filtered statistics per table (default 3).
+
+.PARAMETER TableFilter
+    -AdviseFiltered without -Table: only these tables; [schema].[table] exactly, or patterns on
+    schema.table with * or % (sales.* , dbo.Order%).
+
+.PARAMETER AnyColumn
+    -AdviseFiltered without -Table: also columns without a statistics object (slower; for databases
+    with AUTO_CREATE_STATISTICS off).
+
+.PARAMETER CandidatesOnly
+    -AdviseFiltered without -Table: lists the tables and column pairs it would check, with time
+    estimates, from metadata only.
 
 .PARAMETER ForecastDate
     The date the update history forecast and the health check's age use (default now): rows past
@@ -441,6 +479,38 @@ param(
     [Parameter(ParameterSetName = 'ConnStr')]
     [long]$MinSegmentRows = 1000,
 
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [long]$MinTableRows = 100000,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [long]$SegmentSampleRows = 200000,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [int]$MaxRecommendations = 25,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [int]$MaxPerTable = 3,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [string[]]$TableFilter,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$AnyColumn,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$CandidatesOnly,
+
+    [Parameter(ParameterSetName = 'Server')]
+    [Parameter(ParameterSetName = 'ConnStr')]
+    [switch]$IncludePersisted,
+
     [object]$ForecastDate,
 
     [Parameter(ParameterSetName = 'Hex', Mandatory = $true)]
@@ -466,7 +536,11 @@ param(
 
     # Used by the app's background run: returns the decoded objects and the report together.
     [Parameter(DontShow = $true)]
-    [switch]$GuiRun
+    [switch]$GuiRun,
+
+    # The app's shared table for a long advisor run: progress out, a stop request in.
+    [Parameter(DontShow = $true)]
+    [hashtable]$GuiControl
 )
 
 $ErrorActionPreference = 'Stop'
@@ -2475,6 +2549,120 @@ function Format-StatsReport($D, $Info) {
 
 #region ---------------------------------------------------------------- server access
 
+# Every connection reads without shared locks and gives up on a lock after 100 ms (error 1222), so the tool never queues
+# behind other sessions. Under READ UNCOMMITTED, row and table locks do not stop it; a schema change in progress (ALTER TABLE,
+# an offline index rebuild) does: the table's metadata functions (OBJECT_ID, OBJECT_NAME, OBJECTPROPERTY), its sys.partitions
+# rows, sys.dm_db_stats_properties / _histogram, DBCC SHOW_STATISTICS and its data wait on it (lab, SQL Server 2017 and 2025).
+# Those reads time out and the object is skipped; catalog views (sys.objects, sys.stats, sys.columns, sys.indexes) never wait.
+$script:SessionSql = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
+$script:LockedCause = 'locked by another session (a schema change such as ALTER TABLE or an offline index rebuild)'
+$script:LockedMessage = "$($script:LockedCause): skipped after waiting 100 ms"
+$script:LockedObjects = New-Object 'System.Collections.Generic.List[object]'
+
+function Set-StatsSession($Connection) {
+    $c = $Connection.CreateCommand(); $c.CommandText = $script:SessionSql; $null = $c.ExecuteNonQuery()
+}
+
+function Test-StatsLockTimeout($Exception) {
+    # error 1222 anywhere in the chain: a lock the session gave up waiting for
+    $e = $Exception
+    while ($e) {
+        if ($e -is [Data.SqlClient.SqlException] -and @($e.Errors | Where-Object { $_.Number -eq 1222 }).Count) { return $true }
+        $e = $e.InnerException
+    }
+    return $false
+}
+
+function Add-StatsLockedObject([string]$Name, [string]$Stage) {
+    $script:LockedObjects.Add([pscustomobject]@{ Object = $Name; Stage = $Stage })
+}
+
+function Get-StatsLockedLine($Locked) {
+    # the objects skipped because they were locked, for a report
+    $l = @($Locked)
+    if (-not $l.Count) { return $null }
+    $names = @($l | ForEach-Object Object | Select-Object -Unique)
+    Format-Invariant '{0} object(s) {1}, skipped: {2}{3}' $names.Count $script:LockedCause (($names | Select-Object -First 10) -join ', ') $(if ($names.Count -gt 10) { ', ...' } else { '' })
+}
+
+function Get-StatsLockedIds($Connection) {
+    <#
+      The objects under a schema modification lock (granted or waited for), from the lock manager, before a whole-database
+      read: the read leaves them out instead of timing out on them. Without VIEW SERVER STATE nothing is known up front, and
+      the reads find them as they time out (New-StatsLockSafeSql).
+    #>
+    try {
+        $t = Invoke-Query $Connection "SELECT DISTINCT CAST(resource_associated_entity_id AS int) AS id FROM sys.dm_tran_locks WHERE resource_database_id = DB_ID() AND resource_type = 'OBJECT' AND request_mode = 'Sch-M'"
+        return , [int[]]@($t[0].Rows | ForEach-Object { [int]$_.id } | Sort-Object)
+    } catch { return , [int[]]@() }
+}
+
+function New-StatsLockedPrelude([int[]]$Ids) {
+    # #xray_locked: the objects a batch leaves out (and reports), the known ones to begin with
+    "CREATE TABLE #xray_locked (object_id int PRIMARY KEY);" + $(if ($Ids) { "`r`nINSERT #xray_locked VALUES " + (($Ids | ForEach-Object { "($_)" }) -join ', ') + ';' } else { '' })
+}
+
+function Get-StatsOutsideIds([string]$Column, [int[]]$Ids) {
+    # a predicate that keeps $Column off the given ids as ranges: a NOT IN over a table of ids can be applied after the
+    # metadata read that waits on the lock; ranges become seeks that never touch the locked object (lab, SQL Server 2025)
+    if (-not $Ids) { return '1 = 1' }
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    $parts.Add("$Column < $($Ids[0])")
+    for ($i = 1; $i -lt $Ids.Count; $i++) { if ($Ids[$i] - $Ids[$i - 1] -gt 1) { $parts.Add("$Column BETWEEN $($Ids[$i - 1] + 1) AND $($Ids[$i] - 1)") } }
+    $parts.Add("$Column > $($Ids[$Ids.Count - 1])")
+    '(' + ($parts -join ' OR ') + ')'
+}
+
+function New-StatsLockSafeSql([string]$Name, [string]$Reads, [string]$Objects, [string[]]$Targets, [int[]]$Locked) {
+    <#
+      One T-SQL block, run in the same batch: $Reads for every object at once, the known locked ones left out ({F:column}
+      becomes ranges around their ids). When a lock still stops them (error 1222: a lock taken after the lock manager was
+      asked, or no permission to ask it), the targets are emptied and the reads run again on the server over ranges of the
+      objects ($Objects, a SELECT of object_id), halving a range that times out: one locked table among thousands costs
+      about log2(tables) short waits. A single object that still times out is skipped: its rows taken out, its id added to
+      #xray_locked. One round trip either way.
+    #>
+    $outside = { param($Column) Get-StatsOutsideIds $Column $Locked }
+    $all = [regex]::Replace($Reads, '\{F:([^}]+)\}', { param($m) & $outside $m.Groups[1].Value })
+    $one = [regex]::Replace($Reads, '\{F:([^}]+)\}', { param($m) "$($m.Groups[1].Value) BETWEEN @xray_lo_$Name AND @xray_hi_$Name AND $(& $outside $m.Groups[1].Value)" })
+    $clear = ($Targets | ForEach-Object { "TRUNCATE TABLE $_;" }) -join ' '
+    $undo = ($Targets | ForEach-Object { "DELETE $_ WHERE object_id BETWEEN @xray_lo_$Name AND @xray_hi_$Name;" }) -join ' '
+    @"
+BEGIN TRY
+$all
+END TRY
+BEGIN CATCH
+    IF ERROR_NUMBER() <> 1222 THROW;
+    $clear
+    DECLARE @xray_ids_$Name TABLE (n int IDENTITY PRIMARY KEY, object_id int);
+    INSERT @xray_ids_$Name (object_id) SELECT x.object_id FROM ($Objects) x WHERE x.object_id NOT IN (SELECT object_id FROM #xray_locked) ORDER BY x.object_id;
+    DECLARE @xray_todo_$Name TABLE (a int, b int);
+    INSERT @xray_todo_$Name SELECT 1, COUNT(*) FROM @xray_ids_$Name HAVING COUNT(*) > 0;
+    DECLARE @xray_a_$Name int, @xray_b_$Name int, @xray_lo_$Name int, @xray_hi_$Name int;
+    WHILE EXISTS (SELECT 1 FROM @xray_todo_$Name)
+    BEGIN
+        SELECT TOP (1) @xray_a_$Name = a, @xray_b_$Name = b FROM @xray_todo_$Name;
+        DELETE @xray_todo_$Name WHERE a = @xray_a_$Name AND b = @xray_b_$Name;
+        SELECT @xray_lo_$Name = object_id FROM @xray_ids_$Name WHERE n = @xray_a_$Name;
+        SELECT @xray_hi_$Name = object_id FROM @xray_ids_$Name WHERE n = @xray_b_$Name;
+        BEGIN TRY
+$one
+        END TRY
+        BEGIN CATCH
+            IF ERROR_NUMBER() <> 1222 THROW;
+            $undo
+            IF @xray_a_$Name = @xray_b_$Name
+                INSERT #xray_locked SELECT @xray_lo_$Name WHERE NOT EXISTS (SELECT 1 FROM #xray_locked WHERE object_id = @xray_lo_$Name);
+            ELSE
+                INSERT @xray_todo_$Name VALUES (@xray_a_$Name, (@xray_a_$Name + @xray_b_$Name) / 2), ((@xray_a_$Name + @xray_b_$Name) / 2 + 1, @xray_b_$Name);
+        END CATCH;
+    END;
+END CATCH;
+"@
+}
+# the locked user tables, by name: the last result set of a batch that used #xray_locked
+$script:LockedNamesSql = "SELECT '[' + REPLACE(s.name, ']', ']]') + '].[' + REPLACE(o.name, ']', ']]') + ']' AS name FROM #xray_locked l JOIN sys.objects o ON o.object_id = l.object_id AND o.type = 'U' JOIN sys.schemas s ON s.schema_id = o.schema_id;"
+
 function Invoke-Query($Connection, [string]$Sql, [hashtable]$Parameters = @{}, [int]$TimeoutSeconds = 120) {
     $cmd = $Connection.CreateCommand()
     $cmd.CommandText = $Sql
@@ -2525,7 +2713,7 @@ function Get-StatsTargets($Connection, [string]$TableName, [string[]]$StatNames)
     $t = Invoke-Query $Connection @'
 SELECT o.object_id, s.name AS schema_name, o.name AS table_name
 FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
-WHERE o.object_id = OBJECT_ID(@t)
+WHERE o.object_id = (SELECT o.object_id FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.name = PARSENAME(@t, 1) AND s.name = ISNULL(PARSENAME(@t, 2), SCHEMA_NAME()))
 '@ @{ '@t' = $TableName }
     if ($t[0].Rows.Count -eq 0) { throw "Table '$TableName' not found in database '$($Connection.Database)'." }
     $obj = $t[0].Rows[0]
@@ -2877,7 +3065,7 @@ function Test-StatsAgainstData {
     <#
       Checks the histogram against the table data. The table is read only through a rowstore index whose first key
       is the statistics' leading column (the smallest one), with one seek per step, under READ UNCOMMITTED,
-      LOCK_TIMEOUT 1000, MAXDOP 1 and KEEPFIXED PLAN, within a page budget. Above the budget it becomes a spot
+      LOCK_TIMEOUT 100, MAXDOP 1 and KEEPFIXED PLAN, within a page budget. Above the budget it becomes a spot
       check: the NULL step, both ends of the histogram, then steps at random, as long as their estimated pages fit.
       Results carry step numbers and counts, not key values.
     #>
@@ -2958,7 +3146,7 @@ ORDER BY SUM(au.data_pages), i.index_id;
     $outcome = @{}
     $spent = 0.0; $errors = 0; $lastError = $null
     $session = $Connection.CreateCommand()
-    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;'
+    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
     $null = $session.ExecuteNonQuery()
     try {
         foreach ($i in $order) {
@@ -2980,7 +3168,7 @@ ORDER BY SUM(au.data_pages), i.index_id;
             if ($StepDelay -gt 0) { Start-Sleep -Milliseconds $StepDelay }
         }
     } finally {
-        $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT -1;'
+        $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
         try { $null = $session.ExecuteNonQuery() } catch { }
     }
     $updatedDuring = $false
@@ -3627,7 +3815,7 @@ namespace SQLStatsXRay.Builder {
  // "segment = s AND target = x" from the two columns' own statistics, and what a filtered statistic on the segment gives.
  public sealed class SegmentResult {
   public object Raw; public bool IsNull; public double Rows, Values;
-  public double LegacyEqP95, NewEqP95, NewRangeP95, FilteredEqP95, FilteredRangeP95, NewEqGeoMean;
+  public double LegacyEqP95, NewEqP95, NewRangeP95, LegacyRangeP95, FilteredEqP95, FilteredRangeP95, NewEqGeoMean;
  }
 
  public static class Segments {
@@ -3675,14 +3863,15 @@ namespace SQLStatsXRay.Builder {
     var ownCum = new double[keys.Count + 1];
     for (int i = 0; i < keys.Count; i++) { double t; own.TryGetValue(keys[i], out t); ownCum[i + 1] = ownCum[i] + t; }
     var ownAt = new List<int>(); foreach (var o in own) ownAt.Add(pos[o.Key]);
-    var rnd = new Random(seed); var qr = new List<double>();
+    var rnd = new Random(seed); var qr = new List<double>(); var qrLegacy = new List<double>();
     for (int k = 0; k < ranges && ownAt.Count > 1; k++) {
      int a = ownAt[rnd.Next(ownAt.Count)], b = ownAt[rnd.Next(ownAt.Count)]; if (a > b) { int t = a; a = b; b = t; }
      double pr = (cum[b + 1] - cum[a]) / total, act = (ownCum[b + 1] - ownCum[a]) * scale;
      double lo = Math.Min(ps, pr), hi = Math.Max(ps, pr);
      qr.Add(Histogram.QError(total * scale * lo * Math.Sqrt(hi), act));
+     qrLegacy.Add(Histogram.QError(total * scale * ps * pr, act));   // independence: right when the columns are not correlated
     }
-    res.NewRangeP95 = P95(qr);
+    res.NewRangeP95 = P95(qr); res.LegacyRangeP95 = P95(qrLegacy);
     // a filtered statistic: a 200-step histogram of the segment's own rows, scored against them
     var p = new Profile();
     foreach (var o in own) p.AddKeyed((double)o.Key, null, o.Value, o.Value);
@@ -4193,7 +4382,7 @@ function Read-StatsBuildProfile($Connection, $Target, $Plan, [int]$Seed, [int]$T
     $cmd.CommandTimeout = $TimeoutSeconds
     $cmd.CommandText = $sql
     $session = $Connection.CreateCommand()
-    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;'
+    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
     $null = $session.ExecuteNonQuery()
     $profile = New-StatsBuildProfile $Target $Connection $Plan
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -4201,7 +4390,7 @@ function Read-StatsBuildProfile($Connection, $Target, $Plan, [int]$Seed, [int]$T
         $r = $cmd.ExecuteReader()
         try { $profile.Read($r) } finally { $r.Close() }
     } finally {
-        $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT -1;'
+        $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
         try { $null = $session.ExecuteNonQuery() } catch { }
     }
     return [pscustomobject]@{ Profile = $profile; Seconds = $sw.Elapsed.TotalSeconds }
@@ -4450,7 +4639,7 @@ function Read-StatsBuildShared($Connection, $Target, $Columns, $Plan, [int]$Seed
     $cols = @($Columns)
     $session = $Connection.CreateCommand()
     $session.CommandTimeout = $TimeoutSeconds
-    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;'
+    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
     $null = $session.ExecuteNonQuery()
     $profiles = @{}
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -4472,7 +4661,7 @@ function Read-StatsBuildShared($Connection, $Target, $Columns, $Plan, [int]$Seed
             }
         }
     } finally {
-        $session.CommandText = 'DROP TABLE IF EXISTS #xray_sample; SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT -1;'
+        $session.CommandText = 'DROP TABLE IF EXISTS #xray_sample; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
         try { $null = $session.ExecuteNonQuery() } catch { }
     }
     return [pscustomobject]@{ Profiles = $profiles; Seconds = $sw.Elapsed.TotalSeconds }
@@ -4563,7 +4752,7 @@ function Read-StatsBuildFocusProfile($Connection, $Target, $Column, $Focus, [int
     $hint = $(if ($ix) { " WITH (INDEX([$(([string]$ix.name).Replace(']', ']]'))]))" } else { '' })
     $cmd.CommandText = "SELECT $($Target.ColumnSql), COUNT_BIG(*) FROM $($Target.Table)$hint WHERE $($where -join ' AND ') GROUP BY $($Target.ColumnSql) ORDER BY $($Target.ColumnSql) OPTION (KEEPFIXED PLAN, MAXDOP 1);"
     $session = $Connection.CreateCommand()
-    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;'
+    $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
     $null = $session.ExecuteNonQuery()
     $p = New-StatsBuildProfile $Target $null $null
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -4571,7 +4760,7 @@ function Read-StatsBuildFocusProfile($Connection, $Target, $Column, $Focus, [int
         $r = $cmd.ExecuteReader()
         try { $p.Read($r) } finally { $r.Close() }
     } finally {
-        $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT -1;'
+        $session.CommandText = 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;'
         try { $null = $session.ExecuteNonQuery() } catch { }
     }
     [pscustomobject]@{ Profile = $p; Rows = $p.ReadRows; Seconds = $sw.Elapsed.TotalSeconds; Path = $(if ($ix) { "index [$($ix.name)]" } else { 'a table scan (no index on the column)' }) }
@@ -5090,7 +5279,7 @@ function Format-StatsBuildTableReport($T, [switch]$ShowCandidates) {
 function Set-StatsReadSession($Connection, [switch]$Off) {
     # the advisors read like the builder: dirty reads, short lock waits
     $c = $Connection.CreateCommand()
-    $c.CommandText = $(if ($Off) { 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET LOCK_TIMEOUT -1;' } else { 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 1000;' })
+    $c.CommandText = $(if ($Off) { 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;' } else { 'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED; SET LOCK_TIMEOUT 100;' })
     try { $null = $c.ExecuteNonQuery() } catch { if (-not $Off) { throw } }
 }
 
@@ -5114,41 +5303,13 @@ WHERE sc.object_id = @o AND sc.stats_id = @s ORDER BY COALESCE(NULLIF(ic.key_ord
 
 # ---- 6. sample size advisor
 
-function Invoke-SampleAdvisor {
+function Measure-SampleRates($Cache, [double]$Rows, [double]$Pages, [double]$RefFraction, $Default, [double]$ReadSeconds, [int]$Seeds = 2) {
     <#
-      How the histogram and the distinct value estimate change with the sample size. The table is read once (every row,
-      or within the page budget the largest page sample), as (value, page, rows); each candidate rate is then replayed from
-      memory as a page sample, as TABLESAMPLE keeps whole pages, two seeds each. Each sample gets a MaxDiff histogram
-      (the algorithm closest to SQL Server's own) scored against the full read, and a row-based distinct value estimate
-      (SQL Server's kind). The recommendation is the smallest rate whose scores are within 10% of the full read's.
+      The replay from one read (a SampleCache): the default rate and round percents above it, each as page samples (two seeds),
+      a MaxDiff histogram scored against the read, and a row-based distinct value estimate. Recommended: the smallest rate
+      within 10% of the full read's scores.
     #>
-    param($Connection, [string]$TableName, [string]$StatName, [long]$PageBudget = 100000, [int]$Seeds = 2, [int]$TimeoutSeconds = 0)
-    Initialize-StatsBuilder
-    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to sample." }
-    $target = Get-StatsLeadingTarget $Connection $TableName $StatName
-    $rows = [double]$target.Rows; $pages = [double]$target.Pages
-    if ($rows -le 0 -or $pages -le 0) { throw "The table is empty: there is nothing to sample." }
-    $default = Get-SqlServerSamplePlan ([int64]$rows) ([int64]$pages) 'Default'
-    $refFraction = $(if ($PageBudget -le 0 -or $pages -le $PageBudget) { 1.0 } else { $PageBudget / $pages })
-    $c = $target.ColumnSql
-    $from = $(if ($refFraction -lt 1) { "$($target.Table) TABLESAMPLE SYSTEM ($((100 * $refFraction).ToString('0.######', $script:Inv)) PERCENT) REPEATABLE (1) WITH (INDEX(0))" } else { "$($target.Table) WITH (INDEX(0))" })
-    $sql = @"
-SELECT g.v, DENSE_RANK() OVER (ORDER BY g.v) AS rk, g.pg, g.n
-FROM (SELECT $c AS v, SUBSTRING(%%physloc%%, 1, 6) AS pg, COUNT_BIG(*) AS n FROM $from GROUP BY $c, SUBSTRING(%%physloc%%, 1, 6)) g
-ORDER BY rk OPTION (MAXDOP 1, KEEPFIXED PLAN);
-"@
-    $cache = New-Object SQLStatsXRay.Builder.SampleCache
-    Set-StatsReadSession $Connection
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-    try {
-        $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds; $cmd.CommandText = $sql
-        $r = $cmd.ExecuteReader()
-        try { $cache.Read($r, [bool]$target.IsText) } finally { $r.Close() }
-    } finally { Set-StatsReadSession $Connection -Off }
-    $readSeconds = $sw.Elapsed.TotalSeconds
-    if ($cache.Truncated) { throw "The column has more than $($cache.MaxRows) (value, page) pairs: lower -PageBudget." }
-    if ($cache.TotalRows -le 0) { throw 'The table is empty: there is nothing to sample.' }
-
+    $cache = $Cache; $rows = $Rows; $pages = $Pages; $refFraction = $RefFraction; $default = $Default; $readSeconds = $ReadSeconds
     # the reference: every row read (scale 1 for a full read)
     $pagesRef = 0.0; $onesRef = 0.0
     $ref = $cache.Sample(1.0, 0, [ref]$pagesRef, [ref]$onesRef)
@@ -5201,11 +5362,53 @@ ORDER BY rk OPTION (MAXDOP 1, KEEPFIXED PLAN);
     foreach ($x in $results) { $x | Add-Member Acceptable ([bool](& $ok $x)) }
     $best = @($results | Where-Object Acceptable | Sort-Object Percent | Select-Object -First 1)[0]
     if (-not $best) { $best = $full }
+    [pscustomobject]@{
+        Reference = [pscustomobject]@{ EqP95 = $refScore.EqP95; RangeP95 = $refScore.RangeP95; Distinct = $refDistinct }; ReferenceScore = $refScore
+        Results = $results.ToArray(); Recommended = $best
+    }
+}
+function Invoke-SampleAdvisor {
+    <#
+      How the histogram and the distinct value estimate change with the sample size. The table is read once (every row,
+      or within the page budget the largest page sample), as (value, page, rows); each candidate rate is then replayed from
+      memory as a page sample, as TABLESAMPLE keeps whole pages, two seeds each. Each sample gets a MaxDiff histogram
+      (the algorithm closest to SQL Server's own) scored against the full read, and a row-based distinct value estimate
+      (SQL Server's kind). The recommendation is the smallest rate whose scores are within 10% of the full read's.
+    #>
+    param($Connection, [string]$TableName, [string]$StatName, [long]$PageBudget = 100000, [int]$Seeds = 2, [int]$TimeoutSeconds = 0)
+    Initialize-StatsBuilder
+    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to sample." }
+    $target = Get-StatsLeadingTarget $Connection $TableName $StatName
+    $rows = [double]$target.Rows; $pages = [double]$target.Pages
+    if ($rows -le 0 -or $pages -le 0) { throw "The table is empty: there is nothing to sample." }
+    $default = Get-SqlServerSamplePlan ([int64]$rows) ([int64]$pages) 'Default'
+    $refFraction = $(if ($PageBudget -le 0 -or $pages -le $PageBudget) { 1.0 } else { $PageBudget / $pages })
+    $c = $target.ColumnSql
+    $from = $(if ($refFraction -lt 1) { "$($target.Table) TABLESAMPLE SYSTEM ($((100 * $refFraction).ToString('0.######', $script:Inv)) PERCENT) REPEATABLE (1) WITH (INDEX(0))" } else { "$($target.Table) WITH (INDEX(0))" })
+    $sql = @"
+SELECT g.v, DENSE_RANK() OVER (ORDER BY g.v) AS rk, g.pg, g.n
+FROM (SELECT $c AS v, SUBSTRING(%%physloc%%, 1, 6) AS pg, COUNT_BIG(*) AS n FROM $from GROUP BY $c, SUBSTRING(%%physloc%%, 1, 6)) g
+ORDER BY rk OPTION (MAXDOP 1, KEEPFIXED PLAN);
+"@
+    $cache = New-Object SQLStatsXRay.Builder.SampleCache
+    Set-StatsReadSession $Connection
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds; $cmd.CommandText = $sql
+        $r = $cmd.ExecuteReader()
+        try { $cache.Read($r, [bool]$target.IsText) } finally { $r.Close() }
+    } finally { Set-StatsReadSession $Connection -Off }
+    $readSeconds = $sw.Elapsed.TotalSeconds
+    if ($cache.Truncated) { throw "The column has more than $($cache.MaxRows) (value, page) pairs: lower -PageBudget." }
+    if ($cache.TotalRows -le 0) { throw 'The table is empty: there is nothing to sample.' }
+
+    $m = Measure-SampleRates $cache $rows $pages $refFraction $default $readSeconds $Seeds
+    $refScore = $m.ReferenceScore; $refDistinct = $m.Reference.Distinct; $results = $m.Results; $best = $m.Recommended
     $current = $(if ($target.Stat.sp_rows -isnot [DBNull] -and [double]$target.Stat.sp_rows -gt 0 -and $target.Stat.sp_rows_sampled -isnot [DBNull]) { 100.0 * [double]$target.Stat.sp_rows_sampled / [double]$target.Stat.sp_rows })
     [pscustomobject]@{
         Kind = 'SampleAdvisor'; Target = $target; StatName = $target.StatName; Rows = $rows; Pages = $pages; Default = $default; ReferenceFraction = $refFraction; ReadSeconds = $readSeconds
         Reference = [pscustomobject]@{ EqP95 = $refScore.EqP95; RangeP95 = $refScore.RangeP95; Distinct = $refDistinct }
-        Results = $results.ToArray(); Recommended = $best; CurrentPercent = $current
+        Results = @($results); Recommended = $best; CurrentPercent = $current
         Script = New-SampleAdvisorScript $target $best
     }
 }
@@ -5257,6 +5460,332 @@ function Format-SampleAdvisorReport($A) {
     return , $out
 }
 
+# ---- 6b. sample size advisor for a whole database
+
+# Seconds per unit of work (SQL2025 lab, laptop SSD); the analysis rescales them by the speed it measures as it goes.
+$script:SampleCost = @{ Table = 0.1; Page = 0.00004; Row = 0.0000008; Column = 0.05; Group = 0.0000012; Replay = 0.0000008 }
+
+function Get-SampleTableEstimate([double]$Rows, [double]$Pages, [double]$RefFraction, [int]$Columns) {
+    # one read of the table (a page sample within the budget) into tempdb, then per column its (value, page) groups read back
+    # and replayed at every rate
+    $k = $script:SampleCost
+    $read = $Rows * $RefFraction
+    $copy = $k.Table + $Pages * $RefFraction * $k.Page + $read * $k.Row
+    $column = $k.Column + $read * ($k.Group + $k.Replay)
+    [pscustomobject]@{ Rows = $read; Copy = $copy; Column = $column; Total = $copy + $Columns * $column }
+}
+
+function Get-SampleAdvisorCandidates {
+    <#
+      The statistics worth a sample size check, from metadata only (Get-StatsUpdateCandidates): tables of MinTableRows rows
+      whose default sample does not read the whole table; statistics that are not filtered or incremental, on a column type
+      the builder reads, without a persisted sample rate (unless IncludePersisted). Statistics led by the same column share
+      one analysis: the advice is about the column's values.
+    #>
+    param($Connection, [long]$MinTableRows = 100000, [long]$PageBudget = 50000, [string[]]$TableFilter, [string]$StatName, [switch]$IncludePersisted)
+    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to sample." }
+    $server = Get-StatsServerParallelism $Connection
+    $all = @(Get-StatsUpdateCandidates $Connection $null $server.HasPersisted)
+    $q = { param([string]$n) '[' + $n.Replace(']', ']]') + ']' }
+    $tables = New-Object 'System.Collections.Generic.List[object]'
+    $skipped = New-Object 'System.Collections.Generic.List[object]'
+    $counts = @{ Tables = 0; Small = 0; Whole = 0; Outside = 0; Persisted = 0; Filtered = 0; Type = 0 }
+    foreach ($g in @($all | Group-Object ObjectId)) {
+        $first = $g.Group[0]
+        $counts.Tables++
+        if (-not (Test-FilteredTableMatch $first.Schema $first.TableName $first.Table $TableFilter)) { $counts.Outside++; continue }
+        $rows = [double]$first.Rows; $pages = [double]$first.Pages
+        if ($rows -lt $MinTableRows -or $rows -le 0 -or $pages -le 0) { $counts.Small++; continue }
+        $default = Get-SqlServerSamplePlan ([int64]$rows) ([int64]$pages) 'Default'
+        if ($default.Full) { $counts.Whole++; continue }
+        $stats = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($s in $g.Group) {
+            if ($StatName -and $s.Name -ne $StatName) { continue }
+            if ($s.Filtered -or $s.Incremental) { $counts.Filtered++; continue }
+            if ($s.PersistedPercent -gt 0 -and -not $IncludePersisted) { $counts.Persisted++; continue }
+            if (-not $s.LeadColumn -or $s.LeadType -notin $script:BuildKeyTypes -or $s.KeyBytes -eq -1) { $counts.Type++; continue }
+            $stats.Add($s)
+        }
+        if (-not $stats.Count) { continue }
+        $columns = foreach ($cg in @($stats | Group-Object LeadColumn)) {
+            [pscustomobject]@{ Name = $cg.Name; Sql = & $q $cg.Name; IsText = $cg.Group[0].LeadType -in $script:BuildTextTypes; Stats = @($cg.Group) }
+        }
+        $refFraction = $(if ($PageBudget -le 0 -or $pages -le $PageBudget) { 1.0 } else { $PageBudget / $pages })
+        $est = Get-SampleTableEstimate $rows $pages $refFraction @($columns).Count
+        $tables.Add([pscustomobject]@{
+                ObjectId = $first.ObjectId; Table = $first.Table; Schema = $first.Schema; Name = $first.TableName; Rows = $rows; Pages = $pages
+                Default = $default; RefFraction = $refFraction; Columns = @($columns); Statistics = $stats.Count; Estimate = $est; Seconds = $est.Total
+            })
+    }
+    $ordered = @($tables | Sort-Object Rows -Descending)
+    [pscustomobject]@{
+        Kind = 'SampleCandidates'; Locked = $script:LockedObjects.ToArray(); Tables = $ordered; Counts = $counts; Server = $server; AllStatistics = $all
+        Statistics = [int](($ordered | Measure-Object Statistics -Sum).Sum); Columns = [int](($ordered | ForEach-Object { @($_.Columns).Count } | Measure-Object -Sum).Sum)
+        Seconds = [double](($ordered | Measure-Object Seconds -Sum).Sum); MinTableRows = $MinTableRows; PageBudget = $PageBudget; IncludePersisted = [bool]$IncludePersisted
+    }
+}
+
+function Invoke-SampleAdvisorDatabase {
+    <#
+      The sample size advisor for every statistics object worth it (Get-SampleAdvisorCandidates), biggest table first, within
+      a time budget: each table read once (a page sample within PageBudget, with each row's page) into tempdb, then each
+      leading column's (value, page) groups replayed at every rate (Measure-SampleRates). Each statistic gets the smallest
+      rate within 10% of the read, and what its updates would cost at that rate against the default (the update cost model).
+      Control (the app's shared table) receives the progress and can stop the run.
+    #>
+    param($Connection, [string]$Database, [long]$MinTableRows = 100000, [long]$PageBudget = 50000, [double]$BudgetMinutes = 30,
+        [int]$MaxRecommendations = 50, [string[]]$TableFilter, [string]$StatName, [switch]$IncludePersisted, [switch]$NoProbe,
+        [switch]$CandidatesOnly, [int]$Seeds = 2, $Control)
+    Initialize-StatsBuilder
+    $started = [DateTime]::Now
+    $activity = 'Sample size advisor'
+    Write-FilteredProgress $Control @{ Stage = 'Screen'; Step = 'Reading the tables and statistics (metadata only)'; Percent = 0.0; TableCount = 0 } $activity
+    $cand = Get-SampleAdvisorCandidates -Connection $Connection -MinTableRows $MinTableRows -PageBudget $PageBudget -TableFilter $TableFilter -StatName $StatName -IncludePersisted:$IncludePersisted
+    if ($CandidatesOnly) { return $cand }
+    $tables = @($cand.Tables)
+    $factors = $(if ($NoProbe -or -not $tables) { [pscustomobject]@{ Read = 1.0; Sort = 1.0; Probe = 'not run: lab constants used' } }
+        else { Write-FilteredProgress $Control @{ Stage = 'Screen'; Step = 'Measuring this server''s read and sort speed (two short queries)'; Percent = 0.0; TableCount = 0 } $activity; Measure-StatsCostFactors $Connection @($cand.AllStatistics) })
+    $budget = [Math]::Max(10.0, $BudgetMinutes * 60)
+    $deadline = $started.AddSeconds($budget)
+    $total = [double](($tables | Measure-Object Seconds -Sum).Sum)
+    $done = 0.0
+    $runStart = [DateTime]::Now
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    $log = New-Object 'System.Collections.Generic.List[object]'
+    $stopped = $null
+    $found = 0
+    $rate = { $prior = [Math]::Min(10.0, [Math]::Max(1.0, $total * 0.1)); (([DateTime]::Now - $runStart).TotalSeconds + $prior) / ($done + $prior) }
+    $report = {
+        param([int]$Index, $T, [string]$Step, [double]$TableDone, [double]$Unit)
+        $r = & $rate
+        Write-FilteredProgress $Control @{
+            Stage = 'Analyze'; TableIndex = $Index; TableCount = $tables.Count; Table = $T.Table; TableRows = $T.Rows; Step = $Step
+            TablePercent = $(if ($T.Seconds -gt 0) { [Math]::Min(1.0, $TableDone / $T.Seconds) } else { 1.0 }); TableDone = $TableDone; TableTotal = $T.Seconds
+            Done = $done; Total = $total; Rate = $r; Unit = $Unit
+            Percent = $(if ($total -gt 0) { [Math]::Min(1.0, $done / $total) } else { 1.0 }); Remaining = [Math]::Max(0.0, ($total - $done) * $r); BudgetLeft = ($deadline - [DateTime]::Now).TotalSeconds
+            Elapsed = ([DateTime]::Now - $started).TotalSeconds; Found = $found; Log = $log.ToArray(); At = [DateTime]::Now; Deadline = $deadline
+        } $activity
+    }
+    for ($i = 0; $i -lt $tables.Count; $i++) {
+        $t = $tables[$i]; $est = $t.Estimate
+        $left = ($deadline - [DateTime]::Now).TotalSeconds
+        $entry = [pscustomobject]@{ Table = $t.Table; Rows = $t.Rows; Pairs = @($t.Columns).Count; Checked = 0; Found = 0; Seconds = 0.0; Estimate = $t.Seconds; Result = ''; Note = '' }
+        if ($Control -and $Control.Stop) { $stopped = 'you stopped it' }
+        if ($stopped) { $entry.Result = 'Not reached'; $entry.Note = "stopped: $stopped"; $log.Add($entry); $total -= $t.Seconds; continue }
+        $need = $t.Seconds * (& $rate)
+        if ($left -le 0) { $stopped = 'the time budget ran out'; $entry.Result = 'Not reached'; $entry.Note = 'the time budget ran out'; $log.Add($entry); $total -= $t.Seconds; continue }
+        if ($need -gt $left) { $entry.Result = 'Not reached'; $entry.Note = "needs about $(Format-StatsSeconds $need), $(Format-StatsSeconds $left) left"; $log.Add($entry); $total -= $t.Seconds; continue }
+        $tStart = [DateTime]::Now; $tDone = 0.0
+        $timeout = [int][Math]::Max(30, $left + 30)
+        try {
+            # one read: each row's page and every candidate leading column, within the page budget
+            $from = $(if ($t.RefFraction -lt 1) { "$($t.Table) TABLESAMPLE SYSTEM ($((100 * $t.RefFraction).ToString('0.######', $script:Inv)) PERCENT) REPEATABLE (1) WITH (INDEX(0))" } else { "$($t.Table) WITH (INDEX(0))" })
+            $list = (@($t.Columns | ForEach-Object Sql)) -join ', '
+            & $report ($i + 1) $t (Format-Invariant 'Reading {0} of the pages ({1:N0} rows) into tempdb' $(if ($t.RefFraction -ge 1) { 'all' } else { Format-Invariant '{0:0.##}%' (100 * $t.RefFraction) }) $est.Rows) 0.0 $est.Copy
+            $c = $Connection.CreateCommand(); $c.CommandTimeout = $timeout
+            $c.CommandText = "IF OBJECT_ID('tempdb..#xray_smp') IS NOT NULL DROP TABLE #xray_smp; SELECT SUBSTRING(%%physloc%%, 1, 6) AS pg, $list INTO #xray_smp FROM $from OPTION (MAXDOP 1); SELECT COUNT_BIG(*) FROM #xray_smp;"
+            if ($Control) { $Control.Command = $c }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            Set-StatsReadSession $Connection
+            try { $read = [double]$c.ExecuteScalar() } finally { if ($Control) { $Control.Command = $null }; Set-StatsReadSession $Connection -Off }
+            $copySeconds = $sw.Elapsed.TotalSeconds
+            $done += $est.Copy; $tDone += $est.Copy
+            if ($read -le 0) { throw 'the sample is empty' }
+            $k = 0
+            foreach ($col in $t.Columns) {
+                $k++
+                & $report ($i + 1) $t "Column $k of $(@($t.Columns).Count): [$($col.Name)], replaying the default and larger samples ($(@($col.Stats).Count) statistics object(s))" $tDone $est.Column
+                $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $timeout
+                $cmd.CommandText = @"
+SELECT g.v, DENSE_RANK() OVER (ORDER BY g.v) AS rk, g.pg, g.n
+FROM (SELECT $($col.Sql) AS v, pg, COUNT_BIG(*) AS n FROM #xray_smp GROUP BY $($col.Sql), pg) g
+ORDER BY rk OPTION (MAXDOP 1);
+"@
+                $cache = New-Object SQLStatsXRay.Builder.SampleCache
+                if ($Control) { $Control.Command = $cmd }
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                try { $r = $cmd.ExecuteReader(); try { $cache.Read($r, [bool]$col.IsText) } finally { $r.Close() } } finally { if ($Control) { $Control.Command = $null } }
+                if ($cache.Truncated) { $entry.Note = "[$($col.Name)]: more than $($cache.MaxRows) (value, page) pairs, skipped"; $done += $est.Column; $tDone += $est.Column; continue }
+                $m = Measure-SampleRates $cache $t.Rows $t.Pages $t.RefFraction $t.Default $copySeconds $Seeds
+                $best = $m.Recommended; $def = @($m.Results | Where-Object IsDefault)[0]
+                foreach ($s in $col.Stats) {
+                    $current = $(if ($s.StatRows -gt 0 -and $s.RowsSampled -gt 0) { 100.0 * $s.RowsSampled / $s.StatRows })
+                    $rule = $(if ($best.IsDefault) { 'Default' } elseif ($best.Percent -ge 100) { 'FULLSCAN' } else { [Math]::Ceiling($best.Percent).ToString($script:Inv) + ' PERCENT' })
+                    $costDefault = Get-StatsUpdateCost $s $factors $cand.Server.Dop 'Default'
+                    $costBest = Get-StatsUpdateCost $s $factors $cand.Server.Dop $rule
+                    # worth a change: the default noticeably worse than the recommended rate, not just past the 10% line
+                    $material = ($def.EqP95 -ge 1.5 -and $def.EqP95 -ge 1.2 * $best.EqP95) -or ($def.RangeP95 -ge 1.25 -and $def.RangeP95 -ge 1.2 * $best.RangeP95) -or
+                        ([Math]::Abs($def.DistinctError) -ge 0.15 -and [Math]::Abs($def.DistinctError) - [Math]::Abs($best.DistinctError) -ge 0.1)
+                    $gain = [Math]::Max([Math]::Max($def.EqP95 / [Math]::Max(1, $best.EqP95), $def.RangeP95 / [Math]::Max(1, $best.RangeP95)), (1 + [Math]::Abs($def.DistinctError)) / (1 + [Math]::Abs($best.DistinctError)))
+                    $res = [pscustomobject]@{
+                        Table = $t.Table; Statistics = $s.Name; StatSql = $s.Sql; Column = $col.Name; Rows = $t.Rows; Pages = $t.Pages; IsIndex = $s.IsIndex; NoRecompute = $s.NoRecompute
+                        CurrentPercent = $current; PersistedPercent = $s.PersistedPercent; DefaultPercent = $t.Default.Percent; RefFraction = $t.RefFraction
+                        Needs = (-not $best.IsDefault) -and $material; Status = $(if ($best.IsDefault) { 'Default is enough' } elseif ($material) { 'Recommended' } else { 'Small gain' }); Recommended = $best; Rule = $rule; Default = $def; Reference = $m.Reference; Results = $m.Results; Gain = $gain
+                        CostDefault = $costDefault.Parallel; CostRecommended = $costBest.Parallel
+                    }
+                    $results.Add($res)
+                    if ($res.Needs) { $entry.Found++; $found++ }
+                }
+                $entry.Checked++
+                $done += $est.Column; $tDone += $est.Column
+            }
+            $entry.Result = 'Done'
+            if (-not $entry.Note) { $entry.Note = $(if ($entry.Found) { "$($entry.Found) statistics object(s) need more than the default sample" } else { 'the default sample is enough' }) }
+        } catch {
+            $e = $_.Exception.GetBaseException()
+            if ($Control -and $Control.Stop) { $stopped = 'you stopped it'; $entry.Result = 'Stopped'; $entry.Note = 'you stopped it' }
+            elseif (Test-StatsLockTimeout $_.Exception) { $entry.Result = 'Skipped'; $entry.Note = $script:LockedMessage; Add-StatsLockedObject $t.Table 'table read' }
+            elseif ($e -is [Data.SqlClient.SqlException] -and $e.Number -eq -2) { $stopped = 'the time budget ran out'; $entry.Result = 'Stopped'; $entry.Note = 'the time budget ran out during this table' }
+            else { $entry.Result = 'Failed'; $entry.Note = $e.Message }
+        } finally {
+            try { $null = Invoke-Query $Connection "IF OBJECT_ID('tempdb..#xray_smp') IS NOT NULL DROP TABLE #xray_smp;" } catch { }
+        }
+        $total -= ($t.Seconds - $tDone)
+        $entry.Seconds = ([DateTime]::Now - $tStart).TotalSeconds
+        $log.Add($entry)
+        & $report ($i + 1) $t $entry.Note $t.Seconds 0
+    }
+    # the ones that need more than the default, the biggest improvement on the biggest tables first
+    $needs = @($results | Where-Object Needs | Sort-Object { $_.Gain * [Math]::Log10(10 + $_.Rows) } -Descending)
+    $recommended = @($needs | Select-Object -First $MaxRecommendations)
+    $more = @($needs | Select-Object -Skip $MaxRecommendations)
+    if (-not $Control) { Write-Progress -Id 2 -Activity 'Table' -Completed; Write-Progress -Id 1 -Activity $activity -Completed }
+    [pscustomobject]@{
+        Kind = 'SampleDatabase'; Locked = $script:LockedObjects.ToArray(); Database = $Database; Candidates = $cand; Factors = $factors; Tables = $log.ToArray(); Statistics = $results.ToArray()
+        Recommended = $recommended; More = $more; Stopped = $stopped; Seconds = ([DateTime]::Now - $started).TotalSeconds; BudgetSeconds = $budget; MaxRecommendations = $MaxRecommendations
+        Script = New-SampleAdvisorDatabaseScript $Database $recommended
+    }
+}
+
+function New-SampleAdvisorDatabaseScript([string]$Database, $Recommended) {
+    $l = New-Object 'System.Collections.Generic.List[string]'
+    $l.Add("-- SQLStatsXRay sample size advisor for [$Database], generated $((Get-Date).ToString('yyyy-MM-dd HH:mm', $script:Inv)).")
+    if (-not @($Recommended).Count) { $l.Add('-- Every statistics object checked is estimated well enough by the default sample: nothing to change.'); return ($l.ToArray() -join "`r`n") + "`r`n" }
+    $now = [double](($Recommended | Measure-Object CostDefault -Sum).Sum); $then = [double](($Recommended | Measure-Object CostRecommended -Sum).Sum)
+    $l.Add((Format-Invariant '-- {0} statistics object(s), most useful first. Updating them takes about {1} at these rates instead of {2} with the default sample (estimates).' @($Recommended).Count (Format-StatsSeconds $then) (Format-StatsSeconds $now)))
+    $l.Add('-- PERSIST_SAMPLE_PERCENT keeps each rate for later updates, automatic ones included (SQL Server 2016 SP1 CU4, 2017 CU1 and later).')
+    $l.Add('-- Running this script updates the statistics now, at these rates: run it in a maintenance window.')
+    $l.Add("USE [$($Database.Replace(']', ']]'))];")
+    foreach ($r in $Recommended) {
+        $with = $(if ($r.Rule -eq 'FULLSCAN') { 'FULLSCAN' } else { "SAMPLE $($r.Rule)" }) + ', PERSIST_SAMPLE_PERCENT = ON' + $(if ($r.NoRecompute) { ', NORECOMPUTE' } else { '' })
+        $l.Add('')
+        $l.Add((Format-Invariant '-- {0}.[{1}] on [{2}]: equality 95% within {3:0.##}x with the default ({4:0.##}%), {5:0.##}x at {6}; ranges {7:0.##}x, {8:0.##}x; distinct values {9:+0;-0}%, {10:+0;-0}%; update {11} instead of {12}' `
+                    $r.Table $r.Statistics $r.Column $r.Default.EqP95 $r.DefaultPercent $r.Recommended.EqP95 $r.Rule $r.Default.RangeP95 $r.Recommended.RangeP95 (100 * $r.Default.DistinctError) (100 * $r.Recommended.DistinctError) (Format-StatsSeconds $r.CostRecommended) (Format-StatsSeconds $r.CostDefault)))
+        if ($r.IsIndex) { $l.Add('-- An index statistic: an index rebuild updates it with a full scan, whatever the rate.') }
+        $l.Add("UPDATE STATISTICS $($r.Table) ($($r.StatSql)) WITH $with;")
+    }
+    return ($l.ToArray() -join "`r`n") + "`r`n"
+}
+
+function Get-SampleTablesLine($C) {
+    $n = $C.Counts
+    $parts = @(Format-Invariant '{0:N0} tables with statistics' $n.Tables)
+    if ($n.Outside) { $parts += Format-Invariant '{0:N0} not matching the table filter' $n.Outside }
+    if ($n.Small) { $parts += Format-Invariant '{0:N0} under {1:N0} rows' $n.Small $C.MinTableRows }
+    if ($n.Whole) { $parts += Format-Invariant '{0:N0} small enough that the default sample reads them whole' $n.Whole }
+    $parts -join '; '
+}
+
+function Get-SampleStatsLine($C) {
+    $n = $C.Counts
+    $parts = @()
+    if ($n.Persisted) { $parts += Format-Invariant '{0:N0} with a persisted sample rate (left out; -IncludePersisted)' $n.Persisted }
+    if ($n.Filtered) { $parts += Format-Invariant '{0:N0} filtered or incremental' $n.Filtered }
+    if ($n.Type) { $parts += Format-Invariant '{0:N0} on a column type the builder does not read' $n.Type }
+    if ($parts) { 'statistics left out: ' + ($parts -join '; ') } else { 'no statistics object left out' }
+}
+
+function Format-SampleCandidatesReport($C) {
+    $out = @()
+    $out += New-Section 'SAMPLE SIZE ADVISOR: CANDIDATES'
+    $out += Format-Invariant '{0} table(s) to read, {1:N0} statistics object(s) on {2:N0} leading column(s), about {3} (an estimate from the lab; the analysis measures this server as it goes).' @($C.Tables).Count $C.Statistics $C.Columns (Format-StatsSeconds $C.Seconds)
+    $out += ''
+    $out += Format-KeyValueTable ([ordered]@{
+            'Tables'     = Get-SampleTablesLine $C
+            'Statistics' = Get-SampleStatsLine $C
+            'Read'       = Format-Invariant 'each table once, at most {0:N0} pages (a page sample above that); statistics led by the same column share one analysis' $C.PageBudget
+        })
+    $out += ''
+    if (@($C.Tables).Count) {
+        $rows = foreach ($t in $C.Tables) {
+            [pscustomobject]@{
+                Table = $t.Table; Rows = Format-Invariant '{0:N0}' $t.Rows; Pages = Format-Invariant '{0:N0}' $t.Pages; 'Default sample' = Format-Invariant '{0:0.##}%' $t.Default.Percent
+                Read = $(if ($t.RefFraction -ge 1) { 'all' } else { Format-Invariant '{0:0.##}%' (100 * $t.RefFraction) }); Statistics = $t.Statistics; Columns = @($t.Columns).Count; Estimate = Format-StatsSeconds $t.Seconds
+            }
+        }
+        $out += Format-AsciiTable -Rows $rows -Columns Table, Rows, Pages, 'Default sample', Read, Statistics, Columns, Estimate -RightAlign Rows, Pages, 'Default sample', Read, Statistics, Columns, Estimate
+    }
+    $locked = Get-StatsLockedLine $C.Locked
+    if ($locked) { $out += ''; $out += "Skipped: $locked." }
+    return , $out
+}
+
+function Format-SampleDatabaseReport($A) {
+    $out = @()
+    $c = $A.Candidates
+    $rec = @($A.Recommended); $all = @($A.Statistics)
+    $doneTables = @($A.Tables | Where-Object Result -eq 'Done')
+    $out += New-Section "SAMPLE SIZE ADVISOR: [$($A.Database)]"
+    $needs = @($all | Where-Object Needs).Count
+    $out += $(if ($needs) { Format-Invariant '{0} of {1} statistics object(s) checked need more than the default sample: the default estimates them noticeably worse than a full read.' $needs $all.Count }
+        else { Format-Invariant 'The default sample is enough for all {0} statistics object(s) checked.' $all.Count })
+    $out += ''
+    $now = [double](($rec | Measure-Object CostDefault -Sum).Sum); $then = [double](($rec | Measure-Object CostRecommended -Sum).Sum)
+    $out += Format-KeyValueTable ([ordered]@{
+            'Checked'    = Format-Invariant '{0} of {1} candidate table(s), {2:N0} statistics object(s), in {3} of a {4} budget{5}' $doneTables.Count @($A.Tables).Count $all.Count (Format-StatsSeconds $A.Seconds) (Format-StatsSeconds $A.BudgetSeconds) $(if ($A.Stopped) { " (stopped: $($A.Stopped))" } else { '' })
+            'Tables'     = Get-SampleTablesLine $c
+            'Statistics' = Get-SampleStatsLine $c
+            'Read'       = Format-Invariant 'each table once, at most {0:N0} pages; above that the reference is that page sample, not the whole table' $c.PageBudget
+            'Rule'       = 'the smallest rate whose histogram (equality and ranges, 95th percentile) and distinct value estimate are within 10% of the read''s'
+            'Cost'       = $(if ($rec) { Format-Invariant 'updating the {0} in the script: about {1} at their rates, {2} with the default sample (update cost model; {3})' $rec.Count (Format-StatsSeconds $then) (Format-StatsSeconds $now) $A.Factors.Probe } else { '' })
+        })
+    $out += ''
+    $fmt = {
+        param($s)
+        [pscustomobject]@{
+            Table = $s.Table; Statistics = "[$($s.Statistics)]"; Column = "[$($s.Column)]"; Rows = Format-Invariant '{0:N0}' $s.Rows
+            Current = $(if ($null -ne $s.CurrentPercent) { Format-Invariant '{0:0.##}%' $s.CurrentPercent } else { 'never' }); Default = Format-Invariant '{0:0.##}%' $s.DefaultPercent
+            Recommended = $s.Rule; 'Equality 95%' = Format-Invariant '{0:0.##}x > {1:0.##}x' $s.Default.EqP95 $s.Recommended.EqP95; 'Ranges 95%' = Format-Invariant '{0:0.##}x > {1:0.##}x' $s.Default.RangeP95 $s.Recommended.RangeP95
+            Distinct = Format-Invariant '{0:+0;-0}% > {1:+0;-0}%' (100 * $s.Default.DistinctError) (100 * $s.Recommended.DistinctError); Update = Format-Invariant '{0} > {1}' (Format-StatsSeconds $s.CostDefault) (Format-StatsSeconds $s.CostRecommended)
+        }
+    }
+    $cols = 'Table', 'Statistics', 'Column', 'Rows', 'Current', 'Default', 'Recommended', 'Equality 95%', 'Ranges 95%', 'Distinct', 'Update'
+    if ($rec) {
+        $out += 'Recommended, most useful first (default sample > recommended rate; 1x = exact, against the read):'
+        $out += Format-AsciiTable -Rows @($rec | ForEach-Object { & $fmt $_ }) -Columns $cols -RightAlign Rows, Current, Default, 'Equality 95%', 'Ranges 95%', Distinct, Update
+    }
+    if (@($A.More).Count) { $out += "$(@($A.More).Count) more need a larger sample but are over the limit (-MaxRecommendations)." }
+    $small = @($all | Where-Object Status -eq 'Small gain').Count
+    if ($small) { $out += Format-Invariant '{0} more estimate a little better at a larger rate, not enough to be worth longer updates (Small gain).' $small }
+    $out += ''
+    $out += 'Tables:'
+    $trows = foreach ($t in $A.Tables) {
+        [pscustomobject]@{ Table = $t.Table; Rows = Format-Invariant '{0:N0}' $t.Rows; Columns = Format-Invariant '{0} of {1}' $t.Checked $t.Pairs; Time = $(if ($t.Result -eq 'Not reached') { '' } else { Format-StatsSeconds $t.Seconds }); Result = $t.Result; Note = $t.Note }
+    }
+    $out += Format-AsciiTable -Rows $trows -Columns Table, Rows, Columns, Time, Result, Note -RightAlign Rows, Columns, Time
+    if (@($A.Tables | Where-Object Result -ne 'Done').Count) { $out += 'Tables not checked: run again with a larger time budget, or pick them with -TableFilter.' }
+    # a few statistics (one table, or the statistics object shown): every rate tried, as the advisor for one statistic shows them
+    if ($all.Count -and $all.Count -le 5) {
+        foreach ($s in $all) {
+            $out += ''
+            $out += Format-Invariant 'Rates tried for {0}.[{1}] on [{2}] ({3}; read {4}):' $s.Table $s.Statistics $s.Column $s.Status $(if ($s.RefFraction -ge 1) { 'every row' } else { Format-Invariant '{0:0.##}% of the pages' (100 * $s.RefFraction) })
+            $rr = foreach ($x in $s.Results) {
+                [pscustomobject]@{
+                    Sample = $x.Label + $(if ($x.Label -eq $s.Recommended.Label) { '  <- smallest within 10%' } else { '' }); 'Pages read' = Format-Invariant '{0:N0}' $x.Pages
+                    'Equality 95%' = Format-Invariant '{0:0.##}x' $x.EqP95; 'Ranges 95%' = Format-Invariant '{0:0.##}x' $x.RangeP95; 'Values >10x' = Format-Invariant '{0:N0}' $x.ValuesOver10
+                    'Distinct (row-based)' = Format-Invariant '{0:N0} ({1:+0;-0}%)' $x.Distinct (100 * $x.DistinctError); 'Within 10%' = $(if ($x.Acceptable) { 'yes' } else { 'no' })
+                }
+            }
+            $rc = 'Sample', 'Pages read', 'Equality 95%', 'Ranges 95%', 'Values >10x', 'Distinct (row-based)', 'Within 10%'
+            $out += Format-AsciiTable -Rows $rr -Columns $rc -RightAlign ($rc | Select-Object -Skip 1)
+        }
+    }
+    $out += 'Simulated from one read per table: nothing was changed on the server. The script updates statistics when you run it.'
+    $locked = Get-StatsLockedLine $A.Locked
+    if ($locked) { $out += ''; $out += "Skipped: $locked." }
+    return , $out
+}
+
 # ---- 7. update cost estimate
 
 function Get-StatsServerParallelism($Connection) {
@@ -5278,31 +5807,70 @@ function Get-StatsUpdateCandidates($Connection, [object]$ObjectId, [bool]$HasPer
       reads that index in key order, without a sort).
     #>
     $persisted = $(if ($HasPersisted) { 'sp.persisted_sample_percent' } else { 'CAST(NULL AS float)' })
-    $rows = @((Invoke-Query $Connection @"
-SELECT s.object_id, OBJECT_SCHEMA_NAME(s.object_id) AS schema_name, o.name AS table_name, s.stats_id, s.name AS stats_name,
+    # Sizes, leading columns and ordered indexes in one pass each (a lookup per statistics object took 71 s on a database of
+    # 31,775 statistics). The reads a schema change can block (sizes, partition stats, statistics properties) leave out the
+    # tables the lock manager reports, or halve ranges on the server when one still times out: one round trip, the locked tables skipped.
+    $locked = Get-StatsLockedIds $Connection
+    $reads = New-StatsLockSafeSql 'size' @"
+INSERT #xray_size SELECT p.object_id, SUM(au.data_pages), SUM(p.rows) FROM sys.partitions p
+JOIN sys.allocation_units au ON au.container_id = p.partition_id AND au.type = 1
+WHERE p.index_id IN (0, 1) AND {F:p.object_id} AND (@o IS NULL OR p.object_id = @o) GROUP BY p.object_id;
+-- the leaf pages of the smallest rowstore index led by each column (a full scan reads it in key order); from sys.partitions:
+-- sys.dm_db_partition_stats waits on a locked table even when the query leaves it out
+INSERT #xray_ordered SELECT k.object_id, k.column_id, MIN(q.pages)
+FROM (SELECT p.object_id, p.index_id, SUM(au.data_pages) AS pages FROM sys.partitions p JOIN sys.allocation_units au ON au.container_id = p.partition_id AND au.type = 1
+      WHERE {F:p.object_id} AND (@o IS NULL OR p.object_id = @o) GROUP BY p.object_id, p.index_id) q
+JOIN sys.indexes x ON x.object_id = q.object_id AND x.index_id = q.index_id AND x.type IN (1, 2) AND x.is_disabled = 0 AND x.has_filter = 0
+JOIN sys.index_columns k ON k.object_id = x.object_id AND k.index_id = x.index_id AND k.key_ordinal = 1
+GROUP BY k.object_id, k.column_id;
+INSERT #xray_props SELECT s.object_id, s.stats_id, sp.rows, sp.rows_sampled, sp.modification_counter, sp.last_updated, $persisted
+FROM sys.stats s JOIN sys.objects o ON o.object_id = s.object_id AND o.type = 'U' AND o.is_ms_shipped = 0
+OUTER APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+WHERE {F:s.object_id} AND (@o IS NULL OR s.object_id = @o);
+"@ "SELECT o.object_id FROM sys.objects o WHERE o.type = 'U' AND o.is_ms_shipped = 0 AND (@o IS NULL OR o.object_id = @o)" '#xray_size', '#xray_ordered', '#xray_props' $locked
+    $sql = @"
+SET NOCOUNT ON;
+IF OBJECT_ID('tempdb..#xray_locked') IS NOT NULL DROP TABLE #xray_locked;
+IF OBJECT_ID('tempdb..#xray_size') IS NOT NULL DROP TABLE #xray_size;
+IF OBJECT_ID('tempdb..#xray_lead') IS NOT NULL DROP TABLE #xray_lead;
+IF OBJECT_ID('tempdb..#xray_ordered') IS NOT NULL DROP TABLE #xray_ordered;
+IF OBJECT_ID('tempdb..#xray_props') IS NOT NULL DROP TABLE #xray_props;
+$(New-StatsLockedPrelude $locked)
+CREATE TABLE #xray_size (object_id int PRIMARY KEY, pages bigint, rows bigint);
+CREATE TABLE #xray_ordered (object_id int, column_id int, pages bigint);
+CREATE TABLE #xray_props (object_id int, stats_id int, rows bigint, rows_sampled bigint, modification_counter bigint, last_updated datetime2, persisted_sample_percent float);
+$reads
+-- each statistics object's leading column (an index's first key) and its column count (catalog views: never blocked)
+SELECT x.object_id, x.stats_id, x.column_id, x.columns INTO #xray_lead
+FROM (SELECT sc.object_id, sc.stats_id, sc.column_id, COUNT(*) OVER (PARTITION BY sc.object_id, sc.stats_id) AS columns,
+             ROW_NUMBER() OVER (PARTITION BY sc.object_id, sc.stats_id ORDER BY COALESCE(NULLIF(ic.key_ordinal, 0), sc.stats_column_id)) AS rn
+      FROM sys.stats_columns sc
+      LEFT JOIN sys.indexes i ON i.object_id = sc.object_id AND i.index_id = sc.stats_id
+      LEFT JOIN sys.index_columns ic ON ic.object_id = sc.object_id AND ic.index_id = i.index_id AND ic.column_id = sc.column_id
+      WHERE (@o IS NULL OR sc.object_id = @o)) x
+WHERE x.rn = 1;
+SELECT s.object_id, sch.name AS schema_name, o.name AS table_name, s.stats_id, s.name AS stats_name,
        s.auto_created, s.user_created, s.no_recompute, s.has_filter, s.is_incremental, i.type AS index_type,
-       sp.rows AS stat_rows, sp.rows_sampled, sp.modification_counter, sp.last_updated, $persisted AS persisted_sample_percent,
-       lead.name AS lead_column, lead.system_type_id AS lead_type, lead.max_length AS lead_bytes,
-       (SELECT COUNT(*) FROM sys.stats_columns x WHERE x.object_id = s.object_id AND x.stats_id = s.stats_id) AS column_count,
+       sp.rows AS stat_rows, sp.rows_sampled, sp.modification_counter, sp.last_updated, sp.persisted_sample_percent,
+       c.name AS lead_column, c.system_type_id AS lead_type, c.max_length AS lead_bytes, l.columns AS column_count,
        base.pages AS base_pages, base.rows AS table_rows, ix.pages AS ordered_pages
 FROM sys.stats s
 JOIN sys.objects o ON o.object_id = s.object_id AND o.type = 'U' AND o.is_ms_shipped = 0
+JOIN sys.schemas sch ON sch.schema_id = o.schema_id
 LEFT JOIN sys.indexes i ON i.object_id = s.object_id AND i.index_id = s.stats_id AND i.name = s.name
-OUTER APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
-OUTER APPLY (SELECT TOP (1) c.name, c.system_type_id, c.max_length, c.column_id FROM sys.stats_columns sc
-             JOIN sys.columns c ON c.object_id = sc.object_id AND c.column_id = sc.column_id
-             LEFT JOIN sys.index_columns ic ON ic.object_id = sc.object_id AND ic.index_id = i.index_id AND ic.column_id = sc.column_id
-             WHERE sc.object_id = s.object_id AND sc.stats_id = s.stats_id ORDER BY COALESCE(NULLIF(ic.key_ordinal, 0), sc.stats_column_id)) lead
-OUTER APPLY (SELECT SUM(au.data_pages) AS pages, SUM(p.rows) AS rows FROM sys.partitions p
-             JOIN sys.allocation_units au ON au.container_id = p.partition_id AND au.type = 1
-             WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)) base
-OUTER APPLY (SELECT TOP (1) q.pages FROM (SELECT x.index_id, SUM(ps.in_row_data_page_count) AS pages FROM sys.indexes x
-             JOIN sys.index_columns k ON k.object_id = x.object_id AND k.index_id = x.index_id AND k.key_ordinal = 1 AND k.column_id = lead.column_id
-             JOIN sys.dm_db_partition_stats ps ON ps.object_id = x.object_id AND ps.index_id = x.index_id
-             WHERE x.object_id = s.object_id AND x.type IN (1, 2) AND x.is_disabled = 0 AND x.has_filter = 0 GROUP BY x.index_id) q ORDER BY q.pages) ix
-WHERE (@o IS NULL OR s.object_id = @o) AND (i.type IS NULL OR i.type IN (1, 2))
+LEFT JOIN #xray_props sp ON sp.object_id = s.object_id AND sp.stats_id = s.stats_id
+LEFT JOIN #xray_lead l ON l.object_id = s.object_id AND l.stats_id = s.stats_id
+LEFT JOIN sys.columns c ON c.object_id = l.object_id AND c.column_id = l.column_id
+LEFT JOIN #xray_size base ON base.object_id = s.object_id
+LEFT JOIN #xray_ordered ix ON ix.object_id = s.object_id AND ix.column_id = l.column_id
+WHERE (@o IS NULL OR s.object_id = @o) AND (i.type IS NULL OR i.type IN (1, 2)) AND s.object_id NOT IN (SELECT object_id FROM #xray_locked)
 ORDER BY schema_name, table_name, s.stats_id;
-"@ @{ '@o' = $(if ($null -ne $ObjectId) { [int]$ObjectId } else { [DBNull]::Value }) })[0].Rows)
+$($script:LockedNamesSql)
+DROP TABLE #xray_size; DROP TABLE #xray_lead; DROP TABLE #xray_ordered; DROP TABLE #xray_props; DROP TABLE #xray_locked;
+"@
+    $sets = Invoke-Query $Connection $sql @{ '@o' = $(if ($null -ne $ObjectId) { [int]$ObjectId } else { [DBNull]::Value }) } 600
+    foreach ($l in $sets[1].Rows) { Add-StatsLockedObject ([string]$l.name) 'statistics metadata' }
+    $rows = @($sets[0].Rows)
     $nz = { param($v, $d = 0) if ($null -eq $v -or $v -is [DBNull]) { $d } else { $v } }
     foreach ($r in $rows) {
         $tableRows = [double](& $nz $r.table_rows)
@@ -5312,7 +5880,7 @@ ORDER BY schema_name, table_name, s.stats_id;
             IsIndex = $r.index_type -isnot [DBNull]; AutoCreated = [bool]$r.auto_created; NoRecompute = [bool]$r.no_recompute; Filtered = [bool]$r.has_filter; Incremental = [bool](& $nz $r.is_incremental $false)
             Rows = $tableRows; StatRows = [double](& $nz $r.stat_rows); RowsSampled = [double](& $nz $r.rows_sampled); Modifications = [double](& $nz $r.modification_counter)
             LastUpdated = $(if ($r.last_updated -is [DBNull]) { $null } else { [datetime]$r.last_updated }); PersistedPercent = [double](& $nz $r.persisted_sample_percent)
-            LeadColumn = [string](& $nz $r.lead_column ''); IsText = [int](& $nz $r.lead_type 0) -in 167, 175, 231, 239; KeyBytes = [double](& $nz $r.lead_bytes 8); Columns = [int]$r.column_count
+            LeadColumn = [string](& $nz $r.lead_column ''); LeadType = [int](& $nz $r.lead_type 0); IsText = [int](& $nz $r.lead_type 0) -in 167, 175, 231, 239; KeyBytes = [double](& $nz $r.lead_bytes 8); Columns = [int]$r.column_count
             Pages = [double](& $nz $r.base_pages); OrderedPages = $(if ($r.ordered_pages -is [DBNull]) { $null } else { [double]$r.ordered_pages })
         }
     }
@@ -5344,6 +5912,10 @@ function Measure-StatsCostFactors($Connection, $Candidates, [int]$ProbePages = 5
         $null = & $time "SELECT COUNT_BIG(*) FROM $($pick.Table) $ts OPTION (MAXDOP 1);"   # warms the pages
         $read = & $time "SELECT COUNT_BIG($col) FROM $($pick.Table) $ts OPTION (MAXDOP 1);"
         $sort = & $time "SELECT MAX(x.rn) FROM (SELECT ROW_NUMBER() OVER (ORDER BY $col) AS rn FROM $($pick.Table) $ts) x OPTION (MAXDOP 1);"
+    } catch {
+        if (-not (Test-StatsLockTimeout $_.Exception)) { throw }
+        Add-StatsLockedObject $pick.Table 'update cost probe'
+        return [pscustomobject]@{ Read = 1.0; Sort = 1.0; Probe = "$($pick.Table): $($script:LockedMessage); lab constants used" }
     } finally { Set-StatsReadSession $Connection -Off }
     # too few rows (a table of allocated but mostly empty pages) measure nothing but overhead
     if ([double]$read.Value -lt 10000) { return [pscustomobject]@{ Read = 1.0; Sort = 1.0; Probe = Format-Invariant '{0}: only {1:N0} rows in the probe sample, too few to measure: lab constants used' $pick.Table ([double]$read.Value) } }
@@ -5400,7 +5972,7 @@ function Invoke-StatsUpdateCost {
     $server = Get-StatsServerParallelism $Connection
     $objectId = $null
     if ($TableName) {
-        $id = (Invoke-Query $Connection 'SELECT OBJECT_ID(@t) AS id' @{ '@t' = $TableName })[0].Rows[0].id
+        $id = (Invoke-Query $Connection 'SELECT (SELECT o.object_id FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.name = PARSENAME(@t, 1) AND s.name = ISNULL(PARSENAME(@t, 2), SCHEMA_NAME())) AS id' @{ '@t' = $TableName })[0].Rows[0].id
         if ($id -is [DBNull]) { throw "Table '$TableName' not found in database '$($Connection.Database)'." }
         $objectId = [int]$id
     }
@@ -5410,7 +5982,7 @@ function Invoke-StatsUpdateCost {
         $c | Add-Member Next (Get-StatsUpdateCost $c $factors $server.Dop $null)
         $c | Add-Member FullScan (Get-StatsUpdateCost $c $factors $server.Dop 'FULLSCAN')
     }
-    [pscustomobject]@{ Kind = 'UpdateCost'; Scope = $(if ($TableName) { $TableName } else { "every user table of [$($Connection.Database)]" }); Server = $server; Factors = $factors; Candidates = $cands; IsClone = (Test-StatsCloneDatabase $Connection) }
+    [pscustomobject]@{ Kind = 'UpdateCost'; Locked = $script:LockedObjects.ToArray(); Scope = $(if ($TableName) { $TableName } else { "every user table of [$($Connection.Database)]" }); Server = $server; Factors = $factors; Candidates = $cands; IsClone = (Test-StatsCloneDatabase $Connection) }
 }
 
 function Format-StatsSeconds([double]$Seconds) {
@@ -5449,6 +6021,8 @@ function Format-StatsUpdateCostReport($U, [int]$Top = 50) {
         if ($c.Count -gt $Top) { $out += "The $Top costliest of $($c.Count) shown." }
     }
     $out += 'Estimates from a model of the reads and the sort, scaled by a probe of this server (warm cache): expect them within about 2x, slower when the pages come from disk.'
+    $locked = Get-StatsLockedLine $U.Locked
+    if ($locked) { $out += ''; $out += "Skipped: $locked." }
     return , $out
 }
 
@@ -5572,6 +6146,85 @@ function ConvertTo-StatsFilterLiteral($Value, [int]$SystemTypeId) {
     }
 }
 
+function Read-StatsSegmentSample($Connection, [string]$Table, [double]$Rows, [double]$Pages, [string[]]$Columns, [long]$SampleRows, [int]$TimeoutSeconds, $Control) {
+    # one page sample of the columns, about SampleRows rows (every row of a small table), copied to tempdb (#xray_seg) once
+    $pct = [Math]::Min(100.0, 100.0 * $SampleRows / [Math]::Max(1.0, $Rows))
+    # under 1,024 pages the whole table is cheap to read (a clustered columnstore has almost no in-row pages: sampled anyway)
+    if ($Pages -lt 1024 -and $Rows -le 10 * $SampleRows) { $pct = 100.0 }
+    $source = $(if ($pct -ge 100) { "$Table WITH (INDEX(0))" } else { "$Table TABLESAMPLE SYSTEM ($($pct.ToString('0.######', $script:Inv)) PERCENT) REPEATABLE (1) WITH (INDEX(0))" })
+    $c = $Connection.CreateCommand(); $c.CommandTimeout = $TimeoutSeconds
+    $c.CommandText = "IF OBJECT_ID('tempdb..#xray_seg') IS NOT NULL DROP TABLE #xray_seg; SELECT $($Columns -join ', ') INTO #xray_seg FROM $source OPTION (MAXDOP 1); SELECT COUNT_BIG(*) FROM #xray_seg;"
+    if ($Control) { $Control.Command = $c }
+    Set-StatsReadSession $Connection
+    try { $sampled = [double]$c.ExecuteScalar() } finally { if ($Control) { $Control.Command = $null }; Set-StatsReadSession $Connection -Off }
+    [pscustomobject]@{ Sampled = $sampled; Percent = $pct; Scale = $Rows / [Math]::Max(1.0, $sampled) }
+}
+
+function Get-StatsSegmentValueCount($Connection, [string]$ColumnSql, [int]$TimeoutSeconds, $Control) {
+    # distinct values in the sample, NULL counted as one
+    $c = $Connection.CreateCommand(); $c.CommandTimeout = $TimeoutSeconds
+    $c.CommandText = "SELECT COUNT(DISTINCT $ColumnSql) + ISNULL(MAX(CASE WHEN $ColumnSql IS NULL THEN 1 ELSE 0 END), 0) FROM #xray_seg"
+    if ($Control) { $Control.Command = $c }
+    try { return [double]$c.ExecuteScalar() } finally { if ($Control) { $Control.Command = $null } }
+}
+
+function Measure-StatsSegments($Connection, [string]$SegmentSql, [string]$TargetSql, [double]$Scale, [long]$MinRows, [int]$TimeoutSeconds, $Control) {
+    # every segment of SegmentSql with MinRows rows, scored for the target column (SQLStatsXRay.Builder.Segments)
+    $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds
+    # ranks in each column's own order (equal under the collation = one rank); a NULL target has no rank
+    $cmd.CommandText = @"
+SELECT DENSE_RANK() OVER (ORDER BY g.s) AS sk, g.s, CASE WHEN g.t IS NULL THEN NULL ELSE DENSE_RANK() OVER (ORDER BY g.t) END AS tk, g.n
+FROM (SELECT $SegmentSql AS s, $TargetSql AS t, COUNT_BIG(*) AS n FROM #xray_seg GROUP BY $SegmentSql, $TargetSql) g OPTION (MAXDOP 1);
+"@
+    if ($Control) { $Control.Command = $cmd }
+    try {
+        $r = $cmd.ExecuteReader()
+        try { return , ([SQLStatsXRay.Builder.Segments]::Analyze($r, $Scale, [double]$MinRows, 200, 7)) } finally { $r.Close() }
+    } finally { if ($Control) { $Control.Command = $null } }
+}
+
+function ConvertTo-FilteredSegment($S, [string]$Column, [int]$SystemTypeId) {
+    [pscustomobject]@{
+        Column = $Column; SystemTypeId = $SystemTypeId; Raw = $S.Raw; IsNull = $S.IsNull; Rows = $S.Rows; Values = $S.Values
+        NowEq = $S.NewEqP95; NowRange = $S.NewRangeP95; LegacyEq = $S.LegacyEqP95; LegacyRange = $S.LegacyRangeP95; FilteredEq = $S.FilteredEqP95; FilteredRange = $S.FilteredRangeP95
+        Gain = [Math]::Max($S.NewEqP95 / [Math]::Max(1, $S.FilteredEqP95), $S.NewRangeP95 / [Math]::Max(1, $S.FilteredRangeP95))
+        # correlated: assuming independence is clearly worse than the segment's own histogram (both carry the same sampling
+        # noise, so a sparse sample does not pass for correlation); otherwise the columns are independent and the error is
+        # the estimator's own guess that they are partly correlated (exponential backoff)
+        Correlated = ($S.NewEqP95 -ge 3 -and $S.LegacyEqP95 -ge 2 * [Math]::Max(1, $S.FilteredEqP95)) -or ($S.NewRangeP95 -ge 3 -and $S.LegacyRangeP95 -ge 2 * [Math]::Max(1, $S.FilteredRangeP95))
+    }
+}
+
+# worth a filtered statistic: off by 3x or more at the 95th percentile now, and at least twice as good with one
+function Test-FilteredWorth($R) { ($R.NowEq -ge 3 -or $R.NowRange -ge 3) -and $R.Gain -ge 2 }
+# correlated columns first: for independent ones a filtered statistic fixes one segment of an error every segment has
+function Get-FilteredScore($R) { $R.Gain * [Math]::Log10(10 + $R.Rows) * $(if ($R.Correlated) { 1.0 } else { 0.5 }) }
+function Get-FilteredCause($R) { if ($R.Correlated) { 'Correlated values' } else { 'Independent columns' } }
+
+function Get-FilteredWhere($R) {
+    '[' + $R.Column.Replace(']', ']]') + ']' + $(if ($R.IsNull) { ' IS NULL' } else { ' = ' + (ConvertTo-StatsFilterLiteral $R.Raw $R.SystemTypeId) })
+}
+
+function Get-FilteredStatement([string]$Table, [string]$TargetColumn, [string]$TargetSql, $R, [hashtable]$Used) {
+    # CREATE STATISTICS for one segment; Used keeps the names unique per table
+    $base = ('xray_f_' + $TargetColumn + '_' + $R.Column + '_' + $(if ($R.IsNull) { 'null' } else { [string]$R.Raw })) -replace '[^\w]', '_'
+    if ($base.Length -gt 100) { $base = $base.Substring(0, 100) }
+    $name = $base; $k = 2
+    while ($Used.ContainsKey("$Table|$name")) { $name = "${base}_$k"; $k++ }
+    $Used["$Table|$name"] = $true
+    "CREATE STATISTICS [$name] ON $Table ($TargetSql) WHERE $(Get-FilteredWhere $R) WITH FULLSCAN;"
+}
+
+function Get-FilteredComment($R) {
+    Format-Invariant '-- {0:N0} rows; equality 95% within {1:0.##}x now, {2:0.##}x with it; ranges {3:0.##}x now, {4:0.##}x with it' $R.Rows $R.NowEq $R.FilteredEq $R.NowRange $R.FilteredRange
+}
+
+$script:FilteredScriptNote = @(
+    '-- The optimizer uses a filtered statistic when the query''s predicate matches its filter at compile time (literals,'
+    '-- OPTION (RECOMPILE)); a parameter does not match. Filtered statistics update on the whole table''s modification'
+    '-- counter, so they go stale sooner: update them in maintenance.'
+)
+
 function Invoke-FilteredStatsAdvisor {
     <#
       Columns whose values split the table into segments (tenants, statuses, regions) that the target column behaves
@@ -5593,46 +6246,22 @@ function Invoke-FilteredStatsAdvisor {
     if ($SegmentColumns) { $cols = @($cols | Where-Object { [string]$_.name -in $SegmentColumns }) }
     if (-not $cols) { throw 'No column can split this table into segments (integers, bit, date, uniqueidentifier or strings up to 200 bytes, not computed).' }
     $q = { param([string]$n) '[' + $n.Replace(']', ']]') + ']' }
-    # one page sample, about SampleRows rows (every row when the table is smaller), copied once
-    $pct = [Math]::Min(100.0, 100.0 * $SampleRows / $rows)
-    if ($pages -lt 1024) { $pct = 100.0 }
-    $source = $(if ($pct -ge 100) { "$($target.Table) WITH (INDEX(0))" } else { "$($target.Table) TABLESAMPLE SYSTEM ($($pct.ToString('0.######', $script:Inv)) PERCENT) REPEATABLE (1) WITH (INDEX(0))" })
-    $list = (@($cols | ForEach-Object { & $q ([string]$_.name) }) + @($target.ColumnSql)) -join ', '
-    Set-StatsReadSession $Connection
-    try {
-        $c0 = $Connection.CreateCommand(); $c0.CommandTimeout = $TimeoutSeconds
-        $c0.CommandText = "IF OBJECT_ID('tempdb..#xray_seg') IS NOT NULL DROP TABLE #xray_seg; SELECT $list INTO #xray_seg FROM $source OPTION (MAXDOP 1); SELECT COUNT_BIG(*) FROM #xray_seg;"
-        $sampled = [double]$c0.ExecuteScalar()
-    } finally { Set-StatsReadSession $Connection -Off }
+    $s = Read-StatsSegmentSample $Connection $target.Table $rows $pages (@($cols | ForEach-Object { & $q ([string]$_.name) }) + @($target.ColumnSql)) $SampleRows $TimeoutSeconds
+    $sampled = $s.Sampled; $pct = $s.Percent; $scale = $s.Scale
     if ($sampled -le 0) { try { $null = Invoke-Query $Connection 'DROP TABLE #xray_seg;' } catch { }; throw 'The table is empty: there are no segments to compare.' }
-    $scale = $rows / [Math]::Max(1.0, $sampled)
     $results = New-Object 'System.Collections.Generic.List[object]'
     $checked = New-Object 'System.Collections.Generic.List[object]'
     try {
         foreach ($col in $cols) {
             $name = [string]$col.name; $sq = & $q $name
-            $n = [double](Invoke-Query $Connection "SELECT COUNT(DISTINCT $sq) + ISNULL(MAX(CASE WHEN $sq IS NULL THEN 1 ELSE 0 END), 0) AS n FROM #xray_seg")[0].Rows[0].n
+            $n = Get-StatsSegmentValueCount $Connection $sq 120
             if ($n -lt 2 -or $n -gt $MaxSegments) { $checked.Add([pscustomobject]@{ Column = $name; Values = $n; Note = $(if ($n -lt 2) { 'one value' } else { "more than $MaxSegments values" }) }); continue }
-            $cmd = $Connection.CreateCommand(); $cmd.CommandTimeout = $TimeoutSeconds
-            # ranks in each column's own order (equal under the collation = one rank); a NULL target has no rank
-            $cmd.CommandText = @"
-SELECT DENSE_RANK() OVER (ORDER BY g.s) AS sk, g.s, CASE WHEN g.t IS NULL THEN NULL ELSE DENSE_RANK() OVER (ORDER BY g.t) END AS tk, g.n
-FROM (SELECT $sq AS s, $($target.ColumnSql) AS t, COUNT_BIG(*) AS n FROM #xray_seg GROUP BY $sq, $($target.ColumnSql)) g OPTION (MAXDOP 1);
-"@
-            $r = $cmd.ExecuteReader()
-            try { $segs = [SQLStatsXRay.Builder.Segments]::Analyze($r, $scale, [double]$MinRows, 200, 7) } finally { $r.Close() }
+            $segs = Measure-StatsSegments $Connection $sq $target.ColumnSql $scale $MinRows $TimeoutSeconds
             $checked.Add([pscustomobject]@{ Column = $name; Values = $n; Note = "$($segs.Count) segment(s) of $MinRows rows or more" })
-            foreach ($s in $segs) {
-                $results.Add([pscustomobject]@{
-                        Column = $name; SystemTypeId = [int]$col.system_type_id; Raw = $s.Raw; IsNull = $s.IsNull; Rows = $s.Rows; Values = $s.Values
-                        NowEq = $s.NewEqP95; NowRange = $s.NewRangeP95; LegacyEq = $s.LegacyEqP95; FilteredEq = $s.FilteredEqP95; FilteredRange = $s.FilteredRangeP95
-                        Gain = [Math]::Max($s.NewEqP95 / [Math]::Max(1, $s.FilteredEqP95), $s.NewRangeP95 / [Math]::Max(1, $s.FilteredRangeP95))
-                    })
-            }
+            foreach ($x in $segs) { $results.Add((ConvertTo-FilteredSegment $x $name ([int]$col.system_type_id))) }
         }
     } finally { try { $null = Invoke-Query $Connection 'DROP TABLE #xray_seg;' } catch { } }
-    # worth a filtered statistic: off by 3x or more at the 95th percentile now, and at least twice as good with one
-    $worth = @($results | Where-Object { ($_.NowEq -ge 3 -or $_.NowRange -ge 3) -and $_.Gain -ge 2 } | Sort-Object { $_.Gain * [Math]::Log10(10 + $_.Rows) } -Descending | Select-Object -First $MaxRecommendations)
+    $worth = @($results | Where-Object { Test-FilteredWorth $_ } | Sort-Object { Get-FilteredScore $_ } -Descending | Select-Object -First $MaxRecommendations)
     [pscustomobject]@{
         Kind = 'FilteredAdvisor'; Target = $target; Rows = $rows; SampledRows = $sampled; Percent = $pct; Checked = $checked.ToArray(); Segments = $results.ToArray(); Recommended = $worth
         Script = New-FilteredStatsScript $target $worth
@@ -5643,20 +6272,11 @@ function New-FilteredStatsScript($Target, $Recommended) {
     $l = New-Object 'System.Collections.Generic.List[string]'
     $l.Add("-- SQLStatsXRay filtered statistics advisor for $($Target.Table).[$($Target.Column)], generated $((Get-Date).ToString('yyyy-MM-dd HH:mm', $script:Inv)).")
     if (-not @($Recommended).Count) { $l.Add('-- No segment needs a filtered statistic.'); return ($l.ToArray() -join "`r`n") + "`r`n" }
-    $l.Add('-- The optimizer uses a filtered statistic when the query''s predicate matches its filter at compile time (literals,')
-    $l.Add('-- OPTION (RECOMPILE)); a parameter does not match. Filtered statistics update on the whole table''s modification')
-    $l.Add('-- counter, so they go stale sooner: update them in maintenance.')
+    $l.AddRange([string[]]$script:FilteredScriptNote)
     $used = @{}
     foreach ($r in $Recommended) {
-        $lit = ConvertTo-StatsFilterLiteral $r.Raw $r.SystemTypeId
-        $where = '[' + $r.Column.Replace(']', ']]') + ']' + $(if ($r.IsNull) { ' IS NULL' } else { " = $lit" })
-        $base = ('xray_f_' + $Target.Column + '_' + $r.Column + '_' + $(if ($r.IsNull) { 'null' } else { [string]$r.Raw })) -replace '[^\w]', '_'
-        if ($base.Length -gt 100) { $base = $base.Substring(0, 100) }
-        $name = $base; $k = 2
-        while ($used.ContainsKey($name)) { $name = "${base}_$k"; $k++ }
-        $used[$name] = $true
-        $l.Add((Format-Invariant '-- {0:N0} rows; equality 95% within {1:0.##}x now, {2:0.##}x with it; ranges {3:0.##}x now, {4:0.##}x with it' $r.Rows $r.NowEq $r.FilteredEq $r.NowRange $r.FilteredRange))
-        $l.Add("CREATE STATISTICS [$name] ON $($Target.Table) ($($Target.ColumnSql)) WHERE $where WITH FULLSCAN;")
+        $l.Add((Get-FilteredComment $r))
+        $l.Add((Get-FilteredStatement $Target.Table $Target.Column $Target.ColumnSql $r $used))
     }
     return ($l.ToArray() -join "`r`n") + "`r`n"
 }
@@ -5693,6 +6313,505 @@ function Format-FilteredStatsReport($F) {
         if (@($F.Segments).Count -gt 30) { $out += "The 30 segments with the most to gain of $(@($F.Segments).Count) shown." }
     }
     $out += 'Segment values are data from the table: handle the report and the script as customer data.'
+    return , $out
+}
+
+# ---- 14b. filtered statistics advisor for a whole database
+
+# Seconds per unit of work (SQL2025 lab, laptop SSD); the analysis rescales them by the speed it measures as it goes. A pair's
+# time is mostly its groups (target value x segment value) read back and scored: about 5 microseconds each.
+$script:FilteredCost = @{ Table = 0.1; Page = 0.00002; Row = 0.0000003; Values = 0.01; ValuesRow = 0.00000005; Pair = 0.03; PairRow = 0.0000002; Group = 0.000005 }
+
+function Get-FilteredTableEstimate([double]$Rows, [double]$Pages, [long]$SampleRows, $Targets, $Segments) {
+    # Values: distinct values from the histogram ($null: unknown; a target is then taken as unique, a segment column as 50)
+    $k = $script:FilteredCost
+    $sampled = [Math]::Min($Rows, [double]$SampleRows)
+    $pct = [Math]::Min(1.0, $SampleRows / [Math]::Max(1.0, $Rows))
+    if ($Pages -lt 1024 -and $Rows -le 10 * $SampleRows) { $pct = 1.0; $sampled = $Rows }
+    $copy = $k.Table + $Pages * $pct * $k.Page + $sampled * $k.Row
+    $values = $k.Values + $sampled * $k.ValuesRow
+    $pairs = @{}; $sum = 0.0
+    foreach ($tg in $Targets) {
+        foreach ($sg in $Segments) {
+            if ($sg.Name -eq $tg.Name) { continue }
+            $dt = $(if ($tg.Values) { [Math]::Min($sampled, [double]$tg.Values) } else { $sampled })
+            $ds = $(if ($sg.Values) { [double]$sg.Values } else { 50.0 })
+            $c = $k.Pair + $sampled * $k.PairRow + [Math]::Min($sampled, $dt * $ds) * $k.Group
+            $pairs["$($tg.Name)|$($sg.Name)"] = $c; $sum += $c
+        }
+    }
+    [pscustomobject]@{ Sampled = $sampled; Copy = $copy; Values = $values; Pairs = $pairs; Total = $copy + @($Segments).Count * $values + $sum }
+}
+
+function Test-FilteredTableMatch([string]$Schema, [string]$Name, [string]$Qualified, [string[]]$Patterns) {
+    # [schema].[table] matches exactly; anything else is a pattern on schema.table (* or % for any characters)
+    if (-not $Patterns) { return $true }
+    foreach ($p in $Patterns) {
+        $p = $p.Trim()
+        if (-not $p) { continue }
+        if ($p.StartsWith('[')) { if ($p -eq $Qualified) { return $true }; continue }
+        $plain = $p.Replace('%', '*')
+        if ($plain -notmatch '\.') { $plain = '*.' + $plain }
+        if ("$Schema.$Name" -like $plain) { return $true }
+    }
+    return $false
+}
+
+function Normalize-FilteredDefinition([string]$Text) {
+    # ([status]=(3)) and [status] = 3 alike: no parentheses or spaces, N'..' as '..'
+    ($Text -replace "N'", "'" -replace '[()\s]', '').ToLowerInvariant()
+}
+
+function Get-FilteredStatsCandidates {
+    <#
+      The tables and column pairs worth reading, from metadata only. A column counts when it leads a statistics object
+      (SQL Server creates one when a query filters on it), unless AnyColumn; a segment column needs 2 to MaxSegments
+      values and one value with MinRows rows, from its histogram (sys.dm_db_stats_histogram) when there is one.
+    #>
+    param($Connection, [long]$MinTableRows = 100000, [long]$MinRows = 1000, [int]$MaxSegments = 200, [long]$SampleRows = 200000,
+        [string[]]$TableFilter, [string]$TargetColumn, [switch]$AnyColumn, [int]$TimeoutSeconds = 300)
+    if (Test-StatsCloneDatabase $Connection) { throw "$($script:CloneMessage) to split into segments." }
+    $hasHistogram = [int](Invoke-Query $Connection "SELECT COUNT(*) AS n FROM sys.system_objects WHERE name = 'dm_db_stats_histogram'")[0].Rows[0].n -gt 0
+    $segTypes = ($script:SegmentTypes | ForEach-Object { [string]$_ }) -join ', '
+    $keyTypes = ($script:BuildKeyTypes | ForEach-Object { [string]$_ }) -join ', '
+    # sys.tables.is_memory_optimized (SQL Server 2014 and later): OBJECTPROPERTY would wait on a table's schema lock
+    $memory = $(if ([int](Invoke-Query $Connection "SELECT COUNT(*) AS n FROM sys.all_columns WHERE object_id = OBJECT_ID('sys.tables') AND name = 'is_memory_optimized'")[0].Rows[0].n -gt 0) {
+            'DELETE #xray_tab WHERE object_id IN (SELECT object_id FROM sys.tables WHERE is_memory_optimized = 1);' } else { '' })
+    $histogram = $(if ($hasHistogram) {
+            "CROSS APPLY (SELECT COUNT(*) AS steps, SUM(h.distinct_range_rows) AS dr, MAX(h.equal_rows) AS maxeq, SUM(h.equal_rows + h.range_rows) AS htotal FROM sys.dm_db_stats_histogram(p.object_id, p.stats_id) h) h"
+        } else { 'CROSS APPLY (SELECT 0 AS steps, CAST(NULL AS float) AS dr, CAST(NULL AS float) AS maxeq, CAST(NULL AS float) AS htotal) h' })
+    # The reads a schema change can block (sizes, statistics properties, histograms) leave out the tables the lock manager
+    # reports, or halve ranges on the server when one still times out: one round trip, the locked tables skipped and reported.
+    $locked = Get-StatsLockedIds $Connection
+    $sizes = New-StatsLockSafeSql 'size' @"
+INSERT #xray_size SELECT p.object_id, SUM(p.rows), SUM(au.data_pages) FROM sys.partitions p
+JOIN sys.allocation_units au ON au.container_id = p.partition_id AND au.type = 1
+WHERE p.index_id IN (0, 1) AND {F:p.object_id} GROUP BY p.object_id;
+"@ 'SELECT t.object_id FROM sys.tables t WHERE t.is_ms_shipped = 0' '#xray_size' $locked
+    $props = New-StatsLockSafeSql 'props' @"
+INSERT #xray_props SELECT s.object_id, s.stats_id, sp.rows_sampled
+FROM sys.stats s JOIN #xray_tab b ON b.object_id = s.object_id AND b.rows >= @min
+OUTER APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+WHERE {F:s.object_id};
+"@ 'SELECT object_id FROM #xray_tab WHERE rows >= @min' '#xray_props' $locked
+    $hists = New-StatsLockSafeSql 'hist' @"
+INSERT #xray_hist SELECT p.object_id, p.column_id, h.steps, h.dr, h.maxeq, h.htotal
+FROM #xray_pick p JOIN sys.columns c ON c.object_id = p.object_id AND c.column_id = p.column_id
+$histogram
+WHERE c.system_type_id IN ($keyTypes) AND c.max_length <> -1 AND {F:p.object_id};
+"@ 'SELECT DISTINCT object_id FROM #xray_pick' '#xray_hist' $locked
+    # a table locked during a later read leaves the earlier results too
+    $dropLocked = 'DELETE #xray_tab WHERE object_id IN (SELECT object_id FROM #xray_locked);'
+    $sql = @"
+SET NOCOUNT ON;
+IF OBJECT_ID('tempdb..#xray_locked') IS NOT NULL DROP TABLE #xray_locked;
+IF OBJECT_ID('tempdb..#xray_tab') IS NOT NULL DROP TABLE #xray_tab;
+IF OBJECT_ID('tempdb..#xray_lead') IS NOT NULL DROP TABLE #xray_lead;
+IF OBJECT_ID('tempdb..#xray_pick') IS NOT NULL DROP TABLE #xray_pick;
+IF OBJECT_ID('tempdb..#xray_size') IS NOT NULL DROP TABLE #xray_size;
+IF OBJECT_ID('tempdb..#xray_props') IS NOT NULL DROP TABLE #xray_props;
+IF OBJECT_ID('tempdb..#xray_hist') IS NOT NULL DROP TABLE #xray_hist;
+$(New-StatsLockedPrelude $locked)
+CREATE TABLE #xray_size (object_id int PRIMARY KEY, rows bigint, pages bigint);
+CREATE TABLE #xray_props (object_id int, stats_id int, rows_sampled bigint);
+CREATE TABLE #xray_hist (object_id int, column_id int, steps int, dr float, maxeq float, htotal float);
+-- sizes first, in one pass (a lookup per table took 54 s for 8,000 tables; this takes 4)
+$sizes
+SELECT t.object_id, SCHEMA_NAME(t.schema_id) AS schema_name, t.name, ISNULL(s.rows, 0) AS rows, ISNULL(s.pages, 0) AS pages
+INTO #xray_tab
+FROM sys.tables t LEFT JOIN #xray_size s ON s.object_id = t.object_id
+WHERE t.is_ms_shipped = 0 AND t.object_id NOT IN (SELECT object_id FROM #xray_locked);
+-- memory-optimized tables cannot be sampled
+$memory
+$props
+$dropLocked
+-- each statistics object's leading column (an index's first key)
+SELECT l.object_id, l.stats_id, l.name AS stats_name, l.column_id, l.has_filter, l.filter_definition, ISNULL(sp.rows_sampled, 0) AS rows_sampled
+INTO #xray_lead
+FROM (SELECT s.object_id, s.stats_id, s.name, sc.column_id, s.has_filter, s.filter_definition,
+             ROW_NUMBER() OVER (PARTITION BY s.object_id, s.stats_id ORDER BY COALESCE(NULLIF(ic.key_ordinal, 0), sc.stats_column_id)) AS rn
+      FROM sys.stats s
+      JOIN #xray_tab b ON b.object_id = s.object_id AND b.rows >= @min
+      JOIN sys.stats_columns sc ON sc.object_id = s.object_id AND sc.stats_id = s.stats_id
+      LEFT JOIN sys.indexes i ON i.object_id = s.object_id AND i.index_id = s.stats_id
+      LEFT JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.column_id = sc.column_id) l
+LEFT JOIN #xray_props sp ON sp.object_id = l.object_id AND sp.stats_id = l.stats_id
+WHERE l.rn = 1;
+-- one unfiltered statistic per column: the one with the most rows sampled
+SELECT object_id, column_id, stats_id, stats_name INTO #xray_pick
+FROM (SELECT object_id, column_id, stats_id, stats_name, ROW_NUMBER() OVER (PARTITION BY object_id, column_id ORDER BY rows_sampled DESC, stats_id) AS k
+      FROM #xray_lead WHERE has_filter = 0) x
+WHERE k = 1;
+$hists
+$dropLocked
+SELECT object_id, schema_name, name, rows, pages FROM #xray_tab;
+SELECT h.object_id, h.column_id, h.steps, h.dr, h.maxeq, h.htotal FROM #xray_hist h JOIN #xray_tab b ON b.object_id = h.object_id;
+SELECT c.object_id, c.column_id, c.name, c.system_type_id, c.max_length, c.is_computed, c.is_sparse, p.stats_name,
+       -- an identity or the only key of a unique index never splits a table into segments
+       CASE WHEN c.is_identity = 1 OR EXISTS (SELECT 1 FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                                               WHERE i.object_id = c.object_id AND i.is_unique = 1 AND ic.column_id = c.column_id AND ic.key_ordinal = 1
+                                                 AND NOT EXISTS (SELECT 1 FROM sys.index_columns k WHERE k.object_id = i.object_id AND k.index_id = i.index_id AND k.key_ordinal > 1))
+            THEN 1 ELSE 0 END AS is_key
+FROM sys.columns c
+JOIN #xray_tab b ON b.object_id = c.object_id AND b.rows >= @min
+LEFT JOIN #xray_pick p ON p.object_id = c.object_id AND p.column_id = c.column_id
+WHERE c.system_type_id IN ($keyTypes) AND c.max_length <> -1
+ORDER BY c.object_id, c.column_id;
+SELECT l.object_id, c.name AS column_name, l.stats_name, l.filter_definition
+FROM #xray_lead l JOIN #xray_tab b ON b.object_id = l.object_id JOIN sys.columns c ON c.object_id = l.object_id AND c.column_id = l.column_id WHERE l.has_filter = 1;
+$($script:LockedNamesSql)
+DROP TABLE #xray_pick; DROP TABLE #xray_lead; DROP TABLE #xray_tab; DROP TABLE #xray_size; DROP TABLE #xray_props; DROP TABLE #xray_hist; DROP TABLE #xray_locked;
+"@
+    $r = Invoke-Query $Connection $sql @{ '@min' = [long]$MinTableRows } $TimeoutSeconds
+    $sets = @(for ($i = 0; $i -lt 4; $i++) { , @($r[$i].Rows) })
+    foreach ($l in $r[4].Rows) { Add-StatsLockedObject ([string]$l.name) 'filtered advisor metadata' }
+    $hist = @{}
+    foreach ($h in $sets[1]) { $hist["$($h.object_id)|$($h.column_id)"] = $h }
+    $colsBy = @{}
+    foreach ($c in $sets[2]) { $k = [int]$c.object_id; if (-not $colsBy.ContainsKey($k)) { $colsBy[$k] = New-Object 'System.Collections.Generic.List[object]' }; $colsBy[$k].Add($c) }
+    $existing = @{}
+    foreach ($f in $sets[3]) {
+        $k = [int]$f.object_id; if (-not $existing.ContainsKey($k)) { $existing[$k] = New-Object 'System.Collections.Generic.List[object]' }
+        $existing[$k].Add([pscustomobject]@{ Column = [string]$f.column_name; Name = [string]$f.stats_name; Filter = [string]$f.filter_definition; Key = Normalize-FilteredDefinition ([string]$f.filter_definition) })
+    }
+    $q = { param([string]$n) '[' + $n.Replace(']', ']]') + ']' }
+    $tables = New-Object 'System.Collections.Generic.List[object]'
+    $skipped = New-Object 'System.Collections.Generic.List[object]'
+    $small = 0; $outside = 0; $all = 0
+    foreach ($t in $sets[0]) {
+        $all++
+        $schema = [string]$t.schema_name; $name = [string]$t.name
+        $qualified = (& $q $schema) + '.' + (& $q $name)
+        if (-not (Test-FilteredTableMatch $schema $name $qualified $TableFilter)) { $outside++; continue }
+        $rows = [double]$t.rows; $pages = [double]$t.pages
+        if ($rows -lt $MinTableRows -or $rows -le 0) { $small++; continue }
+        # (@() around a list of DataRows throws "Argument types do not match" in Windows PowerShell)
+        $cols = $(if ($colsBy.ContainsKey([int]$t.object_id)) { $colsBy[[int]$t.object_id].ToArray() } else { @() })
+        $targets = New-Object 'System.Collections.Generic.List[object]'
+        $segments = New-Object 'System.Collections.Generic.List[object]'
+        $notes = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($c in $cols) {
+            if (-not $c) { continue }
+            $cn = [string]$c.name; $hasStat = $c.stats_name -isnot [DBNull]
+            $type = [int]$c.system_type_id
+            # a unique key's equality is always exact: not a column to check, unless asked for
+            $isTarget = $(if ($TargetColumn) { $cn -eq $TargetColumn } else { ($hasStat -or $AnyColumn) -and -not [int]$c.is_key })
+            # the histogram tells how many values the column has and how big its largest value is
+            $values = $null; $largest = $null
+            $h = $hist["$($t.object_id)|$($c.column_id)"]
+            if ($h -and [int]$h.steps -gt 0 -and $h.htotal -isnot [DBNull] -and [double]$h.htotal -gt 0) {
+                $values = [double]$h.steps + [double]$(if ($h.dr -is [DBNull]) { 0 } else { $h.dr })
+                $largest = [double]$h.maxeq * $rows / [double]$h.htotal
+            }
+            if ($isTarget) { $targets.Add([pscustomobject]@{ Name = $cn; Sql = & $q $cn; SystemTypeId = $type; Stat = $(if ($hasStat) { [string]$c.stats_name }); Values = $values }) }
+            if ($type -notin $script:SegmentTypes -or [int]$c.max_length -lt 1 -or [int]$c.max_length -gt 200 -or [bool]$c.is_computed -or [bool]$c.is_sparse -or [int]$c.is_key) { continue }
+            if (-not $hasStat -and -not $AnyColumn) { continue }
+            if ($null -ne $values) {
+                if ($values -lt 2) { $notes.Add("[$cn]: one value"); continue }
+                if ($values -gt $MaxSegments) { continue }
+                if ($largest -lt $MinRows) { $notes.Add("[$cn]: no value with $(Format-Invariant '{0:N0}' $MinRows) rows"); continue }
+            }
+            $segments.Add([pscustomobject]@{ Name = $cn; Sql = & $q $cn; SystemTypeId = $type; Values = $values })
+        }
+        $pairs = 0
+        foreach ($tg in $targets) { foreach ($sg in $segments) { if ($sg.Name -ne $tg.Name) { $pairs++ } } }
+        if (-not $targets.Count -or -not $segments.Count -or -not $pairs) {
+            $why = $(if ($TargetColumn -and -not $targets.Count) { "no column [$TargetColumn] of a supported type" }
+                elseif (-not $segments.Count) { 'no column splits it into segments' + $(if ($notes.Count) { ' (' + ($notes -join '; ') + ')' } else { '' }) }
+                else { 'no column with a statistic to check' })
+            $skipped.Add([pscustomobject]@{ Table = $qualified; Rows = $rows; Reason = $why })
+            continue
+        }
+        $est = Get-FilteredTableEstimate $rows $pages $SampleRows $targets.ToArray() $segments.ToArray()
+        $tables.Add([pscustomobject]@{
+                ObjectId = [int]$t.object_id; Table = $qualified; Schema = $schema; Name = $name; Rows = $rows; Pages = $pages
+                Targets = $targets.ToArray(); Segments = $segments.ToArray(); Pairs = $pairs; Estimate = $est; Seconds = $est.Total
+                Existing = $(if ($existing.ContainsKey([int]$t.object_id)) { $existing[[int]$t.object_id].ToArray() } else { @() })
+            })
+    }
+    $ordered = @($tables | Sort-Object Rows -Descending)
+    [pscustomobject]@{
+        Kind = 'FilteredCandidates'; Locked = $script:LockedObjects.ToArray(); Tables = $ordered; Skipped = $skipped.ToArray(); AllTables = $all; SmallTables = $small; OutsideFilter = $outside
+        Seconds = [double](($ordered | Measure-Object Seconds -Sum).Sum); Pairs = [int](($ordered | Measure-Object Pairs -Sum).Sum); HistogramUsed = $hasHistogram
+        MinTableRows = $MinTableRows; MinRows = $MinRows; MaxSegments = $MaxSegments; SampleRows = $SampleRows; AnyColumn = [bool]$AnyColumn; TargetColumn = $TargetColumn
+    }
+}
+
+function Write-FilteredProgress($Control, [hashtable]$State, [string]$Activity = 'Filtered statistics advisor') {
+    # the app reads a shared table; the console shows two progress bars (all tables, this table)
+    if ($Control) { foreach ($k in $State.Keys) { $Control[$k] = $State[$k] }; return }
+    $overall = [int][Math]::Min(100, [Math]::Max(0, 100 * $State.Percent))
+    $status = $(if ($State.TableCount) { "Table $($State.TableIndex) of $($State.TableCount): $($State.Table)" } else { $State.Step })
+    $left = $(if ($State.Contains('Remaining') -and $null -ne $State.Remaining) { [int]$State.Remaining } else { -1 })
+    Write-Progress -Id 1 -Activity $Activity -Status $status -PercentComplete $overall -SecondsRemaining $left
+    if ($State.TableCount) {
+        Write-Progress -Id 2 -ParentId 1 -Activity $State.Table -Status $State.Step -PercentComplete ([int][Math]::Min(100, [Math]::Max(0, 100 * $State.TablePercent)))
+    }
+}
+
+function Invoke-FilteredStatsDatabase {
+    <#
+      The filtered statistics advisor for every table worth it (Get-FilteredStatsCandidates), biggest first, within a time
+      budget: one sample per table copied to tempdb, every candidate pair scored (Measure-StatsSegments), then one ranked
+      list for the database (MaxPerTable per table, MaxRecommendations in all). A table whose estimate does not fit the
+      time left is passed over for smaller ones. Control (the app's shared table) receives the progress and can stop the run.
+    #>
+    param($Connection, [string]$Database, [long]$MinTableRows = 100000, [long]$MinRows = 1000, [int]$MaxSegments = 200, [long]$SampleRows = 200000,
+        [double]$BudgetMinutes = 30, [int]$MaxRecommendations = 25, [int]$MaxPerTable = 3, [string[]]$TableFilter, [string]$TargetColumn,
+        [switch]$AnyColumn, [switch]$CandidatesOnly, $Control)
+    Initialize-StatsBuilder
+    $started = [DateTime]::Now
+    Write-FilteredProgress $Control @{ Stage = 'Screen'; Step = 'Reading the tables, columns and statistics (metadata only)'; Percent = 0.0; TableCount = 0 }
+    $cand = Get-FilteredStatsCandidates -Connection $Connection -MinTableRows $MinTableRows -MinRows $MinRows -MaxSegments $MaxSegments -SampleRows $SampleRows `
+        -TableFilter $TableFilter -TargetColumn $TargetColumn -AnyColumn:$AnyColumn
+    if ($CandidatesOnly) { return $cand }
+    $budget = [Math]::Max(10.0, $BudgetMinutes * 60)
+    $deadline = $started.AddSeconds($budget)
+    $tables = @($cand.Tables)
+    $total = [double](($tables | Measure-Object Seconds -Sum).Sum)
+    $done = 0.0
+    $runStart = [DateTime]::Now
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    $log = New-Object 'System.Collections.Generic.List[object]'
+    $stopped = $null
+    $found = 0
+    # predicted seconds per estimated second: the lab's model until this server has done some work
+    $rate = { $prior = [Math]::Min(10.0, [Math]::Max(1.0, $total * 0.1)); (([DateTime]::Now - $runStart).TotalSeconds + $prior) / ($done + $prior) }
+    $report = {
+        # Unit: the estimated seconds of the query starting now, so the app can move the bars and the time left while it runs
+        param([int]$Index, $T, [string]$Step, [double]$TableDone, [double]$Unit)
+        $r = & $rate
+        $remaining = [Math]::Max(0.0, ($total - $done) * $r)
+        Write-FilteredProgress $Control @{
+            Stage = 'Analyze'; TableIndex = $Index; TableCount = $tables.Count; Table = $T.Table; TableRows = $T.Rows; Step = $Step
+            TablePercent = $(if ($T.Seconds -gt 0) { [Math]::Min(1.0, $TableDone / $T.Seconds) } else { 1.0 }); TableDone = $TableDone; TableTotal = $T.Seconds
+            Done = $done; Total = $total; Rate = $r; Unit = $Unit
+            Percent = $(if ($total -gt 0) { [Math]::Min(1.0, $done / $total) } else { 1.0 }); Remaining = $remaining; BudgetLeft = ($deadline - [DateTime]::Now).TotalSeconds
+            Elapsed = ([DateTime]::Now - $started).TotalSeconds; Found = $found; Log = $log.ToArray(); At = [DateTime]::Now; Deadline = $deadline
+        }
+    }
+    for ($i = 0; $i -lt $tables.Count; $i++) {
+        $t = $tables[$i]; $est = $t.Estimate
+        $left = ($deadline - [DateTime]::Now).TotalSeconds
+        $entry = [pscustomobject]@{ Table = $t.Table; Rows = $t.Rows; Pairs = $t.Pairs; Checked = 0; Found = 0; Seconds = 0.0; Estimate = $t.Seconds; Result = ''; Note = '' }
+        if ($Control -and $Control.Stop) { $stopped = 'you stopped it' }
+        if ($stopped) { $entry.Result = 'Not reached'; $entry.Note = "stopped: $stopped"; $log.Add($entry); $total -= $t.Seconds; continue }
+        $need = $t.Seconds * (& $rate)
+        if ($left -le 0) { $stopped = 'the time budget ran out' ; $entry.Result = 'Not reached'; $entry.Note = 'the time budget ran out'; $log.Add($entry); $total -= $t.Seconds; continue }
+        # (the first table too: a table bigger than the whole budget would use it up alone)
+        if ($need -gt $left) {
+            $entry.Result = 'Not reached'; $entry.Note = "needs about $(Format-StatsSeconds $need), $(Format-StatsSeconds $left) left"
+            $log.Add($entry); $total -= $t.Seconds; continue
+        }
+        $tStart = [DateTime]::Now; $tDone = 0.0
+        $timeout = [int][Math]::Max(30, $left + 30)
+        $cols = @(@($t.Targets | ForEach-Object Sql) + @($t.Segments | ForEach-Object Sql) | Select-Object -Unique)
+        try {
+            & $report ($i + 1) $t (Format-Invariant 'Copying a sample of about {0:N0} rows to tempdb' $est.Sampled) 0.0 $est.Copy
+            $s = Read-StatsSegmentSample $Connection $t.Table $t.Rows $t.Pages $cols $SampleRows $timeout $Control
+            $done += $est.Copy; $tDone += $est.Copy
+            if ($s.Sampled -le 0) { throw 'the sample is empty' }
+            $segments = New-Object 'System.Collections.Generic.List[object]'
+            $k = 0
+            foreach ($sg in $t.Segments) {
+                $k++
+                & $report ($i + 1) $t "Counting the values of [$($sg.Name)] ($k of $(@($t.Segments).Count) segment columns)" $tDone $est.Values
+                $n = Get-StatsSegmentValueCount $Connection $sg.Sql $timeout $Control
+                $done += $est.Values; $tDone += $est.Values
+                $pairsHere = @($t.Targets | Where-Object { $_.Name -ne $sg.Name }).Count
+                if ($n -lt 2 -or $n -gt $MaxSegments) {
+                    $skip = [double]((@($t.Targets | Where-Object { $_.Name -ne $sg.Name }) | ForEach-Object { $est.Pairs["$($_.Name)|$($sg.Name)"] } | Measure-Object -Sum).Sum)
+                    $done += $skip; $tDone += $skip; continue
+                }
+                $segments.Add($sg)
+            }
+            $p = 0
+            $pairCount = [int]((@($t.Targets) | ForEach-Object { $tg = $_; @($segments | Where-Object { $_.Name -ne $tg.Name }).Count } | Measure-Object -Sum).Sum)
+            foreach ($tg in $t.Targets) {
+                foreach ($sg in $segments) {
+                    if ($sg.Name -eq $tg.Name) { continue }
+                    $p++
+                    & $report ($i + 1) $t "Pair $p of ${pairCount}: [$($tg.Name)] in the segments of [$($sg.Name)]" $tDone $est.Pairs["$($tg.Name)|$($sg.Name)"]
+                    $segs = Measure-StatsSegments $Connection $sg.Sql $tg.Sql $s.Scale $MinRows $timeout $Control
+                    foreach ($x in $segs) {
+                        $r = ConvertTo-FilteredSegment $x $sg.Name $sg.SystemTypeId
+                        $r | Add-Member Table $t.Table; $r | Add-Member Target $tg.Name; $r | Add-Member TargetSql $tg.Sql; $r | Add-Member TableRows $t.Rows
+                        $key = Normalize-FilteredDefinition (Get-FilteredWhere $r)
+                        $have = @($t.Existing | Where-Object { $_.Column -eq $tg.Name -and $_.Key -eq $key } | Select-Object -First 1)
+                        $r | Add-Member Existing $(if ($have) { $have[0].Name } else { $null })
+                        $r | Add-Member Worth (Test-FilteredWorth $r)
+                        if ($r.Worth -and -not $r.Existing) { $entry.Found++; $found++ }
+                        $results.Add($r)
+                    }
+                    $entry.Checked++
+                    $unit = $est.Pairs["$($tg.Name)|$($sg.Name)"]; $done += $unit; $tDone += $unit
+                }
+            }
+            $entry.Result = 'Done'
+            $entry.Note = $(if ($entry.Found) { "$($entry.Found) segment(s) worth a filtered statistic" } else { 'no segment worth a filtered statistic' })
+        } catch {
+            $e = $_.Exception.GetBaseException()
+            if ($Control -and $Control.Stop) { $stopped = 'you stopped it'; $entry.Result = 'Stopped'; $entry.Note = 'you stopped it' }
+            elseif (Test-StatsLockTimeout $_.Exception) { $entry.Result = 'Skipped'; $entry.Note = $script:LockedMessage; Add-StatsLockedObject $t.Table 'table read' }
+            elseif ($e -is [Data.SqlClient.SqlException] -and $e.Number -eq -2) { $stopped = 'the time budget ran out'; $entry.Result = 'Stopped'; $entry.Note = 'the time budget ran out during this table' }
+            else { $entry.Result = 'Failed'; $entry.Note = $e.Message }
+        } finally {
+            try { $null = Invoke-Query $Connection "IF OBJECT_ID('tempdb..#xray_seg') IS NOT NULL DROP TABLE #xray_seg;" } catch { }
+        }
+        # the table's unfinished work leaves the total
+        $total -= ($t.Seconds - $tDone)
+        $entry.Seconds = ([DateTime]::Now - $tStart).TotalSeconds
+        $log.Add($entry)
+        & $report ($i + 1) $t $entry.Note $t.Seconds 0
+    }
+    # one list for the database: the best segments of each table, then the best of those
+    $worth = @($results | Where-Object { $_.Worth -and -not $_.Existing } | Sort-Object { Get-FilteredScore $_ } -Descending)
+    $perTable = @{}; $recommended = New-Object 'System.Collections.Generic.List[object]'; $more = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($r in $worth) {
+        $n = [int]$perTable[$r.Table]
+        if ($n -lt $MaxPerTable -and $recommended.Count -lt $MaxRecommendations) { $recommended.Add($r); $perTable[$r.Table] = $n + 1 } else { $more.Add($r) }
+    }
+    # per column pair: how many of its segments need one (many of them: the two columns are correlated across the board)
+    $pairs = foreach ($grp in @($results | Group-Object Table, Target, Column)) {
+        $first = $grp.Group[0]; $ws = @($grp.Group | Where-Object { $_.Worth -and -not $_.Existing })
+        if (-not $ws) { continue }
+        [pscustomobject]@{
+            Table = $first.Table; Column = $first.Target; 'Segment column' = $first.Column; Segments = $grp.Count; Worth = $ws.Count
+            Recommended = @($recommended | Where-Object { $_.Table -eq $first.Table -and $_.Target -eq $first.Target -and $_.Column -eq $first.Column }).Count
+            Rows = [double](($ws | Measure-Object Rows -Sum).Sum); Worst = [double](($ws | ForEach-Object { [Math]::Max($_.NowEq, $_.NowRange) } | Measure-Object -Maximum).Maximum)
+            Cause = $(if (@($ws | Where-Object Correlated).Count * 2 -ge $ws.Count) { 'Correlated values' } else { 'Independent columns' })
+        }
+    }
+    if (-not $Control) { Write-Progress -Id 2 -Activity 'Table' -Completed; Write-Progress -Id 1 -Activity 'Filtered statistics advisor' -Completed }
+    [pscustomobject]@{
+        Kind = 'FilteredDatabase'; Locked = $script:LockedObjects.ToArray(); Database = $Database; Candidates = $cand; Tables = $log.ToArray(); Segments = $results.ToArray()
+        Pairs = @($pairs | Sort-Object Worth, Worst -Descending)
+        Recommended = $recommended.ToArray(); More = $more.ToArray(); Existing = @($results | Where-Object { $_.Worth -and $_.Existing })
+        Stopped = $stopped; Seconds = ([DateTime]::Now - $started).TotalSeconds; BudgetSeconds = $budget; MaxRecommendations = $MaxRecommendations; MaxPerTable = $MaxPerTable
+        Script = New-FilteredStatsDatabaseScript $Database $recommended.ToArray()
+    }
+}
+
+function New-FilteredStatsDatabaseScript([string]$Database, $Recommended) {
+    $l = New-Object 'System.Collections.Generic.List[string]'
+    $l.Add("-- SQLStatsXRay filtered statistics advisor for [$Database], generated $((Get-Date).ToString('yyyy-MM-dd HH:mm', $script:Inv)).")
+    if (-not @($Recommended).Count) { $l.Add('-- No segment needs a filtered statistic.'); return ($l.ToArray() -join "`r`n") + "`r`n" }
+    $l.Add("-- $(@($Recommended).Count) filtered statistic(s) in $(@($Recommended | ForEach-Object Table | Select-Object -Unique).Count) table(s), most useful first. Review them before running the script.")
+    $l.AddRange([string[]]$script:FilteredScriptNote)
+    $l.Add("USE [$($Database.Replace(']', ']]'))];")
+    $used = @{}
+    foreach ($r in $Recommended) {
+        $l.Add('')
+        $l.Add("-- $($r.Table).[$($r.Target)] in the segment $(Get-FilteredWhere $r)")
+        $l.Add((Get-FilteredComment $r))
+        $l.Add((Get-FilteredStatement $r.Table $r.Target $r.TargetSql $r $used))
+    }
+    return ($l.ToArray() -join "`r`n") + "`r`n"
+}
+
+function Get-FilteredTablesLine($C) {
+    # which tables the candidates left out, and why
+    $parts = @(Format-Invariant '{0:N0} user tables' $C.AllTables)
+    if ($C.OutsideFilter) { $parts += Format-Invariant '{0:N0} not matching the table filter' $C.OutsideFilter }
+    if ($C.SmallTables) { $parts += Format-Invariant '{0:N0} under {1:N0} rows' $C.SmallTables $C.MinTableRows }
+    if (@($C.Skipped).Count) { $parts += Format-Invariant '{0:N0} without a column pair to check' @($C.Skipped).Count }
+    $parts -join '; '
+}
+
+function Format-FilteredStatsCandidatesReport($C) {
+    $out = @()
+    $out += New-Section 'FILTERED STATISTICS ADVISOR: CANDIDATES'
+    $out += Format-Invariant '{0} table(s) to check, {1:N0} column pair(s), about {2} (an estimate from the lab; the analysis measures this server as it goes).' @($C.Tables).Count $C.Pairs (Format-StatsSeconds $C.Seconds)
+    $out += ''
+    $out += Format-KeyValueTable ([ordered]@{
+            'Tables'   = Get-FilteredTablesLine $C
+            'Columns'  = $(if ($C.AnyColumn) { 'every column of a supported type' } else { 'columns that lead a statistics object (SQL Server creates one when a query filters on the column)' })
+            'Segments' = Format-Invariant '2 to {0} values and one value with {1:N0} rows or more{2}' $C.MaxSegments $C.MinRows $(if ($C.HistogramUsed) { ', from each column''s histogram' } else { ' (checked in the sample: sys.dm_db_stats_histogram needs SQL Server 2016 SP1 CU2)' })
+        })
+    $out += ''
+    if (@($C.Tables).Count) {
+        $rows = foreach ($t in $C.Tables) {
+            [pscustomobject]@{
+                Table = $t.Table; Rows = Format-Invariant '{0:N0}' $t.Rows; Columns = @($t.Targets).Count; 'Segment columns' = (@($t.Segments | ForEach-Object { "[$($_.Name)]" }) -join ', ')
+                Pairs = $t.Pairs; Estimate = Format-StatsSeconds $t.Seconds
+            }
+        }
+        $out += Format-AsciiTable -Rows $rows -Columns Table, Rows, Columns, 'Segment columns', Pairs, Estimate -RightAlign Rows, Columns, Pairs, Estimate
+    }
+    $locked = Get-StatsLockedLine $C.Locked
+    if ($locked) { $out += ''; $out += "Skipped: $locked." }
+    return , $out
+}
+
+function Format-FilteredStatsDatabaseReport($F) {
+    $out = @()
+    $c = $F.Candidates
+    $rec = @($F.Recommended)
+    $doneTables = @($F.Tables | Where-Object Result -eq 'Done')
+    $out += New-Section "FILTERED STATISTICS ADVISOR: [$($F.Database)]"
+    $out += $(if ($rec) { "$($rec.Count) filtered statistic(s) recommended in $(@($rec | ForEach-Object Table | Select-Object -Unique).Count) table(s): in these segments the estimates are off by 3x or more and a filtered statistic at least halves the error." }
+        else { "No filtered statistic needed in the $($doneTables.Count) table(s) checked: in no segment are the estimates off by 3x or more and fixed by one." })
+    $notReached = @($F.Tables | Where-Object Result -ne 'Done')
+    $out += ''
+    $out += Format-KeyValueTable ([ordered]@{
+            'Checked'     = Format-Invariant '{0} of {1} candidate table(s), {2:N0} column pair(s), in {3} of a {4} budget{5}' $doneTables.Count @($F.Tables).Count ([int](@($F.Tables) | Measure-Object Checked -Sum).Sum) (Format-StatsSeconds $F.Seconds) (Format-StatsSeconds $F.BudgetSeconds) $(if ($F.Stopped) { " (stopped: $($F.Stopped))" } else { '' })
+            'Tables'      = Get-FilteredTablesLine $c
+            'Columns'     = $(if ($c.TargetColumn) { "[$($c.TargetColumn)], in the segments of every other column" } elseif ($c.AnyColumn) { 'every column of a supported type' } else { 'columns that lead a statistics object' })
+            'Sample'      = Format-Invariant 'about {0:N0} rows per table (every row of a smaller table), copied to tempdb' $c.SampleRows
+            'Rule'        = 'off by 3x or more at the 95th percentile now, at least twice as good with a filtered statistic'
+            'Limits'      = Format-Invariant 'at most {0} per table, {1} in all' $F.MaxPerTable $F.MaxRecommendations
+        })
+    $out += ''
+    $fmt = {
+        param($s, [string]$Mark)
+        [pscustomobject]@{
+            Table = $s.Table; Column = "[$($s.Target)]"; Segment = (Get-FilteredWhere $s) + $Mark; Rows = Format-Invariant '{0:N0}' $s.Rows
+            'Equality now' = Format-Invariant '{0:0.##}x' $s.NowEq; 'Equality filtered' = Format-Invariant '{0:0.##}x' $s.FilteredEq
+            'Ranges now' = Format-Invariant '{0:0.##}x' $s.NowRange; 'Ranges filtered' = Format-Invariant '{0:0.##}x' $s.FilteredRange; Cause = Get-FilteredCause $s
+        }
+    }
+    $cols = 'Table', 'Column', 'Segment', 'Rows', 'Equality now', 'Equality filtered', 'Ranges now', 'Ranges filtered', 'Cause'
+    if ($rec) {
+        $out += 'Recommended, most useful first (95th percentile q-error, 1x = exact, against the sample):'
+        $out += Format-AsciiTable -Rows @($rec | ForEach-Object { & $fmt $_ '' }) -Columns $cols -RightAlign $cols[3..7]
+    }
+    if (@($F.Pairs).Count) {
+        $out += ''
+        $out += 'Column pairs with segments worth a filtered statistic:'
+        $prows = foreach ($p in @($F.Pairs | Select-Object -First 30)) {
+            [pscustomobject]@{
+                Table = $p.Table; Column = "[$($p.Column)]"; 'Segment column' = "[$($p.'Segment column')]"; 'Worth one' = Format-Invariant '{0} of {1}' $p.Worth $p.Segments
+                'In the script' = $p.Recommended; Rows = Format-Invariant '{0:N0}' $p.Rows; 'Worst now' = Format-Invariant '{0:0.##}x' $p.Worst; Cause = $p.Cause
+            }
+        }
+        $out += Format-AsciiTable -Rows $prows -Columns Table, Column, 'Segment column', 'Worth one', 'In the script', Rows, 'Worst now', Cause -RightAlign 'Worth one', 'In the script', Rows, 'Worst now'
+        $out += 'Correlated values: each segment has its own distribution of the column (a tenant''s products), so estimating from the whole column is wrong there.'
+        $out += 'Independent columns: the column is spread alike in every segment, but SQL Server (compatibility level 120+) assumes the two predicates are partly'
+        $out += 'correlated (exponential backoff) and estimates too many rows; a filtered statistic fixes one segment at a time, so these rank lower.'
+    }
+    if (@($F.More).Count) {
+        $out += ''
+        $out += "Also worth one but over the limits ($(@($F.More).Count)), the first 15:"
+        $out += Format-AsciiTable -Rows @($F.More | Select-Object -First 15 | ForEach-Object { & $fmt $_ '' }) -Columns $cols -RightAlign $cols[3..7]
+    }
+    if (@($F.Existing).Count) {
+        $out += ''
+        $out += "Already covered by a filtered statistic ($(@($F.Existing).Count)): " + ((@($F.Existing | Select-Object -First 10) | ForEach-Object { "$($_.Table).[$($_.Existing)]" }) -join ', ')
+    }
+    $out += ''
+    $out += 'Tables:'
+    $trows = foreach ($t in $F.Tables) {
+        [pscustomobject]@{
+            Table = $t.Table; Rows = Format-Invariant '{0:N0}' $t.Rows; Pairs = Format-Invariant '{0} of {1}' $t.Checked $t.Pairs
+            Time = $(if ($t.Result -eq 'Not reached') { '' } else { Format-StatsSeconds $t.Seconds }); Result = $t.Result; Note = $t.Note
+        }
+    }
+    $out += Format-AsciiTable -Rows $trows -Columns Table, Rows, Pairs, Time, Result, Note -RightAlign Rows, Pairs, Time
+    if ($notReached) { $out += "$($notReached.Count) table(s) not checked: run again with a larger time budget, or pick them with -TableFilter." }
+    $out += 'A filtered statistic only helps queries whose filter is a literal (or that use OPTION (RECOMPILE)); queries with parameters keep the old estimates.'
+    $out += 'Segment values are data from the tables: handle the report and the script as customer data.'
+    $locked = Get-StatsLockedLine $F.Locked
+    if ($locked) { $out += ''; $out += "Skipped: $locked." }
     return , $out
 }
 
@@ -6152,7 +7271,7 @@ function Get-GuiServerList($Conn, [string]$DatabaseName, [string]$Sql, [hashtabl
     [Windows.Forms.Cursor]::Current = [Windows.Forms.Cursors]::WaitCursor
     try {
         $cn.Open()
-        $t = Invoke-Query $cn ("SET LOCK_TIMEOUT 2000; SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;`n" + $Sql) $Parameters
+        $t = Invoke-Query $cn ($script:SessionSql + "`n" + $Sql) $Parameters
         return , [string[]]@($t[0].Rows | ForEach-Object { [string]$_[0] })
     } finally {
         $cn.Close()
@@ -6247,7 +7366,7 @@ ORDER BY 1
                 $table = [string]$g.Tables.SelectedItem
                 $g.Stats.Items.Clear(); Set-GuiStatsAll $false; $g.StatsCount.Text = ''
                 if (-not $table) { return }
-                $list = Get-GuiServerList $g.Conn $g.Database.Text.Trim() 'SELECT name FROM sys.stats WHERE object_id = OBJECT_ID(@t) ORDER BY stats_id' @{ '@t' = $table }
+                $list = Get-GuiServerList $g.Conn $g.Database.Text.Trim() 'SELECT name FROM sys.stats WHERE object_id = (SELECT o.object_id FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.name = PARSENAME(@t, 1) AND s.name = ISNULL(PARSENAME(@t, 2), SCHEMA_NAME())) ORDER BY stats_id' @{ '@t' = $table }
                 if ($list) { $g.Stats.Items.AddRange([object[]]$list) }
                 $g.StatsCount.Text = "$($list.Count)"
                 Set-GuiStatus "${table}: $($list.Count) statistics objects. Check some, or none for all, then Decode (F5)."
@@ -6489,10 +7608,10 @@ function Show-GuiBuildDialog {
     $database = $g.Database.Text.Trim()
     if (-not $table -or -not $database) { Show-GuiMessage 'Pick a database and a table first.' 'Warning'; return }
     $types = ($script:BuildKeyTypes | ForEach-Object { [string]$_ }) -join ', '
-    try { $columns = Get-GuiServerList $g.Conn $database "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(@t) AND c.system_type_id IN ($types) ORDER BY c.column_id" @{ '@t' = $table } }
+    try { $columns = Get-GuiServerList $g.Conn $database "SELECT c.name FROM sys.columns c WHERE c.object_id = (SELECT o.object_id FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.name = PARSENAME(@t, 1) AND s.name = ISNULL(PARSENAME(@t, 2), SCHEMA_NAME())) AND c.system_type_id IN ($types) ORDER BY c.column_id" @{ '@t' = $table } }
     catch { Show-GuiMessage "Could not read the table's columns: $($_.Exception.Message)" 'Error'; return }
     # which columns take the time presets, and which take no focus range (character columns)
-    $byType = { param([int[]]$Ids) Get-GuiServerList $g.Conn $database "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(@t) AND c.system_type_id IN ($($Ids -join ', '))" @{ '@t' = $table } }
+    $byType = { param([int[]]$Ids) Get-GuiServerList $g.Conn $database "SELECT c.name FROM sys.columns c WHERE c.object_id = (SELECT o.object_id FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.name = PARSENAME(@t, 1) AND s.name = ISNULL(PARSENAME(@t, 2), SCHEMA_NAME())) AND c.system_type_id IN ($($Ids -join ', '))" @{ '@t' = $table } }
     [string[]]$dateCols = & $byType $script:FocusDateTypes; [string[]]$textCols = & $byType $script:BuildTextTypes
     $current = Get-GuiCurrentResult
     $stat = $(if ($current -and $current.PSObject.Properties['Target'] -and $current.Target.Table -eq $table -and $current.Target.Database -eq $database) { [string]$current.Target.Statistics })
@@ -6737,24 +7856,6 @@ function New-GuiToolNote([string]$Text, [string]$Tag = 'Muted') {
     New-GuiControl Label @{ Text = $Text; AutoSize = $true; Tag = $Tag; MaximumSize = (New-Object Drawing.Size ([int](560 * (Get-GuiScale))), 0); Margin = (New-Object Windows.Forms.Padding 3, 2, 3, 8) }
 }
 
-function Show-GuiSampleAdvisorDialog {
-    $ctx = Get-GuiToolContext -NeedStat -NeedTable
-    if (-not $ctx) { return }
-    $d = New-GuiDialog "Sample size advisor: $($ctx.Table)"
-    Add-GuiRow $d.Layout '' (New-GuiToolNote 'It only reads; the script it writes changes the sample rate SQL Server uses for this statistic.')
-    Add-GuiRow $d.Layout 'Statistics object' (New-GuiControl Label @{ Text = "[$($ctx.Stat)]"; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 3, 6, 3, 3) })
-    $budget = New-GuiControl NumericUpDown @{ Minimum = 0; Maximum = 100000000; Increment = 10000; Value = 100000; Width = [int](140 * (Get-GuiScale)); ThousandsSeparator = $true }
-    Add-GuiRow $d.Layout 'Page budget' $budget
-    Add-GuiRow $d.Layout '' (New-GuiToolNote ('Reads the table once (every row, or this many pages; 0 = no limit), then replays page samples of growing size from memory: each gets a histogram scored ' +
-            'against the full read and a distinct value estimate. Recommends the smallest rate within 10% of a full scan.'))
-    $buttons = Add-GuiDialogButtons $d 'Advise'
-    $buttons.Ok.DialogResult = 'OK'
-    try { $r = $d.Form.ShowDialog($script:App.Form) } finally { $d.Form.Dispose() }
-    if ($r -ne 'OK') { return }
-    $p = $ctx.Parameters; $p.Table = $ctx.Table; $p.Statistics = [string[]]@($ctx.Stat); $p.AdviseSample = $true; $p.PageBudget = [long]$budget.Value
-    Start-GuiJob $p "Sample size advisor on [$($ctx.Stat)]" $null $null @{ Title = 'Sample size advisor'; File = "SampleAdvisor_$($ctx.Database)_$($ctx.Table)_$($ctx.Stat)" }
-}
-
 function Show-GuiMaintenanceDialog {
     $ctx = Get-GuiToolContext
     if (-not $ctx) { return }
@@ -6787,29 +7888,758 @@ function Show-GuiMaintenanceDialog {
     Start-GuiJob $p "$(if ($plan.Checked) { 'Planning maintenance' } else { 'Estimating update costs' }) for $scope" $null $null @{ Title = $(if ($plan.Checked) { 'Maintenance plan' } else { 'Update cost estimate' }); File = "Maintenance_$($ctx.Database)_$scope" }
 }
 
-function Show-GuiFilteredAdvisorDialog {
-    $ctx = Get-GuiToolContext -NeedTable
+function Start-GuiWizardJob([hashtable]$Parameters) {
+    # a run of the script in its own runspace, like Start-GuiJob, for a wizard that keeps the window to itself
+    $ps = [PowerShell]::Create()
+    $ps.Runspace = [RunspaceFactory]::CreateRunspace()
+    $ps.Runspace.Open()
+    $null = $ps.AddCommand($script:DecoderPath).AddParameters($Parameters)
+    return @{ PowerShell = $ps; Async = $ps.BeginInvoke(); Started = [DateTime]::Now }
+}
+
+function Receive-GuiWizardJob($Job) {
+    $ps = $Job.PowerShell
+    $result = $null; $failure = $null
+    try { $result = @($ps.EndInvoke($Job.Async)) | Where-Object { $_.PSObject.Properties['Lines'] } | Select-Object -Last 1 }
+    catch { $failure = $_.Exception; while ($failure.InnerException) { $failure = $failure.InnerException } }
+    $notes = @($ps.Streams.Warning | ForEach-Object { "WARNING: $($_.Message)" }) + @($ps.Streams.Error | ForEach-Object { "ERROR: $($_.Exception.Message)" })
+    $ps.Runspace.Dispose(); $ps.Dispose()
+    return @{ Result = $result; Failure = $failure; Notes = $notes }
+}
+
+function Stop-GuiWizardJob([switch]$Abandon) {
+    # asks the run to stop (it cancels the query in flight and returns what it has); Abandon also stops the pipeline
+    $w = $script:App.Wizard
+    if (-not $w -or -not $w.Job) { return }
+    $w.Control.Stop = $true
+    $cmd = $w.Control.Command
+    if ($cmd) { try { $cmd.Cancel() } catch { } }
+    if ($Abandon) { try { $null = $w.Job.PowerShell.BeginStop($null, $null) } catch { }; $w.Job = $null }
+}
+
+function New-GuiWizardCard([string]$Caption) {
+    # a small card: a muted caption over a value
+    $card = New-GuiControl TableLayoutPanel @{ AutoSize = $true; ColumnCount = 1; Tag = 'Card'; Padding = (New-Object Windows.Forms.Padding 10, 6, 18, 8); Margin = (New-Object Windows.Forms.Padding 0, 0, 10, 0) }
+    $cap = New-GuiControl Label @{ Text = $Caption; AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 0, 0, 0, 2) }
+    $value = New-GuiControl Label @{ Text = '-'; AutoSize = $true; Font = (New-Object Drawing.Font 'Segoe UI', 11, ([Drawing.FontStyle]::Bold)); Margin = (New-Object Windows.Forms.Padding 0) }
+    Add-GuiStackRow $card $cap; Add-GuiStackRow $card $value
+    return @{ Card = $card; Value = $value }
+}
+
+# The advisors that run as a wizard over a database: what each one adds to the shared steps (Show-GuiAdvisorWizard).
+# Scope builds step 1's controls; Parameters turns them into the script's parameters; Candidates and Results fill steps 2
+# and 4; Script writes the script from the checked rows. The scriptblocks run in this script's scope, with $w the wizard.
+$script:GuiAdvisors = @{
+    Filtered = @{
+        Title = 'Filtered statistics advisor'; FileStem = 'FilteredStats'; UnitColumn = 'Pairs'; UnitWord = 'pair(s)'; FoundCaption = 'Segments worth one'; CheckHeader = 'Create'
+        FootNote = 'Reads only; the script it writes creates filtered statistics when you run it. Reports hold values from the tables: handle them as customer data.'
+        Descriptions = @(
+            'Pick what to check and how long it may read. Nothing is read from the tables in this step.'
+            'The tables worth reading and their column pairs, from metadata only (no table is read). Clear the ones to skip; the time is an estimate.'
+            'Each table is read once, the biggest first: a sample copied to tempdb, then every column pair scored. You can stop at any time and keep the results so far.'
+            'Check the filtered statistics to create; the script follows the checks. The app never runs it.')
+        Screening = @('Reading the tables, columns and statistics...', 'Metadata only: sys.tables, sys.stats and each statistic''s histogram.')
+        Tabs = @('Recommendations', 'Column pairs', 'Tables', 'Report', 'Script')
+        Scope = {
+            param($w, $l1, $l2, $ctx, $note, $num, $sc)
+            $columns = @()
+            if ($ctx.Table) {
+                $types = ($script:BuildKeyTypes | ForEach-Object { [string]$_ }) -join ', '
+                # assigned as returned: @() around it would nest the list into one item
+                try { $columns = Get-GuiServerList $script:App.Conn $ctx.Database "SELECT c.name FROM sys.columns c WHERE c.object_id = (SELECT o.object_id FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.name = PARSENAME(@t, 1) AND s.name = ISNULL(PARSENAME(@t, 2), SCHEMA_NAME())) AND c.system_type_id IN ($types) AND c.max_length <> -1 ORDER BY c.column_id" @{ '@t' = $ctx.Table } }
+                catch { $columns = @() }
+                if ($null -eq $columns) { $columns = @() }
+            }
+            Add-GuiRow $l1 '' (New-GuiHeading 'What to check' 2)
+            $w.AllTables = New-GuiControl RadioButton @{ AutoSize = $true; Text = "Every table of [$($ctx.Database)]"; Checked = $true }
+            Add-GuiRow $l1 '' $w.AllTables
+            $oneRow = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0) }
+            $w.OneTable = New-GuiControl RadioButton @{ AutoSize = $true; Text = $(if ($ctx.Table) { "One column of $($ctx.Table):" } else { 'One column of a table (pick the table first)' }); Enabled = [bool]($ctx.Table -and $columns.Count); Margin = (New-Object Windows.Forms.Padding 3, 5, 6, 3) }
+            $w.Column = New-GuiControl ComboBox @{ DropDownStyle = 'DropDownList'; Width = [int](200 * $sc); Enabled = $false }
+            if ($columns.Count) { $null = $w.Column.Items.AddRange([object[]]$columns); $w.Column.SelectedIndex = $(if ($ctx.Column -and $w.Column.Items.Contains($ctx.Column)) { $w.Column.Items.IndexOf($ctx.Column) } else { 0 }) }
+            $oneRow.Controls.AddRange(@($w.OneTable, $w.Column))
+            Add-GuiRow $l1 '' $oneRow
+            Add-GuiRow $l1 '' (New-GuiHeading 'Which tables and columns')
+            $w.MinTable = & $num 0 10000000000 10000 100000 140
+            Add-GuiRow $l1 'Smallest table (rows)' $w.MinTable
+            $w.Filter = New-GuiControl TextBox @{ Width = [int](300 * $sc) }
+            Add-GuiRow $l1 'Only these tables' $w.Filter
+            Add-GuiRow $l1 '' (& $note 'Optional: names or patterns, separated by commas (sales.*, dbo.Order%, [dbo].[Orders]). Empty: every table.')
+            $w.AnyColumn = New-GuiControl CheckBox @{ AutoSize = $true; Text = 'Also columns without a statistics object (slower)' }
+            Add-GuiRow $l1 '' $w.AnyColumn
+            Add-GuiRow $l1 '' (& $note ('By default a column counts when it leads a statistics object: SQL Server creates one when a query filters on the column, so those are the columns ' +
+                    'queries use (check the box when AUTO_CREATE_STATISTICS is off). A segment column needs 2 to 200 values; its histogram tells, without reading the table.'))
+            Add-GuiRow $l2 '' (New-GuiHeading 'Limits' 2)
+            $w.MinSegment = & $num 1 1000000000 1000 1000 140
+            Add-GuiRow $l2 'Smallest segment (rows)' $w.MinSegment
+            $w.Sample = & $num 1000 100000000 50000 200000 140
+            Add-GuiRow $l2 'Rows read per table' $w.Sample
+            $w.Budget = New-GuiControl NumericUpDown @{ Minimum = 0.5; Maximum = 1440; DecimalPlaces = 1; Increment = 5; Value = 15; Width = [int](110 * $sc) }
+            Add-GuiRow $l2 'Time budget (minutes)' $w.Budget
+            $limits = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0) }
+            $w.MaxAll = & $num 1 1000 5 25 70
+            $w.MaxPer = & $num 1 200 1 3 70
+            $limits.Controls.AddRange(@($w.MaxAll, (New-GuiControl Label @{ Text = 'in all, at most'; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 6, 6, 6, 3) }), $w.MaxPer, (New-GuiControl Label @{ Text = 'per table'; AutoSize = $true; Margin = (New-Object Windows.Forms.Padding 6, 6, 3, 3) })))
+            Add-GuiRow $l2 'Recommendations' $limits
+            Add-GuiRow $l2 '' (& $note ('Each table is read once: a page sample of about this many rows (every row of a smaller table) is copied to tempdb, and every pair of a column and a ' +
+                    'segment column is scored there. The biggest tables go first; a table that does not fit the time left is passed over for smaller ones.'))
+            Add-GuiRow $l2 '' (& $note 'A filtered statistic is recommended where the estimates in a segment are off by 3x or more and it at least halves the error.')
+            $w.OneTable.Add_CheckedChanged({
+                    $w = $script:App.Wizard
+                    $one = $w.OneTable.Checked
+                    $w.Column.Enabled = $one
+                    foreach ($c in @($w.MinTable, $w.Filter, $w.AnyColumn, $w.MaxPer)) { $c.Enabled = -not $one }
+                    # one table: a bigger sample, like the advisor for one column always had
+                    $w.Sample.Value = $(if ($one) { 500000 } else { 200000 })
+                    Set-GuiWizardStep 0
+                })
+        }
+        # one column of one table skips the candidates
+        Single = { param($w) [bool]$w.OneTable.Checked }
+        Parameters = {
+            param($w, $p)
+            $p.AdviseFiltered = $true
+            $p.MinSegmentRows = [long]$w.MinSegment.Value
+            $p.SegmentSampleRows = [long]$w.Sample.Value
+            $p.TimeBudgetMinutes = [double]$w.Budget.Value
+            $p.MaxRecommendations = [int]$w.MaxAll.Value
+            if ($w.OneTable.Checked) {
+                $p.TableFilter = [string[]]@($w.Ctx.Table); $p.Column = [string]$w.Column.SelectedItem; $p.MinTableRows = 0; $p.MaxPerTable = [int]$w.MaxAll.Value
+            } else {
+                $p.MinTableRows = [long]$w.MinTable.Value; $p.MaxPerTable = [int]$w.MaxPer.Value
+                $filter = @($w.Filter.Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                if ($filter) { $p.TableFilter = [string[]]$filter }
+                if ($w.AnyColumn.Checked) { $p.AnyColumn = $true }
+            }
+        }
+        Candidates = {
+            param($w, $C)
+            $tables = @($C.Tables)
+            $skipped = @($C.Skipped)
+            $parts = @(Format-Invariant '{0:N0} user tables' $C.AllTables)
+            if ($C.SmallTables) { $parts += Format-Invariant '{0:N0} under {1:N0} rows' $C.SmallTables $C.MinTableRows }
+            if ($C.OutsideFilter) { $parts += Format-Invariant '{0:N0} outside the table filter' $C.OutsideFilter }
+            if ($skipped) { $parts += Format-Invariant '{0:N0} without a column pair to check (for example {1}: {2})' $skipped.Count $skipped[0].Table $skipped[0].Reason }
+            if (-not $C.HistogramUsed) { $parts += 'segment columns are confirmed in the sample (this server has no sys.dm_db_stats_histogram)' }
+            if (@($C.Locked).Count) { $parts += 'skipped: ' + (Get-StatsLockedLine $C.Locked) }
+            $i = 0
+            @{
+                Summary = $(if ($tables.Count) { Format-Invariant '{0} table(s) to check, {1:N0} column pair(s), about {2} in all (estimate).' $tables.Count $C.Pairs (Format-StatsSeconds $C.Seconds) } else { 'No table to check: no table has a column pair that can be split into segments.' })
+                Skipped = ($parts -join '; ') + '.'
+                Rows = @(foreach ($t in $tables) {
+                        [pscustomobject]@{
+                            Key = $i++; Table = $t.Table; Rows = [long]$t.Rows; Columns = [int]@($t.Targets).Count; 'Segment columns' = (@($t.Segments | ForEach-Object { "[$($_.Name)]" }) -join ', ')
+                            Pairs = [int]$t.Pairs; Estimate = Format-StatsSeconds $t.Seconds; Seconds = [double]$t.Seconds
+                        }
+                    })
+                Columns = @('Key', 'Table', 'Rows', 'Columns', 'Segment columns', 'Pairs', 'Estimate', 'Seconds')
+            }
+        }
+        Results = {
+            param($w, $F)
+            $rec = @($F.Recommended); $more = @($F.More)
+            $done = @($F.Tables | Where-Object Result -eq 'Done').Count
+            $notes = @()
+            if (-not @($F.Tables).Count) {
+                $why = @($F.Candidates.Skipped | Select-Object -First 1)
+                $notes += $(if ($why) { "Nothing to check in $($why[0].Table): $($why[0].Reason)." } else { 'No table matched the scope: lower the smallest table or change the table filter.' })
+            }
+            if ($F.Stopped) { $notes += "Stopped: $($F.Stopped)." }
+            $missed = @($F.Tables | Where-Object Result -ne 'Done').Count
+            if ($missed) { $notes += "$missed table(s) not checked (see Tables)." }
+            if (@($F.Locked).Count) { $notes += "Skipped: $(Get-StatsLockedLine $F.Locked)." }
+            if ($more) { $notes += Format-Invariant '{0:N0} more segment(s) are worth one but over the limits: unchecked in the list, check them to add them.' $more.Count }
+            $notes += 'Filtered statistics help queries whose filter is a literal or that use OPTION (RECOMPILE); queries with parameters keep the old estimates.'
+            # recommended (checked) and over the limits (unchecked), most useful first; at most 500 rows
+            $list = @($rec) + @($more | Select-Object -First ([Math]::Max(0, 500 - $rec.Count)))
+            $i = 0
+            @{
+                Verdict = $(if ($rec) { Format-Invariant '{0} filtered statistic(s) recommended in {1} table(s), from {2} table(s) checked in {3}.' $rec.Count @($rec | ForEach-Object Table | Select-Object -Unique).Count $done (Format-StatsSeconds $F.Seconds) }
+                    else { Format-Invariant 'No filtered statistic needed in the {0} table(s) checked ({1}).' $done (Format-StatsSeconds $F.Seconds) })
+                Notes = $notes; Items = $list; Checked = [bool[]]@(for ($k = 0; $k -lt $list.Count; $k++) { $k -lt $rec.Count })
+                Rows = @(foreach ($s in $list) {
+                        [pscustomobject]@{
+                            Key = $i++; Table = $s.Table; Column = "[$($s.Target)]"; Segment = Get-FilteredWhere $s; Rows = [long][Math]::Round($s.Rows)
+                            'Equality now' = [Math]::Round($s.NowEq, 2); 'Equality filtered' = [Math]::Round($s.FilteredEq, 2); 'Ranges now' = [Math]::Round($s.NowRange, 2); 'Ranges filtered' = [Math]::Round($s.FilteredRange, 2)
+                            Cause = Get-FilteredCause $s; Status = $(if ($i -le $rec.Count) { 'Recommended' } else { 'Over the limits' })
+                        }
+                    })
+                Columns = @('Key', 'Table', 'Column', 'Segment', 'Rows', 'Equality now', 'Equality filtered', 'Ranges now', 'Ranges filtered', 'Cause', 'Status')
+                Formats = @{ Rows = 'N0'; 'Equality now' = '0.##x'; 'Equality filtered' = '0.##x'; 'Ranges now' = '0.##x'; 'Ranges filtered' = '0.##x' }
+                ExtraRows = @(foreach ($p in @($F.Pairs)) {
+                        [pscustomobject]@{ Table = $p.Table; Column = "[$($p.Column)]"; 'Segment column' = "[$($p.'Segment column')]"; 'Worth one' = [int]$p.Worth; Segments = [int]$p.Segments; 'In the script' = [int]$p.Recommended; Rows = [long][Math]::Round($p.Rows); 'Worst now' = [Math]::Round($p.Worst, 2); Cause = $p.Cause }
+                    })
+                ExtraColumns = @('Table', 'Column', 'Segment column', 'Worth one', 'Segments', 'In the script', 'Rows', 'Worst now', 'Cause')
+                ExtraFormats = @{ Rows = 'N0'; 'Worst now' = '0.##x' }
+            }
+        }
+        Script = { param($w, $picked) New-FilteredStatsDatabaseScript $w.Result.Database $picked }
+        ScriptCount = { param($picked) "$(@($picked).Count) filtered statistic(s) in the script" }
+    }
+    Sample = @{
+        Title = 'Sample size advisor'; FileStem = 'SampleSize'; UnitColumn = 'Columns'; UnitWord = 'column(s)'; FoundCaption = 'Need a larger sample'; CheckHeader = 'Persist'
+        FootNote = 'Reads only; the script it writes updates statistics at the new rates when you run it. Reports hold names from the database: handle them as customer data.'
+        Descriptions = @(
+            'Pick what to check and how long it may read. Nothing is read from the tables in this step.'
+            'The tables whose default sample does not read them whole, and their statistics, from metadata only (no table is read). Clear the ones to skip; the time is an estimate.'
+            'Each table is read once, the biggest first: its pages copied to tempdb, then each leading column replayed at the default and larger samples. You can stop at any time and keep the results so far.'
+            'Check the sample rates to persist; the script follows the checks. The app never runs it.')
+        Screening = @('Reading the tables and statistics...', 'Metadata only: sys.stats, sys.dm_db_stats_properties and the table sizes.')
+        Tabs = @('Statistics', 'Tables', 'Report', 'Script')
+        Scope = {
+            param($w, $l1, $l2, $ctx, $note, $num, $sc)
+            Add-GuiRow $l1 '' (New-GuiHeading 'What to check' 2)
+            $w.AllTables = New-GuiControl RadioButton @{ AutoSize = $true; Text = "Every table of [$($ctx.Database)]"; Checked = $true }
+            $w.ThisTable = New-GuiControl RadioButton @{ AutoSize = $true; Text = $(if ($ctx.Table) { "Every statistics object of $($ctx.Table)" } else { 'Every statistics object of a table (pick the table first)' }); Enabled = [bool]$ctx.Table }
+            $w.ThisStat = New-GuiControl RadioButton @{ AutoSize = $true; Text = $(if ($ctx.Stat) { "The statistics object shown: [$($ctx.Stat)]" } else { 'The statistics object shown (decode the table first)' }); Enabled = [bool]$ctx.Stat }
+            Add-GuiRow $l1 '' $w.AllTables; Add-GuiRow $l1 '' $w.ThisTable; Add-GuiRow $l1 '' $w.ThisStat
+            Add-GuiRow $l1 '' (New-GuiHeading 'Which tables and statistics')
+            $w.MinTable = & $num 0 10000000000 10000 100000 140
+            Add-GuiRow $l1 'Smallest table (rows)' $w.MinTable
+            $w.Filter = New-GuiControl TextBox @{ Width = [int](300 * $sc) }
+            Add-GuiRow $l1 'Only these tables' $w.Filter
+            Add-GuiRow $l1 '' (& $note 'Optional: names or patterns, separated by commas (sales.*, dbo.Order%, [dbo].[Orders]). Empty: every table.')
+            $w.Persisted = New-GuiControl CheckBox @{ AutoSize = $true; Text = 'Also statistics that already have a persisted sample rate' }
+            Add-GuiRow $l1 '' $w.Persisted
+            Add-GuiRow $l1 '' (& $note ('Left out: tables small enough that the default sample reads them whole (under about 1,024 pages), filtered and incremental statistics, and ' +
+                    'columns of types the builder does not read. Statistics led by the same column share one analysis.'))
+            Add-GuiRow $l2 '' (New-GuiHeading 'Limits' 2)
+            $w.Pages = & $num 1024 100000000 10000 50000 140
+            Add-GuiRow $l2 'Pages read per table' $w.Pages
+            $w.Budget = New-GuiControl NumericUpDown @{ Minimum = 0.5; Maximum = 1440; DecimalPlaces = 1; Increment = 5; Value = 15; Width = [int](110 * $sc) }
+            Add-GuiRow $l2 'Time budget (minutes)' $w.Budget
+            $w.MaxAll = & $num 1 5000 10 50 70
+            Add-GuiRow $l2 'Recommendations' $w.MaxAll
+            $w.Probe = New-GuiControl CheckBox @{ AutoSize = $true; Text = 'Probe this server''s read and sort speed (two short queries)'; Checked = $true }
+            Add-GuiRow $l2 '' $w.Probe
+            Add-GuiRow $l2 '' (& $note ('Each table is read once, at most this many pages (a page sample above that, which then stands in for the whole table). Each leading column is replayed ' +
+                    'from that read at the default sample and larger ones; the smallest rate within 10% of the read is recommended where the default is noticeably worse.'))
+            Add-GuiRow $l2 '' (& $note 'The probe scales the update cost model, which shows how long each update takes at the new rate against the default.')
+            $toggle = {
+                $w = $script:App.Wizard
+                $all = $w.AllTables.Checked
+                foreach ($c in @($w.MinTable, $w.Filter)) { $c.Enabled = $all }
+            }
+            $w.AllTables.Add_CheckedChanged($toggle); $w.ThisTable.Add_CheckedChanged($toggle); $w.ThisStat.Add_CheckedChanged($toggle)
+        }
+        Single = { param($w) $false }
+        Parameters = {
+            param($w, $p)
+            $p.AdviseSample = $true
+            $p.PageBudget = [long]$w.Pages.Value
+            $p.TimeBudgetMinutes = [double]$w.Budget.Value
+            $p.MaxRecommendations = [int]$w.MaxAll.Value
+            if ($w.Persisted.Checked) { $p.IncludePersisted = $true }
+            if (-not $w.Probe.Checked) { $p.NoProbe = $true }
+            if ($w.AllTables.Checked) {
+                $p.MinTableRows = [long]$w.MinTable.Value
+                $filter = @($w.Filter.Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                if ($filter) { $p.TableFilter = [string[]]$filter }
+            } else {
+                $p.TableFilter = [string[]]@($w.Ctx.Table); $p.MinTableRows = 0
+                if ($w.ThisStat.Checked) { $p.Statistics = [string[]]@($w.Ctx.Stat) }
+            }
+        }
+        Candidates = {
+            param($w, $C)
+            $tables = @($C.Tables)
+            $i = 0
+            @{
+                Summary = $(if ($tables.Count) { Format-Invariant '{0} table(s) to read, {1:N0} statistics object(s) on {2:N0} leading column(s), about {3} in all (estimate).' $tables.Count $C.Statistics $C.Columns (Format-StatsSeconds $C.Seconds) }
+                    else { 'Nothing to check: no statistics object in the scope is on a table the default sample reads only in part.' })
+                Skipped = (Get-SampleTablesLine $C) + '; ' + (Get-SampleStatsLine $C) + $(if (@($C.Locked).Count) { '; skipped: ' + (Get-StatsLockedLine $C.Locked) } else { '' }) + '.'
+                Rows = @(foreach ($t in $tables) {
+                        [pscustomobject]@{
+                            Key = $i++; Table = $t.Table; Rows = [long]$t.Rows; Pages = [long]$t.Pages; 'Default sample' = [Math]::Round($t.Default.Percent, 2)
+                            Read = $(if ($t.RefFraction -ge 1) { 'all' } else { Format-Invariant '{0:0.##}%' (100 * $t.RefFraction) }); Statistics = [int]$t.Statistics; Columns = [int]@($t.Columns).Count
+                            Estimate = Format-StatsSeconds $t.Seconds; Seconds = [double]$t.Seconds
+                        }
+                    })
+                Columns = @('Key', 'Table', 'Rows', 'Pages', 'Default sample', 'Read', 'Statistics', 'Columns', 'Estimate', 'Seconds')
+                Formats = @{ Pages = 'N0'; 'Default sample' = '0.##\%' }
+            }
+        }
+        Results = {
+            param($w, $F)
+            $all = @($F.Statistics); $rec = @($F.Recommended); $more = @($F.More)
+            $done = @($F.Tables | Where-Object Result -eq 'Done').Count
+            $notes = @()
+            if (-not @($F.Tables).Count) { $notes += 'No table matched the scope: lower the smallest table or change the table filter.' }
+            if ($F.Stopped) { $notes += "Stopped: $($F.Stopped)." }
+            $missed = @($F.Tables | Where-Object Result -ne 'Done').Count
+            if ($missed) { $notes += "$missed table(s) not checked (see Tables)." }
+            if (@($F.Locked).Count) { $notes += "Skipped: $(Get-StatsLockedLine $F.Locked)." }
+            if ($more) { $notes += Format-Invariant '{0:N0} more need a larger sample but are over the limit: unchecked in the list.' $more.Count }
+            if ($rec) {
+                $now = [double](($rec | Measure-Object CostDefault -Sum).Sum); $then = [double](($rec | Measure-Object CostRecommended -Sum).Sum)
+                $notes += Format-Invariant 'Updating the {0} recommended takes about {1} at their rates instead of {2} with the default sample (estimate).' $rec.Count (Format-StatsSeconds $then) (Format-StatsSeconds $now)
+            }
+            # the recommended first (checked), then the others: over the limit, small gains, default enough
+            $order = @{ 'Recommended' = 0; 'Small gain' = 1; 'Default is enough' = 2 }
+            $list = @($rec) + @($more) + @($all | Where-Object { -not $_.Needs } | Sort-Object { $order[$_.Status] }, { - $_.Rows })
+            $list = @($list | Select-Object -First 2000)
+            $i = 0
+            $fmtErr = { param($e) Format-Invariant '{0:+0;-0}%' (100 * $e) }
+            @{
+                Verdict = $(if ($rec) { Format-Invariant '{0} of {1} statistics object(s) need more than the default sample, from {2} table(s) checked in {3}.' (@($all | Where-Object Needs).Count) $all.Count $done (Format-StatsSeconds $F.Seconds) }
+                    else { Format-Invariant 'The default sample is enough for the {0} statistics object(s) checked ({1} table(s), {2}).' $all.Count $done (Format-StatsSeconds $F.Seconds) })
+                Notes = $notes; Items = $list; Checked = [bool[]]@(for ($k = 0; $k -lt $list.Count; $k++) { $k -lt $rec.Count })
+                # the default is enough: no rate to persist
+                Locked = [bool[]]@(foreach ($s in $list) { $s.Rule -eq 'Default' })
+                Rows = @(foreach ($s in $list) {
+                        [pscustomobject]@{
+                            Key = $i++; Table = $s.Table; Statistics = "[$($s.Statistics)]"; Column = "[$($s.Column)]"; Rows = [long]$s.Rows
+                            Current = $(if ($null -ne $s.CurrentPercent) { [Math]::Round($s.CurrentPercent, 2) }); Default = [Math]::Round($s.DefaultPercent, 2); Recommended = $s.Rule
+                            'Equality default' = [Math]::Round($s.Default.EqP95, 2); 'Equality at rate' = [Math]::Round($s.Recommended.EqP95, 2)
+                            'Ranges default' = [Math]::Round($s.Default.RangeP95, 2); 'Ranges at rate' = [Math]::Round($s.Recommended.RangeP95, 2)
+                            'Distinct default' = & $fmtErr $s.Default.DistinctError; 'Distinct at rate' = & $fmtErr $s.Recommended.DistinctError
+                            'Update default' = Format-StatsSeconds $s.CostDefault; 'Update at rate' = Format-StatsSeconds $s.CostRecommended; Status = $s.Status
+                        }
+                    })
+                Columns = @('Key', 'Table', 'Statistics', 'Column', 'Rows', 'Current', 'Default', 'Recommended', 'Equality default', 'Equality at rate', 'Ranges default', 'Ranges at rate', 'Distinct default', 'Distinct at rate', 'Update default', 'Update at rate', 'Status')
+                Formats = @{ Rows = 'N0'; Current = '0.##\%'; Default = '0.##\%'; 'Equality default' = '0.##x'; 'Equality at rate' = '0.##x'; 'Ranges default' = '0.##x'; 'Ranges at rate' = '0.##x' }
+            }
+        }
+        # rows the default is enough for have no rate to persist
+        Script = { param($w, $picked) New-SampleAdvisorDatabaseScript $w.Result.Database @($picked | Where-Object { $_.Rule -ne 'Default' }) }
+        ScriptCount = { param($picked) "$(@($picked | Where-Object { $_.Rule -ne 'Default' }).Count) sample rate(s) in the script" }
+    }
+}
+
+function Show-GuiFilteredWizard { Show-GuiAdvisorWizard 'Filtered' }
+function Show-GuiSampleWizard { Show-GuiAdvisorWizard 'Sample' }
+
+function Show-GuiAdvisorWizard([string]$Kind) {
+    <#
+      An advisor over a database, step by step: 1 what to check and the limits; 2 the candidate tables, from metadata only,
+      with time estimates (pick the ones to read); 3 the analysis, with progress for all tables and for the table being read,
+      the time left and the time budget; 4 the results, the report and the script. Steps 2 and 3 run the script in a
+      runspace; a synchronized table carries the progress back and a stop request in. $script:GuiAdvisors holds each
+      advisor's own parts.
+    #>
+    $ctx = Get-GuiToolContext
     if (-not $ctx) { return }
-    $types = ($script:BuildKeyTypes | ForEach-Object { [string]$_ }) -join ', '
-    try { $columns = Get-GuiServerList $script:App.Conn $ctx.Database "SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID(@t) AND c.system_type_id IN ($types) ORDER BY c.column_id" @{ '@t' = $ctx.Table } }
-    catch { Show-GuiMessage "Could not read the table's columns: $($_.Exception.Message)" 'Error'; return }
-    $d = New-GuiDialog "Filtered statistics advisor: $($ctx.Table)"
-    Add-GuiRow $d.Layout '' (New-GuiToolNote 'It reads a page sample into tempdb; the script it writes creates filtered statistics.')
-    $column = New-GuiControl ComboBox @{ DropDownStyle = 'DropDownList'; Width = [int](260 * (Get-GuiScale)) }
-    $null = $column.Items.AddRange([object[]]$columns)
-    # the column of the statistics object shown, when there is one
-    if ($ctx.Column -and $column.Items.Contains($ctx.Column)) { $column.SelectedItem = $ctx.Column } elseif ($columns.Count) { $column.SelectedIndex = 0 }
-    Add-GuiRow $d.Layout 'Column' $column
-    $minRows = New-GuiControl NumericUpDown @{ Minimum = 1; Maximum = 1000000000; Increment = 1000; Value = 1000; Width = [int](140 * (Get-GuiScale)); ThousandsSeparator = $true }
-    Add-GuiRow $d.Layout 'Smallest segment (rows)' $minRows
-    Add-GuiRow $d.Layout '' (New-GuiToolNote ('Every other column with 2 to 200 values (integers, bit, date, uniqueidentifier, short strings) splits the table into segments. In each segment, the estimates for the column ' +
-            'from the two columns'' own statistics are compared with a histogram of the segment''s own rows; a filtered statistic is recommended where it at least halves an error of 3x or more.'))
-    $buttons = Add-GuiDialogButtons $d 'Advise'
-    $buttons.Ok.DialogResult = 'OK'
-    try { $r = $d.Form.ShowDialog($script:App.Form) } finally { $d.Form.Dispose() }
-    if ($r -ne 'OK' -or -not $column.SelectedItem) { return }
-    $p = $ctx.Parameters; $p.Table = $ctx.Table; $p.Column = [string]$column.SelectedItem; $p.AdviseFiltered = $true; $p.MinSegmentRows = [long]$minRows.Value
-    Start-GuiJob $p "Filtered statistics advisor on [$($column.SelectedItem)]" $null $null @{ Title = 'Filtered statistics advisor'; File = "FilteredStats_$($ctx.Database)_$($ctx.Table)_$($column.SelectedItem)" }
+    $def = $script:GuiAdvisors[$Kind]
+    $g = $script:App
+    $sc = Get-GuiScale
+    $form = New-GuiControl Form @{
+        Text = "$($def.Title): $($ctx.Database)"; StartPosition = 'CenterParent'; Font = $g.Form.Font; ShowInTaskbar = $false; MinimizeBox = $false
+        Size = (New-Object Drawing.Size 1120, 760); MinimumSize = (New-Object Drawing.Size 820, 560)
+    }
+    if ($g.Icon) { $form.Icon = $g.Icon }
+    $w = @{ Kind = $Kind; Def = $def; Ctx = $ctx; Form = $form; Step = 0; Job = $null; Stage = $null; Control = $null; Candidates = $null; Result = $null; Single = $false; LogCount = -1 }
+    $g.Wizard = $w
+
+    # ---- header: title, the four steps, what this step does
+    $head = New-GuiControl TableLayoutPanel @{ Dock = 'Top'; AutoSize = $true; ColumnCount = 1; Padding = (New-Object Windows.Forms.Padding 16, 12, 16, 4) }
+    $title = New-GuiControl Label @{ Text = $def.Title; AutoSize = $true; Font = (New-Object Drawing.Font 'Segoe UI', 13, ([Drawing.FontStyle]::Bold)); Margin = (New-Object Windows.Forms.Padding 0, 0, 0, 6) }
+    $stepsRow = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0, 0, 0, 4) }
+    $w.StepLabels = @()
+    $names = '1  Scope', '2  Candidates', '3  Analysis', '4  Results'
+    for ($i = 0; $i -lt 4; $i++) {
+        if ($i) { $stepsRow.Controls.Add((New-GuiControl Label @{ Text = [string][char]0x203A; AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 6, 2, 6, 0) })) }
+        $l = New-GuiControl Label @{ Text = $names[$i]; AutoSize = $true; Font = (New-Object Drawing.Font 'Segoe UI', 10); Margin = (New-Object Windows.Forms.Padding 0, 2, 0, 0) }
+        $stepsRow.Controls.Add($l); $w.StepLabels += $l
+    }
+    $w.Description = New-GuiControl Label @{ AutoSize = $true; Tag = 'Muted'; MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 0, 4, 0, 4) }
+    Add-GuiStackRow $head $title; Add-GuiStackRow $head $stepsRow; Add-GuiStackRow $head $w.Description
+
+    # ---- footer: Back, Next, Cancel / Close
+    $foot = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; Dock = 'Bottom'; FlowDirection = 'RightToLeft'; Padding = (New-Object Windows.Forms.Padding 10, 6, 10, 10) }
+    $size = New-Object Drawing.Size ([int](110 * $sc)), 0
+    $w.Cancel = New-GuiControl Button @{ Text = 'Cancel'; AutoSize = $true; MinimumSize = $size; Padding = (New-Object Windows.Forms.Padding 8, 2, 8, 2) }
+    $w.Next = New-GuiControl Button @{ Text = 'Next'; AutoSize = $true; MinimumSize = $size; Tag = 'Primary'; Padding = (New-Object Windows.Forms.Padding 8, 2, 8, 2) }
+    $w.Back = New-GuiControl Button @{ Text = 'Back'; AutoSize = $true; MinimumSize = $size; Padding = (New-Object Windows.Forms.Padding 8, 2, 8, 2) }
+    $w.FootNote = New-GuiControl Label @{ AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 3, 9, 16, 3); Text = $def.FootNote }
+    $foot.Controls.AddRange(@($w.Cancel, $w.Next, $w.Back, $w.FootNote))
+
+    $body = New-GuiControl Panel @{ Dock = 'Fill'; Padding = (New-Object Windows.Forms.Padding 16, 4, 16, 4) }
+    $w.Panels = @()
+
+    # ---- step 1: scope and limits (what to check on the left, the limits on the right), from the advisor's definition
+    $p1 = New-GuiControl TableLayoutPanel @{ Dock = 'Fill'; ColumnCount = 2; AutoScroll = $true }
+    $null = $p1.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'Percent', 52)); $null = $p1.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'Percent', 48))
+    $note = { param([string]$Text) New-GuiControl Label @{ Text = $Text; AutoSize = $true; Tag = 'Muted'; MaximumSize = (New-Object Drawing.Size ([int](470 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 3, 2, 3, 8) } }
+    $column = { $t = New-GuiControl TableLayoutPanel @{ AutoSize = $true; ColumnCount = 2; Anchor = 'Top, Left'; Padding = (New-Object Windows.Forms.Padding 0, 0, 12, 8) }; $null = $t.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'AutoSize')); $null = $t.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'AutoSize')); $t }
+    $num = { param($min, $max, $inc, $val, $width) New-GuiControl NumericUpDown @{ Minimum = $min; Maximum = $max; Increment = $inc; Value = $val; Width = [int]($width * $sc); ThousandsSeparator = $true } }
+    $l1 = & $column; $l2 = & $column
+    & $def.Scope $w $l1 $l2 $ctx $note $num $sc
+    $p1.Controls.Add($l1, 0, 0); $p1.Controls.Add($l2, 1, 0)
+    $w.Panels += $p1
+
+    # ---- step 2: candidates
+    $p2 = New-GuiControl TableLayoutPanel @{ Dock = 'Fill'; ColumnCount = 1 }
+    $null = $p2.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'Percent', 100))
+    $w.CandSummary = New-GuiControl Label @{ AutoSize = $true; Font = (New-Object Drawing.Font 'Segoe UI', 10, ([Drawing.FontStyle]::Bold)); MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 3, 4, 3, 2) }
+    $w.CandSkipped = New-GuiControl Label @{ AutoSize = $true; Tag = 'Muted'; MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 3, 2, 3, 6) }
+    $w.CandBusy = New-GuiControl ProgressBar @{ Style = 'Marquee'; MarqueeAnimationSpeed = 30; Height = [int](16 * $sc); Width = [int](420 * $sc); Margin = (New-Object Windows.Forms.Padding 3, 6, 3, 6) }
+    $pick = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0, 0, 0, 4) }
+    $w.PickAll = New-GuiControl Button @{ Text = 'Select all'; AutoSize = $true }
+    $w.PickNone = New-GuiControl Button @{ Text = 'Select none'; AutoSize = $true }
+    $w.PickFit = New-GuiControl Button @{ Text = 'Select what fits the budget'; AutoSize = $true }
+    $pick.Controls.AddRange(@($w.PickAll, $w.PickNone, $w.PickFit))
+    $grid = { param([string]$Name) New-GuiControl DataGridView @{ Name = $Name; Dock = 'Fill'; AllowUserToAddRows = $false; AllowUserToDeleteRows = $false; RowHeadersVisible = $false; AutoSizeColumnsMode = 'None'; SelectionMode = 'FullRowSelect'; MultiSelect = $true; ClipboardCopyMode = 'EnableWithAutoHeaderText'; BorderStyle = 'None' } }
+    $w.CandGrid = & $grid "$($Kind)Candidates"
+    $w.CandSelected = New-GuiControl Label @{ AutoSize = $true; MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 3, 6, 3, 2) }
+    Add-GuiStackRow $p2 $w.CandSummary; Add-GuiStackRow $p2 $w.CandSkipped; Add-GuiStackRow $p2 $w.CandBusy; Add-GuiStackRow $p2 $pick
+    Add-GuiStackRow $p2 $w.CandGrid 'Percent' 100; Add-GuiStackRow $p2 $w.CandSelected
+    $w.Panels += $p2
+    $w.CandGrid.Add_CurrentCellDirtyStateChanged({ param($s, $e) if ($s.IsCurrentCellDirty) { $null = $s.CommitEdit('CurrentCellChange') } })
+    $w.CandGrid.Add_CellValueChanged({ param($s, $e) if ($e.RowIndex -ge 0) { Update-GuiWizardSelection } })
+    $w.PickAll.Add_Click({ Set-GuiWizardChecks $script:App.Wizard.CandGrid { $true } })
+    $w.PickNone.Add_Click({ Set-GuiWizardChecks $script:App.Wizard.CandGrid { $false } })
+    $w.PickFit.Add_Click({
+            $w = $script:App.Wizard
+            $budget = [double]$w.Budget.Value * 60; $used = 0.0
+            # biggest first, like the analysis; a table that does not fit is passed over for smaller ones
+            $order = @($w.CandGrid.Rows | Sort-Object { [double]$_.Cells['Rows'].Value } -Descending)
+            $fit = @{}
+            foreach ($r in $order) { $s = [double]$r.Cells['Seconds'].Value; if ($used + $s -le $budget) { $used += $s; $fit[$r.Index] = $true } }
+            Set-GuiWizardChecks $w.CandGrid { param($r) [bool]$fit[$r.Index] }.GetNewClosure()
+        })
+
+    # ---- step 3: analysis
+    $p3 = New-GuiControl TableLayoutPanel @{ Dock = 'Fill'; ColumnCount = 1 }
+    $null = $p3.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'Percent', 100))
+    $bar = { New-GuiControl ProgressBar @{ Style = 'Continuous'; Minimum = 0; Maximum = 1000; Dock = 'Fill'; Height = [int](22 * $sc); Margin = (New-Object Windows.Forms.Padding 3, 2, 3, 2) } }
+    $barRow = {
+        param([string]$Caption)
+        $t = New-GuiControl TableLayoutPanel @{ Dock = 'Fill'; AutoSize = $true; ColumnCount = 3; Margin = (New-Object Windows.Forms.Padding 0, 4, 0, 2) }
+        $null = $t.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'Absolute', ([int](110 * $sc))))
+        $null = $t.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'Percent', 100))
+        $null = $t.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'Absolute', ([int](70 * $sc))))
+        $cap = New-GuiControl Label @{ Text = $Caption; AutoSize = $true; Anchor = 'Left'; Margin = (New-Object Windows.Forms.Padding 3, 4, 3, 3) }
+        $b = & $bar
+        $pct = New-GuiControl Label @{ Text = ''; AutoSize = $true; Anchor = 'Right'; Font = (New-Object Drawing.Font 'Segoe UI', 10, ([Drawing.FontStyle]::Bold)); Margin = (New-Object Windows.Forms.Padding 3, 3, 3, 3) }
+        $t.Controls.Add($cap, 0, 0); $t.Controls.Add($b, 1, 0); $t.Controls.Add($pct, 2, 0)
+        return @{ Row = $t; Bar = $b; Percent = $pct }
+    }
+    $w.RunTable = New-GuiControl Label @{ AutoSize = $true; Font = (New-Object Drawing.Font 'Segoe UI', 10, ([Drawing.FontStyle]::Bold)); MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 3, 6, 3, 4); Text = 'Starting...' }
+    $all = & $barRow 'All tables'; $one = & $barRow 'This table'
+    $w.AllBar = $all.Bar; $w.AllPercent = $all.Percent; $w.TableBar = $one.Bar; $w.TablePercent = $one.Percent
+    $w.RunStep = New-GuiControl Label @{ AutoSize = $true; Tag = 'Muted'; MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 116, 0, 3, 10) }
+    $cards = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $true; Margin = (New-Object Windows.Forms.Padding 3, 4, 3, 8) }
+    $w.Cards = @{}
+    foreach ($k in @(@('Elapsed', 'Elapsed'), @('Left', 'Time left (estimate)'), @('Ends', 'Done around'), @('Budget', 'Time budget left'), @('Tables', 'Tables done'), @('Found', $def.FoundCaption))) {
+        $c = New-GuiWizardCard $k[1]; $cards.Controls.Add($c.Card); $w.Cards[$k[0]] = $c.Value
+    }
+    $w.RunNote = New-GuiControl Label @{ AutoSize = $true; Tag = 'Muted'; MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 3, 0, 3, 6)
+        Text = 'The time left starts from a model measured on a lab server and follows this server''s real speed as tables finish. Stop and show results keeps what is done.' }
+    $w.RunLog = New-GuiControl ListBox @{ Dock = 'Fill'; IntegralHeight = $false; BorderStyle = 'None'; HorizontalScrollbar = $true }
+    Add-GuiStackRow $p3 $w.RunTable; Add-GuiStackRow $p3 $all.Row; Add-GuiStackRow $p3 $one.Row; Add-GuiStackRow $p3 $w.RunStep
+    Add-GuiStackRow $p3 $cards; Add-GuiStackRow $p3 $w.RunNote
+    Add-GuiStackRow $p3 (New-GuiControl Label @{ Text = 'Tables'; AutoSize = $true; Font = (New-Object Drawing.Font 'Segoe UI', 10, ([Drawing.FontStyle]::Bold)); Margin = (New-Object Windows.Forms.Padding 3, 6, 3, 2) })
+    Add-GuiStackRow $p3 $w.RunLog 'Percent' 100
+    $w.Panels += $p3
+
+    # ---- step 4: results: the checked list first, then (when the advisor has one) a second view, the tables, the report, the script
+    $p4 = New-GuiControl TableLayoutPanel @{ Dock = 'Fill'; ColumnCount = 1 }
+    $null = $p4.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle 'Percent', 100))
+    $w.Verdict = New-GuiControl Label @{ AutoSize = $true; Font = (New-Object Drawing.Font 'Segoe UI', 10, ([Drawing.FontStyle]::Bold)); MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 3, 4, 3, 2) }
+    $w.VerdictNote = New-GuiControl Label @{ AutoSize = $true; Tag = 'Muted'; MaximumSize = (New-Object Drawing.Size ([int](1040 * $sc)), 0); Margin = (New-Object Windows.Forms.Padding 3, 2, 3, 6) }
+    $actions = New-GuiControl FlowLayoutPanel @{ AutoSize = $true; WrapContents = $false; Margin = (New-Object Windows.Forms.Padding 0, 0, 0, 4) }
+    $w.SaveScript = New-GuiControl Button @{ Text = 'Save script as...'; AutoSize = $true; Tag = 'Primary' }
+    $w.CopyScript = New-GuiControl Button @{ Text = 'Copy script'; AutoSize = $true }
+    $w.SaveReport = New-GuiControl Button @{ Text = 'Save report as...'; AutoSize = $true }
+    $w.ScriptCount = New-GuiControl Label @{ AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 10, 7, 3, 3) }
+    $actions.Controls.AddRange(@($w.SaveScript, $w.CopyScript, $w.SaveReport, $w.ScriptCount))
+    $w.ResultTabs = New-GuiControl TabControl @{ Dock = 'Fill' }
+    $mono = New-Object Drawing.Font 'Consolas', 9.75
+    $w.RecGrid = & $grid "$($Kind)Results"; $w.ExtraGrid = & $grid "$($Kind)Extra"; $w.TableGrid = & $grid "$($Kind)Tables"
+    $w.ExtraGrid.ReadOnly = $true; $w.TableGrid.ReadOnly = $true
+    $w.ReportBox = New-GuiControl TextBox @{ Dock = 'Fill'; ReadOnly = $true; Multiline = $true; WordWrap = $false; ScrollBars = 'Both'; MaxLength = 0; Font = $mono; BorderStyle = 'None' }
+    $w.ScriptBox = New-GuiControl TextBox @{ Dock = 'Fill'; ReadOnly = $true; Multiline = $true; WordWrap = $false; ScrollBars = 'Both'; MaxLength = 0; Font = $mono; BorderStyle = 'None' }
+    $views = @($w.RecGrid) + $(if ($def.Tabs.Count -eq 5) { @($w.ExtraGrid) } else { @() }) + @($w.TableGrid, $w.ReportBox, $w.ScriptBox)
+    for ($i = 0; $i -lt $def.Tabs.Count; $i++) {
+        $page = New-GuiControl TabPage @{ Text = $def.Tabs[$i]; Padding = (New-Object Windows.Forms.Padding 4) }
+        $page.Controls.Add($views[$i]); $w.ResultTabs.TabPages.Add($page)
+    }
+    $w.TablesTab = $def.Tabs.Count - 3
+    Add-GuiStackRow $p4 $w.Verdict; Add-GuiStackRow $p4 $w.VerdictNote; Add-GuiStackRow $p4 $actions; Add-GuiStackRow $p4 $w.ResultTabs 'Percent' 100
+    $w.Panels += $p4
+    $w.RecGrid.Add_CurrentCellDirtyStateChanged({ param($s, $e) if ($s.IsCurrentCellDirty) { $null = $s.CommitEdit('CurrentCellChange') } })
+    $w.RecGrid.Add_CellValueChanged({ param($s, $e) if ($e.RowIndex -ge 0) { Update-GuiWizardScript } })
+    $w.CopyScript.Add_Click({ [Windows.Forms.Clipboard]::SetText($script:App.Wizard.ScriptBox.Text); Set-GuiStatus 'Script copied to the clipboard.' })
+    $w.SaveScript.Add_Click({ Save-GuiWizardText $script:App.Wizard.ScriptBox.Text 'SQL scripts|*.sql|All files|*.*' '.sql' })
+    $w.SaveReport.Add_Click({ Save-GuiWizardText $script:App.Wizard.ReportBox.Text 'Text files|*.txt|All files|*.*' '.txt' })
+
+    foreach ($p in $w.Panels) { $p.Visible = $false; $body.Controls.Add($p) }
+    $form.Controls.Add($body); $form.Controls.Add($foot); $form.Controls.Add($head)
+
+    # ---- navigation
+    $w.Back.Add_Click({
+            $w = $script:App.Wizard
+            switch ($w.Step) {
+                1 { Stop-GuiWizardJob -Abandon; Set-GuiWizardStep 0 }
+                3 { Set-GuiWizardStep 0 }
+            }
+        })
+    $w.Next.Add_Click({
+            $w = $script:App.Wizard
+            switch ($w.Step) {
+                0 { if (& $w.Def.Single $w) { Start-GuiWizardAnalysis } else { Start-GuiWizardScreen } }
+                1 { Start-GuiWizardAnalysis }
+                2 { Stop-GuiWizardJob; $w.Next.Enabled = $false; $w.Next.Text = 'Stopping...'; $w.RunStep.Text = 'Stopping: the query in flight is cancelled, then the results so far are shown.' }
+            }
+        })
+    $w.Cancel.Add_Click({ $script:App.Wizard.Form.Close() })
+    $form.Add_FormClosing({
+            param($s, $e)
+            $w = $script:App.Wizard
+            if ($w.Job -and $w.Step -eq 2) {
+                if ([Windows.Forms.MessageBox]::Show($s, 'Stop the analysis and close? The results so far are lost.', 'SQLStatsXRay', 'YesNo', 'Question') -ne 'Yes') { $e.Cancel = $true; return }
+            }
+            Stop-GuiWizardJob -Abandon
+            $w.Timer.Stop()
+        })
+    $w.Timer = New-Object Windows.Forms.Timer
+    $w.Timer.Interval = 250
+    $w.Timer.Add_Tick({ Update-GuiWizardJob })
+    $form.Add_Load({ param($s, $e) Set-GuiControlTheme $s; Set-GuiWizardStep 0 })
+    try { $null = $form.ShowDialog($g.Form) }
+    finally { $w.Timer.Dispose(); $form.Dispose(); $g.Wizard = $null }
+}
+
+function Set-GuiWizardStep([int]$Step) {
+    # shows one step: its panel, the step names (done, current, to come) and the buttons it needs
+    $w = $script:App.Wizard
+    $w.Step = $Step
+    $pal = Get-GuiPalette
+    for ($i = 0; $i -lt 4; $i++) {
+        $w.Panels[$i].Visible = ($i -eq $Step)
+        $l = $w.StepLabels[$i]
+        $l.Font = New-Object Drawing.Font 'Segoe UI', 10, $(if ($i -eq $Step) { [Drawing.FontStyle]::Bold } else { [Drawing.FontStyle]::Regular })
+        $l.ForeColor = $(if ($i -eq $Step) { $pal.Link } elseif ($i -lt $Step) { $pal.Text } else { $pal.Muted })
+    }
+    $single = [bool](& $w.Def.Single $w)
+    # a run that skips the candidates greys them out
+    if ($single -and $Step -ne 1) { $w.StepLabels[1].ForeColor = $pal.Muted }
+    $w.Back.Visible = $true; $w.Next.Visible = $true; $w.Back.Enabled = $true; $w.Next.Enabled = $true; $w.Cancel.Text = 'Cancel'
+    $w.Description.Text = $w.Def.Descriptions[$Step]
+    switch ($Step) {
+        0 { $w.Back.Enabled = $false; $w.Next.Text = $(if ($single) { 'Analyze' } else { 'Next' }) }
+        1 { $w.Next.Text = 'Analyze'; $w.Next.Enabled = $false }
+        2 { $w.Back.Enabled = $false; $w.Next.Text = 'Stop and show results' }
+        3 { $w.Back.Text = 'Settings'; $w.Next.Visible = $false; $w.Cancel.Text = 'Close' }
+    }
+    if ($Step -ne 3) { $w.Back.Text = 'Back' }
+    $w.Form.AcceptButton = $(if ($w.Next.Visible) { $w.Next } else { $null })
+}
+
+function Get-GuiWizardParameters {
+    # the run's parameters: the connection's, then the advisor's from step 1
+    $w = $script:App.Wizard
+    $p = @{} + $w.Ctx.Parameters
+    & $w.Def.Parameters $w $p
+    return $p
+}
+
+function Start-GuiWizardScreen {
+    $w = $script:App.Wizard
+    $w.Control = [hashtable]::Synchronized(@{})
+    $p = Get-GuiWizardParameters
+    $p.CandidatesOnly = $true; $p.GuiControl = $w.Control
+    Set-GuiWizardStep 1
+    $w.CandSummary.Text = $w.Def.Screening[0]
+    $w.CandSkipped.Text = $w.Def.Screening[1]
+    $w.CandBusy.Visible = $true; $w.CandGrid.Rows.Clear(); $w.CandGrid.Columns.Clear(); $w.CandSelected.Text = ''
+    foreach ($b in @($w.PickAll, $w.PickNone, $w.PickFit)) { $b.Enabled = $false }
+    $w.Stage = 'Screen'
+    $w.Job = Start-GuiWizardJob $p
+    $w.Timer.Start()
+}
+
+function Start-GuiWizardAnalysis {
+    $w = $script:App.Wizard
+    $p = Get-GuiWizardParameters
+    if ($w.Step -eq 1) {
+        $tables = @($w.CandGrid.Rows | Where-Object { $_.Cells['Check'].Value -eq $true } | ForEach-Object { [string]$_.Cells['Table'].Value })
+        if (-not $tables) { Show-GuiMessage 'Check at least one table.' 'Warning'; return }
+        $p.TableFilter = [string[]]$tables
+        $w.Single = $false
+    } else { $w.Single = [bool](& $w.Def.Single $w) }
+    $w.Control = [hashtable]::Synchronized(@{})
+    $p.GuiControl = $w.Control
+    Set-GuiWizardStep 2
+    $w.RunTable.Text = 'Starting the analysis (loading the scoring engine)...'
+    $w.RunStep.Text = ''
+    $w.AllBar.Style = 'Marquee'; $w.TableBar.Style = 'Continuous'; $w.TableBar.Value = 0; $w.AllPercent.Text = ''; $w.TablePercent.Text = ''
+    foreach ($k in @($w.Cards.Keys)) { $w.Cards[$k].Text = '-' }
+    $w.Cards['Budget'].Text = Format-StatsSeconds ([double]$w.Budget.Value * 60)
+    $w.RunLog.Items.Clear(); $w.LogCount = -1
+    $w.Stage = 'Analyze'
+    $w.Job = Start-GuiWizardJob $p
+    $w.Timer.Start()
+}
+
+function Update-GuiWizardJob {
+    # the timer: progress while the run works, then its result
+    $w = $script:App.Wizard
+    if (-not $w -or -not $w.Job) { if ($w) { $w.Timer.Stop() }; return }
+    if ($w.Job.Async.IsCompleted) {
+        $job = $w.Job; $w.Job = $null; $w.Timer.Stop()
+        $r = Receive-GuiWizardJob $job
+        if ($r.Failure -or -not $r.Result) {
+            $message = $(if ($r.Failure) { $r.Failure.Message } else { 'The advisor returned no result.' })
+            Show-GuiMessage ((@($message) + $r.Notes) -join [Environment]::NewLine) 'Error'
+            Set-GuiWizardStep 0
+            return
+        }
+        $a = @($r.Result.Objects) | Select-Object -First 1
+        if ($w.Stage -eq 'Screen') { Show-GuiWizardCandidates $a } else { Show-GuiWizardResults $a $r.Result.Lines $r.Notes }
+        return
+    }
+    $c = $w.Control
+    if ($w.Stage -ne 'Analyze') {
+        # the screening reports what it is reading
+        if ($c.Step) { $w.CandSkipped.Text = [string]$c.Step }
+        return
+    }
+    $now = [DateTime]::Now
+    $w.Cards['Elapsed'].Text = Format-StatsSeconds ($now - $w.Job.Started).TotalSeconds
+    if ($c.Stage -ne 'Analyze') {
+        if ($c.Stage -eq 'Screen') { $w.RunTable.Text = [string]$c.Step + '...' }
+        return
+    }
+    if ($w.AllBar.Style -ne 'Continuous') { $w.AllBar.Style = 'Continuous' }
+    # The run reports between queries. While a query runs, its share of the work counts as done at the measured speed (up to
+    # 90% of it); a query that runs longer than predicted slows the speed down, so the time left grows instead of reaching 0.
+    # (the run can report after $now was read: never a negative time)
+    $since = [Math]::Max(0.0, ($now - [datetime]$c.At).TotalSeconds)
+    $unit = [double]$c.Unit; $rate = [Math]::Max(0.01, [double]$c.Rate)
+    $speed = $(if ($unit -gt 0 -and $since -gt $unit * $rate) { $since / $unit } else { $rate })
+    $inUnit = $(if ($unit -gt 0) { [Math]::Min(0.9 * $unit, $since / $speed) } else { 0.0 })
+    $total = [Math]::Max(0.001, [double]$c.Total)
+    $all = [Math]::Min(1.0, ([double]$c.Done + $inUnit) / $total)
+    $one = $(if ([double]$c.TableTotal -gt 0) { [Math]::Min(1.0, ([double]$c.TableDone + $inUnit) / [double]$c.TableTotal) } else { 1.0 })
+    $left = [Math]::Max(0.0, ($total - [double]$c.Done - $inUnit) * $speed)
+    $all = [Math]::Max(0.0, $all); $one = [Math]::Max(0.0, $one)
+    $w.AllBar.Value = [int](1000 * $all); $w.AllPercent.Text = Format-Invariant '{0:0}%' (100 * $all)
+    $w.TableBar.Value = [int](1000 * $one); $w.TablePercent.Text = Format-Invariant '{0:0}%' (100 * $one)
+    $w.RunTable.Text = Format-Invariant 'Table {0} of {1}: {2} ({3:N0} rows)' $c.TableIndex $c.TableCount $c.Table $c.TableRows
+    if (-not $w.Control.Stop) { $w.RunStep.Text = [string]$c.Step + $(if ($unit -gt 0 -and $since -ge 3) { " (running for $(Format-StatsSeconds $since))" } else { '' }) }
+    $budgetLeft = ([datetime]$c.Deadline - $now).TotalSeconds
+    $w.Cards['Left'].Text = $(if ($left -gt $budgetLeft) { (Format-StatsSeconds $left) + ' (over the budget)' } else { Format-StatsSeconds $left })
+    $w.Cards['Ends'].Text = $now.AddSeconds([Math]::Min($left, [Math]::Max(0, $budgetLeft))).ToString('HH:mm:ss')
+    $w.Cards['Budget'].Text = $(if ($budgetLeft -gt 0) { Format-StatsSeconds $budgetLeft } else { 'used up' })
+    $log = @($c.Log)
+    $w.Cards['Tables'].Text = Format-Invariant '{0} of {1}' @($log | Where-Object Result -eq 'Done').Count $c.TableCount
+    $w.Cards['Found'].Text = Format-Invariant '{0:N0}' $c.Found
+    if ($log.Count -ne $w.LogCount) {
+        $w.LogCount = $log.Count
+        $w.RunLog.BeginUpdate()
+        $w.RunLog.Items.Clear()
+        $word = ($w.Def.UnitWord -replace '\(s\)', 's')
+        foreach ($e in $log) {
+            $mark = switch ($e.Result) { 'Done' { [char]0x2713 } 'Failed' { [char]0x2717 } default { [char]0x2013 } }
+            $time = $(if ($e.Result -eq 'Not reached') { '' } else { ', ' + (Format-StatsSeconds $e.Seconds) })
+            $null = $w.RunLog.Items.Add((Format-Invariant '{0}  {1}  ({2:N0} rows)  {3}: {4}, {5} of {6} {7}{8}' $mark $e.Table $e.Rows $e.Result $e.Note $e.Checked $e.Pairs $word $time))
+        }
+        $w.RunLog.EndUpdate()
+        $w.RunLog.TopIndex = [Math]::Max(0, $w.RunLog.Items.Count - 1)
+    }
+}
+
+function Set-GuiWizardChecks($Grid, [scriptblock]$Rule) {
+    foreach ($r in $Grid.Rows) { $r.Cells['Check'].Value = [bool](& $Rule $r) }
+    $Grid.EndEdit() | Out-Null
+    if ($Grid -eq $script:App.Wizard.CandGrid) { Update-GuiWizardSelection } else { Update-GuiWizardScript }
+}
+
+function Add-GuiWizardCheckColumn($Grid, [string]$Header, [bool[]]$Values) {
+    # a check box column in front of a grid Set-GuiGrid filled (its other columns stay read-only)
+    $col = New-Object Windows.Forms.DataGridViewCheckBoxColumn
+    $col.Name = 'Check'; $col.HeaderText = $Header; $col.SortMode = 'Automatic'; $col.Width = [int](70 * (Get-GuiScale))
+    $Grid.Columns.Insert(0, $col)
+    foreach ($c in $Grid.Columns) { $c.ReadOnly = $c.Name -ne 'Check' }
+    for ($i = 0; $i -lt $Grid.Rows.Count; $i++) { $Grid.Rows[$i].Cells['Check'].Value = $Values[$i] }
+}
+
+function Set-GuiWizardGrid($Grid, $Rows, [string[]]$Columns, [hashtable]$Formats) {
+    # Set-GuiGrid, then the advisor's number formats; Key and Seconds are for the wizard, not to read
+    Set-GuiGrid $Grid $Rows $Columns
+    foreach ($n in 'Key', 'Seconds') { if ($Grid.Columns.Contains($n)) { $Grid.Columns[$n].Visible = $false } }
+    if ($Formats) { foreach ($k in $Formats.Keys) { if ($Grid.Columns.Contains($k)) { $Grid.Columns[$k].DefaultCellStyle.Format = $Formats[$k] } } }
+}
+
+function Show-GuiWizardCandidates($C) {
+    $w = $script:App.Wizard
+    $w.Candidates = $C
+    $w.CandBusy.Visible = $false
+    $v = & $w.Def.Candidates $w $C
+    $w.CandSummary.Text = $v.Summary
+    $w.CandSkipped.Text = $v.Skipped
+    $rows = @($v.Rows)
+    Set-GuiWizardGrid $w.CandGrid $rows $v.Columns (@{ Rows = 'N0' } + $(if ($v.Formats) { $v.Formats } else { @{} }))
+    Add-GuiWizardCheckColumn $w.CandGrid 'Check' ([bool[]]@($rows | ForEach-Object { $true }))
+    Set-GuiGridWidths $w.CandGrid
+    foreach ($b in @($w.PickAll, $w.PickNone, $w.PickFit)) { $b.Enabled = $rows.Count -gt 0 }
+    Update-GuiWizardSelection
+}
+
+function Update-GuiWizardSelection {
+    # the checked tables' estimate against the budget
+    $w = $script:App.Wizard
+    $rows = @($w.CandGrid.Rows | Where-Object { $_.Cells['Check'].Value -eq $true })
+    $seconds = [double](($rows | ForEach-Object { [double]$_.Cells['Seconds'].Value } | Measure-Object -Sum).Sum)
+    $units = [int](($rows | ForEach-Object { [int]$_.Cells[$w.Def.UnitColumn].Value } | Measure-Object -Sum).Sum)
+    $budget = [double]$w.Budget.Value * 60
+    $fit = $(if ($seconds -le $budget) { 'fits the budget' } else { 'more than the budget: the biggest tables go first, and what does not fit is listed as not reached' })
+    $w.CandSelected.Text = Format-Invariant 'Checked: {0} table(s), {1:N0} {2}, about {3} of a {4} budget; {5}.' $rows.Count $units $w.Def.UnitWord (Format-StatsSeconds $seconds) (Format-StatsSeconds $budget) $fit
+    $w.Next.Enabled = $rows.Count -gt 0 -and $w.Step -eq 1
+}
+
+function Show-GuiWizardResults($F, [string[]]$Lines, [string[]]$Notes) {
+    $w = $script:App.Wizard
+    $g = $script:App
+    $w.Result = $F
+    Set-GuiWizardStep 3
+    $v = & $w.Def.Results $w $F
+    $w.Verdict.Text = $v.Verdict
+    $w.VerdictNote.Text = @($v.Notes) -join ' '
+    $w.RecItems = @($v.Items)
+    Set-GuiWizardGrid $w.RecGrid @($v.Rows) $v.Columns $v.Formats
+    Add-GuiWizardCheckColumn $w.RecGrid $w.Def.CheckHeader $v.Checked
+    if ($v.Locked) { for ($i = 0; $i -lt $w.RecGrid.Rows.Count; $i++) { if ($v.Locked[$i]) { $w.RecGrid.Rows[$i].Cells['Check'].ReadOnly = $true } } }
+    Set-GuiGridWidths $w.RecGrid
+    if ($v.ExtraColumns) { Set-GuiWizardGrid $w.ExtraGrid @($v.ExtraRows) $v.ExtraColumns $v.ExtraFormats }
+    $word = $w.Def.UnitColumn
+    $trows = foreach ($t in @($F.Tables)) {
+        $o = [ordered]@{ Table = $t.Table; Rows = [long]$t.Rows }
+        $o[$word] = [int]$t.Pairs; $o.Checked = [int]$t.Checked; $o.Found = [int]$t.Found
+        $o.Time = $(if ($t.Result -eq 'Not reached') { '' } else { Format-StatsSeconds $t.Seconds }); $o.Result = $t.Result; $o.Note = $t.Note
+        [pscustomobject]$o
+    }
+    Set-GuiWizardGrid $w.TableGrid $trows @('Table', 'Rows', $word, 'Checked', 'Found', 'Time', 'Result', 'Note') @{ Rows = 'N0' }
+    # the report without the script (the run appends it after a SCRIPT heading)
+    $summary = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($l in @($Lines)) { if ($l -eq '  SCRIPT') { if ($summary.Count -gt 1) { $summary.RemoveRange($summary.Count - 2, 2) }; break }; $summary.Add($l) }
+    $w.ReportBox.Text = ((@($Notes) + $summary.ToArray()) -join [Environment]::NewLine).Trim()
+    Update-GuiWizardScript
+    $w.ResultTabs.SelectedIndex = $(if ($w.RecItems.Count) { 0 } else { $w.TablesTab })
+    # the main window's report keeps a copy, like the other advisors
+    $g.Report.AppendText([Environment]::NewLine + $w.ReportBox.Text + [Environment]::NewLine)
+    $g.HasReport = $true
+    Set-GuiStatus "$($w.Def.Title): $($w.Verdict.Text)"
+}
+
+function Update-GuiWizardScript {
+    # the script follows the checked rows, in the list's order
+    $w = $script:App.Wizard
+    if (-not $w.Result) { return }
+    $picked = @($w.RecGrid.Rows | Where-Object { $_.Cells['Check'].Value -eq $true } | Sort-Object { [int]$_.Cells['Key'].Value } | ForEach-Object { $w.RecItems[[int]$_.Cells['Key'].Value] })
+    $w.ScriptBox.Text = & $w.Def.Script $w $picked
+    $w.ScriptCount.Text = & $w.Def.ScriptCount $picked
+    $w.SaveScript.Enabled = $w.CopyScript.Enabled = $picked.Count -gt 0
+}
+
+function Save-GuiWizardText([string]$Text, [string]$Filter, [string]$Extension) {
+    $w = $script:App.Wizard
+    $sfd = New-Object Windows.Forms.SaveFileDialog
+    $sfd.Filter = $Filter
+    $sfd.FileName = ("$($w.Def.FileStem)_$($w.Ctx.Database)" -replace '[\[\]\\/:*?"<>|\s]', '') + $Extension
+    try { if ($sfd.ShowDialog($w.Form) -eq 'OK') { [IO.File]::WriteAllText($sfd.FileName, $Text, (New-Object Text.UTF8Encoding $true)); Set-GuiStatus "Saved to $($sfd.FileName)." } }
+    finally { $sfd.Dispose() }
 }
 
 function Complete-GuiTool($Job, $Result, [string[]]$Notes) {
@@ -9309,9 +11139,9 @@ function Show-DecoderWindow {
     $mSettings = New-GuiMenuItem '&Settings...' 0xE713 'Control, Oemcomma' { Show-GuiSettingsDialog }
     $mSettings.ShortcutKeyDisplayString = 'Ctrl+,'
     $mBuild = New-GuiMenuItem '&Build statistics (beta)...' 0xE9D9 'Control, B' { Show-GuiBuildDialog }
-    $mSample = New-GuiMenuItem 'Sample si&ze advisor...' 0 '' { Show-GuiSampleAdvisorDialog }
+    $mSample = New-GuiMenuItem 'Sample si&ze advisor...' 0 '' { Show-GuiSampleWizard }
     $mMaint = New-GuiMenuItem '&Update cost and maintenance plan...' 0 '' { Show-GuiMaintenanceDialog }
-    $mFiltered = New-GuiMenuItem '&Filtered statistics advisor...' 0 '' { Show-GuiFilteredAdvisorDialog }
+    $mFiltered = New-GuiMenuItem '&Filtered statistics advisor...' 0 '' { Show-GuiFilteredWizard }
     $null = $toolsMenu.DropDownItems.AddRange([Windows.Forms.ToolStripItem[]]@($mBuild, $mSample, $mMaint, $mFiltered, (New-Object Windows.Forms.ToolStripSeparator), $mSettings))
     $helpMenu = New-Object Windows.Forms.ToolStripMenuItem '&Help'
     $mProject = New-GuiMenuItem 'SQLStatsXRay on &GitHub' 0xE774 '' { Open-GuiProjectPage }
@@ -9415,11 +11245,9 @@ function Show-DecoderWindow {
     $g.Generate = New-GuiControl Button @{ Text = 'Generate script...'; AutoSize = $true; Enabled = $false; Tag = 'Primary'; Margin = (New-Object Windows.Forms.Padding 10, 2, 3, 2) }
     $g.Discard = New-GuiControl Button @{ Text = 'Discard edits'; AutoSize = $true; Enabled = $false; Margin = (New-Object Windows.Forms.Padding 6, 2, 3, 2) }
     $g.EditInfo = New-GuiControl Label @{ AutoSize = $true; Tag = 'Muted'; Margin = (New-Object Windows.Forms.Padding 8, 7, 3, 3) }
-    $g.BuildButton = New-GuiControl Button @{ Text = 'Build statistics (beta)...'; AutoSize = $true; Enabled = $false; Margin = (New-Object Windows.Forms.Padding 18, 2, 3, 2) }
-    $g.BuildButton.Add_Click({ Show-GuiBuildDialog })
-    $g.Commands.Build = @($mBuild, $g.BuildButton)
+    $g.Commands.Build = @($mBuild)
     $g.Commands.Tools = @($mSample, $mMaint, $mFiltered)
-    $pickerRow.Controls.AddRange(@($pickerLabel, $g.Picker, $g.EditMode, $g.Generate, $g.Discard, $g.BuildButton, $g.EditInfo))
+    $pickerRow.Controls.AddRange(@($pickerLabel, $g.Picker, $g.EditMode, $g.Generate, $g.Discard, $g.EditInfo))
     $right.Controls.Add($pickerRow, 0, 0)
 
     $g.ChartFont = New-Object Drawing.Font 'Segoe UI', 9
@@ -9806,6 +11634,7 @@ if ($PSCmdlet.ParameterSetName -in 'Hex', 'File') {
         $cn.Credential = New-Object System.Data.SqlClient.SqlCredential ($Credential.UserName, $pw)
     }
     $cn.Open()
+    Set-StatsSession $cn
     $dac = $null
     if ($UseDac) {
         $dcsb = New-Object System.Data.SqlClient.SqlConnectionStringBuilder $csb.ConnectionString
@@ -9813,7 +11642,7 @@ if ($PSCmdlet.ParameterSetName -in 'Hex', 'File') {
         $dcsb['Pooling'] = $false
         $dac = New-Object System.Data.SqlClient.SqlConnection $dcsb.ConnectionString
         if ($Credential) { $dac.Credential = $cn.Credential }
-        try { $dac.Open() }
+        try { $dac.Open(); Set-StatsSession $dac }
         catch { Write-Warning "DAC connection failed ($($_.Exception.Message)); Snapshot Ctr will be estimated."; $dac = $null }
     }
     try {
@@ -9843,8 +11672,19 @@ if ($PSCmdlet.ParameterSetName -in 'Hex', 'File') {
             $target = [pscustomobject]@{ Schema = ''; Table = ''; Stats = @() }
         } elseif ($AdviseSample -or $UpdateCost -or $MaintenancePlan -or $AdviseFiltered) {
             # the advisors: a report and a script, nothing changed on the server
-            if (($AdviseSample -or $AdviseFiltered) -and -not $Table) { throw '-AdviseSample and -AdviseFiltered need -Table.' }
-            if ($AdviseSample) {
+            if ($AdviseSample -and -not $Table) {
+                # the whole database (or -TableFilter's tables); a smaller page budget per table than for one statistic
+                $budgetPages = $(if ($PSBoundParameters.ContainsKey('PageBudget')) { $PageBudget } else { 50000 })
+                $a = Invoke-SampleAdvisorDatabase -Connection $cn -Database $Database -MinTableRows $MinTableRows -PageBudget $budgetPages -BudgetMinutes $TimeBudgetMinutes `
+                    -MaxRecommendations $MaxRecommendations -TableFilter $TableFilter -StatName $(if ($Statistics) { $Statistics[0] }) -IncludePersisted:$IncludePersisted -NoProbe:$NoProbe -CandidatesOnly:$CandidatesOnly -Control $GuiControl
+                $lines = $(if ($CandidatesOnly) { Format-SampleCandidatesReport $a } else { Format-SampleDatabaseReport $a })
+            } elseif ($AdviseFiltered -and -not $Table) {
+                # the whole database (or -TableFilter's tables)
+                $a = Invoke-FilteredStatsDatabase -Connection $cn -Database $Database -MinTableRows $MinTableRows -MinRows $MinSegmentRows -SampleRows $SegmentSampleRows `
+                    -BudgetMinutes $TimeBudgetMinutes -MaxRecommendations $MaxRecommendations -MaxPerTable $MaxPerTable -TableFilter $TableFilter -TargetColumn $Column `
+                    -AnyColumn:($AnyColumn -or [bool]$Column) -CandidatesOnly:$CandidatesOnly -Control $GuiControl
+                $lines = $(if ($CandidatesOnly) { Format-FilteredStatsCandidatesReport $a } else { Format-FilteredStatsDatabaseReport $a })
+            } elseif ($AdviseSample) {
                 if (@($Statistics).Count -ne 1) { throw '-AdviseSample takes one statistics object (-Statistics).' }
                 $a = Invoke-SampleAdvisor -Connection $cn -TableName $Table -StatName $Statistics[0] -PageBudget $PageBudget
                 $lines = Format-SampleAdvisorReport $a
@@ -9876,48 +11716,60 @@ if ($PSCmdlet.ParameterSetName -in 'Hex', 'File') {
         }
         $qualified = '[' + $target.Schema.Replace(']', ']]') + '].[' + $target.Table.Replace(']', ']]') + ']'
         $tf2388 = $null
-        if ($Validate) { $tf2388 = Get-TraceFlag2388FromServer $cn $qualified @($target.Stats | ForEach-Object { [string]$_.name }) }
+        if ($Validate) {
+            try { $tf2388 = Get-TraceFlag2388FromServer $cn $qualified @($target.Stats | ForEach-Object { [string]$_.name }) }
+            catch { if (-not (Test-StatsLockTimeout $_.Exception)) { throw }; Write-Warning "Trace flag 2388 view not read: the table is $($script:LockedMessage)." }
+        }
         foreach ($st in $target.Stats) {
             $statName = [string]$st.name
-            $q = Read-ResultSets $cn @'
+            try {
+                $q = Read-ResultSets $cn @'
 DECLARE @cmd nvarchar(max) = N'DBCC SHOW_STATISTICS(' + QUOTENAME(@t, '''') + N', ' + QUOTENAME(@s) + N') WITH STATS_STREAM, NO_INFOMSGS';
 EXEC sys.sp_executesql @cmd;
 '@ @{ '@t' = $qualified; '@s' = $statName }
-            $bytes = [byte[]](@($q[0])[0].Stats_Stream)
-            Get-CollationInfo $cn (Get-ColumnIdsFromStream $bytes)
-            $names = Get-StatsColumnNames $cn $target.ObjectId ([int]$st.stats_id) ([BitConverter]::ToInt32($bytes, 4))
-            $d = ConvertFrom-StatsStream -Bytes $bytes -Names $names -Label "[$($ver.s)].[$Database].$qualified.[$statName]"
-            Resolve-PendingValues $d $cn
-            $d.CurrentSnapshotCtr = Get-CurrentSnapshotCtr $dac $target.ObjectId ([int]$st.stats_id)
-            $d.TraceFlag2388 = Get-TraceFlag2388View $d
+                $bytes = [byte[]](@($q[0])[0].Stats_Stream)
+                Get-CollationInfo $cn (Get-ColumnIdsFromStream $bytes)
+                $names = Get-StatsColumnNames $cn $target.ObjectId ([int]$st.stats_id) ([BitConverter]::ToInt32($bytes, 4))
+                $d = ConvertFrom-StatsStream -Bytes $bytes -Names $names -Label "[$($ver.s)].[$Database].$qualified.[$statName]"
+                Resolve-PendingValues $d $cn
+                $d.CurrentSnapshotCtr = Get-CurrentSnapshotCtr $dac $target.ObjectId ([int]$st.stats_id)
+                $d.TraceFlag2388 = Get-TraceFlag2388View $d
 
-            $info = [ordered]@{
-                'Server'            = "$($ver.s) (SQL Server $($ver.v))"
-                'Database'          = $Database
-                'Table'             = $qualified
-                'Statistics'        = "$statName (stats_id $($st.stats_id))"
-                'Kind'              = $(if ($st.index_type -is [DBNull] -or -not $st.index_type) { 'column statistics' } else { "index statistics ($($st.index_type))" })
-                'Auto created'      = $st.auto_created
-                'User created'      = $st.user_created
-                'No recompute'      = $st.no_recompute
-                'Incremental'       = $st.is_incremental
-                'Filter'            = $(if ($st.has_filter) { $st.filter_definition } else { '' })
-                'Modification ctr'  = $st.sp_modification_counter
-            }
-            if ($st.Table.Columns.Contains('auto_drop')) { $info['Auto drop'] = $st.auto_drop }
-            if ($st.Table.Columns.Contains('has_persisted_sample')) { $info['Has persisted sample'] = $st.has_persisted_sample }
-            $d | Add-Member ServerInfo $info
-            # Where an edited copy of these statistics would be loaded back (the app's script generator).
-            $d | Add-Member Target ([pscustomobject]@{ Server = [string]$csb['Data Source']; Database = $Database; Table = $qualified; Statistics = $statName; NoRecompute = [bool]$st.no_recompute })
+                $info = [ordered]@{
+                    'Server'            = "$($ver.s) (SQL Server $($ver.v))"
+                    'Database'          = $Database
+                    'Table'             = $qualified
+                    'Statistics'        = "$statName (stats_id $($st.stats_id))"
+                    'Kind'              = $(if ($st.index_type -is [DBNull] -or -not $st.index_type) { 'column statistics' } else { "index statistics ($($st.index_type))" })
+                    'Auto created'      = $st.auto_created
+                    'User created'      = $st.user_created
+                    'No recompute'      = $st.no_recompute
+                    'Incremental'       = $st.is_incremental
+                    'Filter'            = $(if ($st.has_filter) { $st.filter_definition } else { '' })
+                    'Modification ctr'  = $st.sp_modification_counter
+                }
+                if ($st.Table.Columns.Contains('auto_drop')) { $info['Auto drop'] = $st.auto_drop }
+                if ($st.Table.Columns.Contains('has_persisted_sample')) { $info['Has persisted sample'] = $st.has_persisted_sample }
+                $d | Add-Member ServerInfo $info
+                # Where an edited copy of these statistics would be loaded back (the app's script generator).
+                $d | Add-Member Target ([pscustomobject]@{ Server = [string]$csb['Data Source']; Database = $Database; Table = $qualified; Statistics = $statName; NoRecompute = [bool]$st.no_recompute })
 
-            if ($Validate) {
-                $checks = Test-StatsAgainstServer $d $cn $qualified $statName $tf2388
-                $d | Add-Member Validation $checks
-            }
-            if ($VerifyData) {
-                try { $check = Test-StatsAgainstData -D $d -Connection $cn -ObjectId $target.ObjectId -Stat $st -QualifiedTable $qualified -PageBudget $VerifyPageBudget -TimeoutSeconds $VerifyTimeout -StepDelay $VerifyStepDelay }
-                catch { $check = New-DataCheckResult "the check failed: $($_.Exception.Message)" }
-                $d | Add-Member DataCheck $check
+                if ($Validate) {
+                    $checks = Test-StatsAgainstServer $d $cn $qualified $statName $tf2388
+                    $d | Add-Member Validation $checks
+                }
+                if ($VerifyData) {
+                    try { $check = Test-StatsAgainstData -D $d -Connection $cn -ObjectId $target.ObjectId -Stat $st -QualifiedTable $qualified -PageBudget $VerifyPageBudget -TimeoutSeconds $VerifyTimeout -StepDelay $VerifyStepDelay }
+                    catch { $check = New-DataCheckResult $(if (Test-StatsLockTimeout $_.Exception) { "the table is $($script:LockedMessage)" } else { "the check failed: $($_.Exception.Message)" }) }
+                    $d | Add-Member DataCheck $check
+                }
+            } catch {
+                # a statistics object locked by a schema change: skipped, the others are decoded
+                if (-not (Test-StatsLockTimeout $_.Exception)) { throw }
+                Add-StatsLockedObject "$qualified.[$statName]" 'decode'
+                Write-Warning "[$statName] skipped: $($script:LockedMessage)."
+                if ($buildReport) { $allLines.Add("Statistics [$statName] on $qualified skipped: $($script:LockedMessage)."); $allLines.Add('') }
+                continue
             }
             $objects += $d
             if ($buildReport) {
@@ -9932,6 +11784,9 @@ EXEC sys.sp_executesql @cmd;
                 $allLines.Add('')
             }
         }
+    } catch {
+        if (Test-StatsLockTimeout $_.Exception) { throw "Stopped: a table or statistics object is $($script:LockedCause), and the read gave up after waiting 100 ms. Try again when the schema change has finished." }
+        throw
     } finally {
         $cn.Close()
         if ($dac) { $dac.Close() }
